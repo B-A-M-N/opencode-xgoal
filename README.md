@@ -154,19 +154,57 @@ valid isolation check — read the harness log instead.
 
 ---
 
+## Verification
+
+All six implementation phases are complete and committed. `bun test` runs 114
+tests; `scripts/p6-convergence.sh` runs 11 end-to-end scenarios against a real
+OpenCode 2 server with real models.
+
+```bash
+bun test                        # 114 unit/integration tests
+bash scripts/p6-convergence.sh  # 11 live end-to-end scenarios
+```
+
+Live convergence results (11/11):
+
+| Scenario | Evidence |
+| --- | --- |
+| Multi-step coding goal | both files created with correct content, continuation injected |
+| False completion rejected | goal not completed without satisfying its criterion |
+| Complete-and-stop | goal completes; driver stops (1 admitted, 4 idle) |
+| Restart mid-goal | goal survived the restart, file created afterwards |
+| Two independent sessions | both files created, no cross-contamination |
+| Normal operation, goal inactive | works normally, 0 continuations driven |
+| Replacement while active | gen1→gen2 over live RPC; stale confirmation refused |
+
+Harness notes, learned the hard way:
+
+- Use the headless `run` subcommand, not the TUI `--prompt` path. The TUI stays
+  open until killed, so a `timeout` truncates work mid-flight.
+- Do **not** use `set -e` here. A non-zero exit from a probe helper aborts the
+  run and silently skips every later scenario.
+- `service start` daemonises and does **not** reliably inherit `XGOAL_DB`, so a
+  scenario that drives the server RPC must assert on the RPC's own responses
+  rather than reading a database file.
+- Headless `run` does not dispatch slash commands; the `/goal` command is only
+  reachable interactively. Replacement is therefore tested over the server RPC,
+  which is the actual atomic path anyway.
+
+---
+
 ## Roadmap
 
-Phase 01 is done. Remaining phases, in the order the design requires:
+All phases below are implemented and committed.
 
 1. **Goal state and lifecycle** — persistent goals, immutable objective,
-   generation IDs, single-active-goal enforcement, archive/history.
+   generation IDs, single-active-goal enforcement, archive/history. ✅
 2. **Native continuation driver** — prepared/admitted/settled rounds via the
-   native inbox, ID reuse on retry, event reconciliation, restart recovery.
+   native inbox, ID reuse on retry, event reconciliation, restart recovery. ✅
 3. **Verification and loop protection** — completion proposal, evidence
-   validation, blocker auditing, progress classification, usage accounting.
-4. **TUI and replacement** — RPC bridge, confirmation dialog, status indicator.
+   validation, blocker auditing, progress classification, usage accounting. ✅
+4. **TUI and replacement** — RPC bridge, confirmation dialog, status indicator. ✅
 5. **Parity evaluation** — identical tasks against Codex `/goal` and this
-   controller; measure verified completion rate and premature-stop rate.
+   controller; measure verified completion rate and premature-stop rate. ⬜
 
 Design constraints carried forward from the review (deliberate, non-obvious):
 
@@ -181,3 +219,12 @@ Design constraints carried forward from the review (deliberate, non-obvious):
 - A plugin that launches duplicate turns is worse than one that stops early —
   exactly-once admission and restart reconciliation come before verification
   sophistication.
+
+### Defect found by live testing
+
+RPC output fields were `undefined` when absent. `undefined` is not a JSON value,
+so the output schema rejected it: `goal.replace` returned
+`rpc.invalid_output: Expected JSON value at ["goal"]["reason"]` to the caller
+*after* it had already mutated state. A fresh goal has no `reason`, so this hit
+every first replacement. Fields are now coerced to `null`, with regression tests
+in `tests/rpc.test.ts`.
