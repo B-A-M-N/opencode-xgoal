@@ -17,6 +17,7 @@
  * compare-and-swap, so it cannot provide (2) or (3).
  */
 import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
 import {
   type Actor,
   type Goal,
@@ -116,6 +117,10 @@ CREATE TABLE IF NOT EXISTS goal_criteria (
   -- verification.
   source      TEXT NOT NULL DEFAULT 'derived',
   met         INTEGER NOT NULL DEFAULT 0,
+  -- A derived/model criterion that investigation proved wrong is superseded,
+  -- not deleted: the row stays for the audit trail but no longer gates
+  -- verification. User-source criteria cannot be superseded by the model.
+  superseded  INTEGER NOT NULL DEFAULT 0,
   created_at_ms INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS goal_criteria_goal ON goal_criteria (goal_id);
@@ -190,6 +195,21 @@ CREATE TABLE IF NOT EXISTS session_usage (
   session_id  TEXT PRIMARY KEY,
   total_tokens INTEGER NOT NULL,
   updated_at_ms INTEGER NOT NULL
+);
+
+-- Explicit user acceptance of an objective-level criterion.
+--
+-- A broad objective ("fix the flaky tests", "clean up the config handling")
+-- cannot be machine-proven from ordinary evidence: any passing test or file
+-- change is consistent with a partial job. Rather than pretend completeness is
+-- established, the verifier leaves such criteria unresolved until the user
+-- either accepts the objective explicitly (this table, generation-fenced) or
+-- the model registers concrete machine-checkable sub-criteria.
+CREATE TABLE IF NOT EXISTS goal_acceptances (
+  goal_id     TEXT PRIMARY KEY,
+  generation  INTEGER NOT NULL,
+  note        TEXT,
+  at_ms       INTEGER NOT NULL
 );
 
 -- Continuation ledger. One row per continuation attempt.
@@ -289,6 +309,40 @@ function newID(prefix: string): string {
     .slice(2, 10)}`;
 }
 
+/**
+ * Canonical hash of a criteria + evidence snapshot.
+ *
+ * The single authoritative hashing rule for verification freshness: the
+ * verifier hashes exactly the rows it read, and `completeGoal` re-hashes the
+ * current rows to prove the world did not change in between. Exported as a
+ * pure function so both sides share one implementation without a DB round-trip
+ * in the verifier's hot path.
+ */
+export function snapshotHash(
+  criteria: { id: string; text: string; spec?: CriterionSpec }[],
+  evidence: {
+    id: string;
+    kind: string;
+    ref: string;
+    exitCode?: number;
+    hash?: string;
+    criterionID?: string;
+  }[],
+): string {
+  const canonical = JSON.stringify({
+    criteria: criteria.map((c) => [c.id, c.text, c.spec ?? null]),
+    evidence: evidence.map((e) => [
+      e.id,
+      e.kind,
+      e.ref,
+      e.exitCode ?? null,
+      e.hash ?? null,
+      e.criterionID ?? null,
+    ]),
+  });
+  return createHash("sha256").update(canonical).digest("hex").slice(0, 32);
+}
+
 export class GoalStore {
   readonly db: Database;
   /** Transaction nesting depth; lets compound ops join an open transaction. */
@@ -300,6 +354,23 @@ export class GoalStore {
     this.db.exec("PRAGMA foreign_keys = ON");
     this.db.exec("PRAGMA busy_timeout = 5000");
     this.db.exec(SCHEMA);
+    this.migrate();
+  }
+
+  /**
+   * Guarded, idempotent migrations for databases created by older versions.
+   *
+   * `CREATE TABLE IF NOT EXISTS` never alters an existing table, so columns
+   * added to the canonical schema must also be added here when missing.
+   */
+  private migrate(): void {
+    const columns = this.db
+      .query<{ name: string }, []>(`PRAGMA table_info(goal_criteria)`)
+      .all()
+      .map((row) => row.name);
+    if (!columns.includes("superseded")) {
+      this.db.exec(`ALTER TABLE goal_criteria ADD COLUMN superseded INTEGER NOT NULL DEFAULT 0`);
+    }
   }
 
   close(): void {
@@ -544,6 +615,17 @@ export class GoalStore {
         detail: input.reason ?? `replaced by ${newIDValue}`,
       });
 
+      // Fail the superseded goal's outstanding round in the SAME transaction.
+      // Its continuation belongs to an objective that no longer exists; leaving
+      // it outstanding would keep it in the recovery sweep until the next
+      // reconcile and risk classifying a late settlement against a superseded
+      // objective. This is a supersession, not a delivery failure of the
+      // replacement — so it never parks anything.
+      const stale = this.outstandingRound(existing.id);
+      if (stale) {
+        this.markRoundFailed(stale.id, `superseded by ${newIDValue}`, { parkGoal: false });
+      }
+
       this.db
         .query(
           `INSERT INTO goals (id, session_id, generation, objective, status, rounds,
@@ -734,23 +816,121 @@ export class GoalStore {
     return id;
   }
 
-  /** Add an acceptance criterion. Returns its id so evidence can be bound. */
+  /**
+   * Add an acceptance criterion. Returns its id so evidence can be bound.
+   *
+   * Additive and idempotent: adding a criterion whose normalized text already
+   * exists for this goal returns the existing id rather than creating a
+   * duplicate. The model may not create an objective-type criterion — that
+   * verdict is the user's to give, via acceptance.
+   */
   addCriterion(
     goalID: string,
     text: string,
     spec?: CriterionSpec,
-    source: "user" | "model" = "user",
+    source: "user" | "model" | "derived" = "user",
   ): string {
     const goal = this.byID(goalID);
     if (!goal) throw new GoalConflictError(`unknown goal ${goalID}`);
     if (!isNonTerminal(goal.status)) {
       throw new TransitionRejectedError(`cannot add criteria to terminal goal ${goalID}`);
     }
+    const normalized = text.trim().toLowerCase().replace(/\s+/g, " ");
+    if (source === "model" && spec?.type === "objective") {
+      throw new TransitionRejectedError(
+        "the model cannot establish an objective-type criterion; only the user can accept the objective",
+      );
+    }
     let id = "";
     this.tx(() => {
+      const existingRows = this.db
+        .query<{ id: string; text: string }, [string]>(
+          `SELECT id, text FROM goal_criteria WHERE goal_id = ? AND superseded = 0`,
+        )
+        .all(goalID);
+      const existing = existingRows.find(
+        (r) => r.text.trim().toLowerCase().replace(/\s+/g, " ") === normalized,
+      );
+      if (existing) {
+        id = existing.id;
+        return;
+      }
       id = this.insertCriterion(goalID, goal.generation, { text, spec, source }, Date.now());
     });
     return id;
+  }
+
+  /**
+   * Supersede a derived or model criterion that investigation proved wrong.
+   *
+   * The row is retained for the audit trail but stops gating verification.
+   * Explicit user requirements are never supersedeable: removing one to pass
+   * verification is exactly the failure this ledger exists to prevent.
+   */
+  supersedeCriterion(criterionID: string, reason: string): void {
+    this.tx(() => {
+      const row = this.db
+        .query<{ goal_id: string; generation: number; source: string; superseded: number }, [string]>(
+          `SELECT goal_id, generation, source, superseded FROM goal_criteria WHERE id = ?`,
+        )
+        .get(criterionID);
+      if (!row) throw new GoalConflictError(`unknown criterion ${criterionID}`);
+      if (row.source === "user") {
+        throw new TransitionRejectedError(
+          "an explicit user requirement cannot be superseded; it must be satisfied or the objective replaced",
+        );
+      }
+      if (row.superseded === 1) return; // idempotent
+      this.db
+        .query(`UPDATE goal_criteria SET superseded = 1, met = 0 WHERE id = ?`)
+        .run(criterionID);
+      this.appendEvent(row.goal_id, row.generation, "criterion-superseded", {
+        actor: "model",
+        detail: reason.slice(0, 300),
+      });
+    });
+  }
+
+  /**
+   * Record explicit user acceptance of the objective-level remainder.
+   *
+   * Acceptance is generation-fenced: it applies to the goal generation that
+   * existed when the user accepted. Replacement mints a new generation, so a
+   * new objective always requires fresh acceptance.
+   */
+  recordUserAcceptance(goalID: string, generation: number, note?: string): void {
+    this.tx(() => {
+      const goal = this.byID(goalID);
+      if (!goal) throw new GoalConflictError(`unknown goal ${goalID}`);
+      if (goal.generation !== generation) {
+        throw new GoalConflictError(
+          `stale generation: goal ${goalID} is generation ${goal.generation}, acceptance claimed ${generation}`,
+        );
+      }
+      this.db
+        .query(
+          `INSERT INTO goal_acceptances (goal_id, generation, note, at_ms)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(goal_id) DO UPDATE SET generation=excluded.generation,
+             note=excluded.note, at_ms=excluded.at_ms`,
+        )
+        .run(goalID, generation, note ?? null, Date.now());
+      this.appendEvent(goalID, generation, "accepted", {
+        actor: "user",
+        detail: note ?? "user accepted the objective",
+      });
+    });
+  }
+
+  /** The acceptance recorded for a goal, if any. */
+  userAcceptance(goalID: string): { generation: number; note?: string; atMs: number } | undefined {
+    const row = this.db
+      .query<{ generation: number; note: string | null; at_ms: number }, [string]>(
+        `SELECT generation, note, at_ms FROM goal_acceptances WHERE goal_id = ?`,
+      )
+      .get(goalID);
+    if (!row) return undefined;
+    return { generation: row.generation, note: row.note ?? undefined, atMs: row.at_ms };
   }
 
   addEvidence(input: {
@@ -790,6 +970,8 @@ export class GoalStore {
     });
   }
 
+  /** Active criteria. Superseded ones are retained in the table for the audit
+   *  trail but no longer gate verification, so they are not listed. */
   listCriteria(goalID: string): {
     id: string;
     text: string;
@@ -802,7 +984,8 @@ export class GoalStore {
         { id: string; text: string; met: number; spec: string | null; source: string },
         [string]
       >(
-        `SELECT id, text, met, spec, source FROM goal_criteria WHERE goal_id = ? ORDER BY created_at_ms ASC`,
+        `SELECT id, text, met, spec, source FROM goal_criteria
+          WHERE goal_id = ? AND superseded = 0 ORDER BY created_at_ms ASC`,
       )
       .all(goalID)
       .map((r) => ({
@@ -1153,11 +1336,14 @@ export class GoalStore {
       }
       const id = newID("round");
       const now = Date.now();
-      // Snapshot how much evidence already exists, so settlement can tell
-      // whether this round produced any verified work at all.
+      // Snapshot how much VERIFIABLE evidence already exists, so settlement
+      // can tell whether this round produced any verified work at all.
+      // Checkpoint refs are model-annotated pointers, not observations: a
+      // model that emits ten goal_checkpoint calls without doing anything must
+      // not earn ten "progress" verdicts.
       const baseline = this.db
         .query<{ n: number }, [string]>(
-          `SELECT COUNT(*) AS n FROM goal_evidence WHERE goal_id = ?`,
+          `SELECT COUNT(*) AS n FROM goal_evidence WHERE goal_id = ? AND kind != 'ref'`,
         )
         .get(input.goalID)!.n;
       this.db
@@ -1284,8 +1470,19 @@ export class GoalStore {
    * failure, so it must not be counted as a round — but it must also stop
    * automatic dispatch until recovery, or a later event would mint a fresh
    * continuation and circumvent the retry limit.
+   *
+   * `parkGoal: false` is for rounds abandoned BEFORE any submission was
+   * attempted (the goal was replaced or paused between reserve and dispatch).
+   * No delivery was attempted there, so recording a delivery failure would be a
+   * lie — and since nothing clears that flag automatically, it would wrongly
+   * require a recovery step the user never caused.
    */
-  markRoundFailed(roundID: string, detail: string): GoalRound {
+  markRoundFailed(
+    roundID: string,
+    detail: string,
+    options: { parkGoal?: boolean } = {},
+  ): GoalRound {
+    const parkGoal = options.parkGoal ?? true;
     return this.tx(() => {
       const round = this.roundByID(roundID);
       if (!round) throw new GoalConflictError(`unknown round ${roundID}`);
@@ -1293,7 +1490,7 @@ export class GoalStore {
         .query(`UPDATE goal_rounds SET status='failed', detail=?, settled_at_ms=? WHERE id=?`)
         .run(detail, Date.now(), roundID);
       const goal = this.byID(round.goalID);
-      if (goal) {
+      if (goal && parkGoal) {
         this.db
           .query(
             `UPDATE goals SET delivery_failed=1, updated_at_ms=?, version=version+1
@@ -1386,6 +1583,17 @@ export class GoalStore {
   }
 
   /**
+   * Canonical hash of the criteria + evidence snapshot a verification checks.
+   *
+   * ONE implementation, owned by the store: the verifier records its result
+   * against this hash, and `completeGoal` recomputes it from the CURRENT world
+   * to prove nothing changed between the verification decision and the commit.
+   */
+  snapshotOf(goalID: string): string {
+    return snapshotHash(this.listCriteria(goalID), this.listEvidence(goalID));
+  }
+
+  /**
    * Atomically settle any in-flight round and move a verified goal to
    * `complete`, guarded by generation and the verification snapshot.
    *
@@ -1414,11 +1622,18 @@ export class GoalStore {
           `cannot complete goal ${input.goalID} from status ${goal.status}; verification is required first`,
         );
       }
-      if (input.snapshot !== undefined && goal.verificationSnapshot !== input.snapshot) {
-        throw new GoalConflictError(
-          `verification snapshot mismatch: the verifier checked ${goal.verificationSnapshot ?? "none"}, ` +
-            `this completion claims ${input.snapshot}`,
-        );
+      if (input.snapshot !== undefined) {
+        // Freshness, recomputed from the CURRENT criteria and evidence rather
+        // than trusted from the record: a verifier that ran before a late
+        // checkpoint, criterion change or evidence mutation must not be able
+        // to commit a decision the world has since contradicted.
+        const current = this.snapshotOf(input.goalID);
+        if (current !== input.snapshot) {
+          throw new GoalConflictError(
+            `verification is stale: the criteria or evidence changed after the verifier checked ` +
+              `${input.snapshot} (now ${current}); re-verify before completing`,
+          );
+        }
       }
       const outstanding = this.outstandingRound(input.goalID);
       if (outstanding) {
@@ -1458,6 +1673,20 @@ export class GoalStore {
       )
       .get(sessionID, atMs);
     return row?.generation;
+  }
+
+  /**
+   * How many goal generations this session has ever had.
+   *
+   * Timestamp attribution is only sound when the answer is 1: with several
+   * generations their execution lifetimes may overlap, so wall-clock order
+   * cannot decide which generation produced a message.
+   */
+  generationCount(sessionID: string): number {
+    const row = this.db
+      .query<{ n: number }, [string]>(`SELECT COUNT(*) AS n FROM goals WHERE session_id = ?`)
+      .get(sessionID);
+    return row?.n ?? 0;
   }
 }
 

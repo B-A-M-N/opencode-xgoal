@@ -66,7 +66,10 @@ export const goalRpcDefinition = {
   methods: {
     "goal.status": {
       input: { type: "object", properties: { sessionID: str }, required: ["sessionID"] },
-      output: { type: "object", properties: { goal: goalOrNull } },
+      output: {
+        type: "object",
+        properties: { current: goalOrNull, latest: goalOrNull, goal: goalOrNull },
+      },
     },
     "goal.history": {
       input: { type: "object", properties: { sessionID: str }, required: ["sessionID"] },
@@ -103,6 +106,14 @@ export const goalRpcDefinition = {
       input: { type: "object", properties: { sessionID: str }, required: ["sessionID"] },
       output: { type: "object", properties: { goal: goalOrNull, error: str } },
     },
+    "goal.accept": {
+      input: {
+        type: "object",
+        properties: { sessionID: str, note: str },
+        required: ["sessionID"],
+      },
+      output: { type: "object", properties: { goal: goalOrNull, error: str } },
+    },
     "goal.health": {
       input: { type: "object", properties: { sessionID: str }, required: ["sessionID"] },
       output: { type: "object", properties: { health: { type: "object" } } },
@@ -127,6 +138,19 @@ export const goalRpcDefinition = {
 } as const;
 
 /**
+ * The subset of the verifier the RPC surface needs. Kept structural so this
+ * module does not depend on the verification internals.
+ */
+export interface AcceptanceVerifier {
+  verify(goalID: string): Promise<{
+    verdict: "complete" | "incomplete";
+    reason: string;
+    unmet: string[];
+    snapshot?: string;
+  }>;
+}
+
+/**
  * Build the RPC handlers for a controller.
  *
  * Every method is defensive: RPC handlers run on the server, so a malformed
@@ -136,11 +160,18 @@ export const goalRpcDefinition = {
 export function goalRpcHandlers(
   controller: GoalController,
   coordinator?: GoalCoordinator,
+  verifier?: AcceptanceVerifier,
 ) {
   return {
     "goal.status": async (input: { sessionID?: string }) => {
-      if (!input?.sessionID) return { goal: null };
-      return { goal: wire(controller, controller.latest(input.sessionID)) };
+      if (!input?.sessionID) return { current: null, latest: null, goal: null };
+      // `current` is the goal in progress (nonterminal) — what a replacement
+      // confirmation must be rendered against. `latest` is the most recent
+      // goal including a completed one, for status readouts. `goal` is kept as
+      // an alias of `latest` for existing consumers.
+      const latest = wire(controller, controller.latest(input.sessionID));
+      const current = wire(controller, controller.status(input.sessionID));
+      return { current, latest, goal: latest };
     },
 
     "goal.history": async (input: { sessionID?: string }) => {
@@ -218,6 +249,37 @@ export function goalRpcHandlers(
           return { goal: wire(controller, result.goal), drive: result.drive ?? null };
         }
         return { goal: wire(controller, controller.resume(input.sessionID)) };
+      } catch (error) {
+        return { goal: null, error: String(error) };
+      }
+    },
+
+    "goal.accept": async (input: { sessionID?: string; note?: string }) => {
+      if (!input?.sessionID) return { goal: null, error: "sessionID is required" };
+      try {
+        // A USER action only: it records explicit acceptance of the
+        // objective-level remainder that cannot be machine-proven. If
+        // completion was waiting on exactly this, finish it now rather than
+        // leaving the user to re-trigger the model.
+        const accepted = controller.acceptObjective(input.sessionID, input.note);
+        if (accepted.status === "verifying" && verifier) {
+          const result = await verifier.verify(accepted.id);
+          if (result.verdict === "complete") {
+            const done = controller.commitComplete(
+              accepted.id,
+              accepted.generation,
+              result.reason,
+              result.snapshot,
+            );
+            return { goal: wire(controller, done) };
+          }
+          controller.rejectCompletion(accepted.id, accepted.generation, result.reason);
+          return {
+            goal: wire(controller, controller.status(input.sessionID)),
+            error: `acceptance recorded, but completion is still unmet: ${result.unmet.join("; ")}`,
+          };
+        }
+        return { goal: wire(controller, accepted) };
       } catch (error) {
         return { goal: null, error: String(error) };
       }

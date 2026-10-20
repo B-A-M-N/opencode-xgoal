@@ -102,3 +102,113 @@ describe("authoritative probe", () => {
     expect(await t.probe({ sessionID: "ses_a", round: round() })).toBe("unknown");
   });
 });
+
+// Audit P1-6: settlement correlation. A human prompt interleaved after our
+// continuation starts a NEW turn — a terminal assistant answering the human
+// must never be scored as settlement of our round.
+describe("settlement is bounded by the first foreign prompt", () => {
+  test("a terminal assistant answering an interleaved human prompt is not settlement", async () => {
+    const t = transport({
+      inbox: [],
+      messages: [
+        { id: "msg_1", type: "synthetic" },
+        { id: "asst_1", type: "assistant", finish: "tool-calls" },
+        // The human interrupts; the session answers the human.
+        { id: "human_1", type: "user" },
+        { id: "asst_2", type: "assistant", finish: "stop" },
+        { id: "idle_1", type: "idle" },
+      ],
+    });
+    // Our round's own execution never observed a finish before the human
+    // interjection: the outcome is not proven either way.
+    expect(await t.probe({ sessionID: "ses_a", round: round() })).toBe("unknown");
+  });
+
+  test("a finish before the interleaved prompt still settles", async () => {
+    const t = transport({
+      inbox: [],
+      messages: [
+        { id: "msg_1", type: "synthetic" },
+        // Our turn finished BEFORE the human spoke.
+        { id: "asst_1", type: "assistant", finish: "stop" },
+        { id: "human_1", type: "user" },
+        { id: "asst_2", type: "assistant", finish: "stop" },
+      ],
+    });
+    expect(await t.probe({ sessionID: "ses_a", round: round() })).toBe("settled");
+  });
+
+  test("an idle marker after the foreign prompt does not settle our round", async () => {
+    const t = transport({
+      inbox: [],
+      messages: [
+        { id: "msg_1", type: "synthetic" },
+        { id: "asst_1", type: "assistant", finish: "tool-calls" },
+        { id: "human_1", type: "user" },
+        { id: "idle_1", type: "idle" },
+      ],
+    });
+    expect(await t.probe({ sessionID: "ses_a", round: round() })).toBe("unknown");
+  });
+});
+
+describe("live execution liveness", () => {
+  test("running executions are tracked per session", () => {
+    const observer = new RoundObserver();
+    expect(observer.isBusy("ses_a")).toBe(false);
+    observer.observe({ type: "session.execution.started", data: { sessionID: "ses_a" } });
+    expect(observer.isBusy("ses_a")).toBe(true);
+    expect(observer.isBusy("ses_b")).toBe(false);
+    observer.observe({ type: "session.execution.succeeded", data: { sessionID: "ses_a" } });
+    expect(observer.isBusy("ses_a")).toBe(false);
+  });
+
+  test("a completion for one session never releases another", () => {
+    const observer = new RoundObserver();
+    observer.observe({ type: "session.execution.started", data: { sessionID: "ses_a" } });
+    observer.observe({ type: "session.execution.started", data: { sessionID: "ses_b" } });
+    observer.observe({ type: "session.execution.failed", data: { sessionID: "ses_a" } });
+    expect(observer.isBusy("ses_a")).toBe(false);
+    expect(observer.isBusy("ses_b")).toBe(true);
+  });
+
+  test("SessionTransport.liveWait reflects the observer", () => {
+    const observer = new RoundObserver();
+    const t = new SessionTransport({ observer, send: async () => {} });
+    expect(t.liveWait({ sessionID: "ses_a" })).toBe(false);
+    observer.observe({ type: "session.execution.started", data: { sessionID: "ses_a" } });
+    expect(t.liveWait({ sessionID: "ses_a" })).toBe(true);
+  });
+
+  // Audit P2 follow-up: a completion event that never arrives (dropped stream,
+  // plugin reload) must not leak the busy reference — otherwise every future
+  // round classifies as verifiedWait and the goal can never stall.
+  test("transcript settlement releases a reference whose completion event was lost", () => {
+    const observer = new RoundObserver();
+    observer.observe({
+      type: "session.execution.started",
+      data: { sessionID: "ses_a", messageID: "msg_xgoal_x" },
+    });
+    expect(observer.isBusy("ses_a")).toBe(true);
+    // No succeeded/failed event ever arrives. Settlement of the round from the
+    // transcript is authoritative and releases the reference.
+    observer.forget("msg_xgoal_x");
+    expect(observer.isBusy("ses_a")).toBe(false);
+  });
+
+  test("duplicate started events do not double-count", () => {
+    const observer = new RoundObserver();
+    const started = {
+      type: "session.execution.started",
+      data: { sessionID: "ses_a", messageID: "msg_xgoal_y" },
+    };
+    observer.observe(started);
+    observer.observe(started);
+    observer.observe({
+      type: "session.execution.succeeded",
+      data: { sessionID: "ses_a", messageID: "msg_xgoal_y" },
+    });
+    // One release must fully clear the duplicated starts.
+    expect(observer.isBusy("ses_a")).toBe(false);
+  });
+});

@@ -382,3 +382,207 @@ describe("completion cannot be self-declared", () => {
     expect(done.status).toBe("complete");
   });
 });
+
+// Audit P0-2: the objective-level fallback used to be proven by any bound
+// passing test or file change — equally consistent with a partial job. It now
+// resolves only through explicit USER acceptance (or decomposition into
+// concrete sub-criteria); ordinary evidence can never establish it.
+describe("objective-level criteria require user acceptance", () => {
+  test("passing evidence cannot prove a broad objective on its own", async () => {
+    const goal = store.create({
+      sessionID: "ses_a",
+      objective: "make the config handling better",
+    });
+    const criterionID = store.addCriterion(
+      goal.id,
+      "The requirement is achieved: make the config handling better",
+      { type: "objective" },
+    );
+    // Machine-observed evidence exists — and is even bound to the criterion.
+    store.addEvidence({
+      goalID: goal.id,
+      criterionID,
+      kind: "test",
+      ref: "bun test",
+      detail: "exit 0",
+      exitCode: 0,
+    });
+
+    const verifier = new GoalVerifier(store, validator());
+    const result = await verifier.verify(goal.id);
+    expect(result.verdict).toBe("incomplete");
+    expect(result.unmet.some((u) => u.includes("criterion unresolved"))).toBe(true);
+    // The unmet message must name both real resolution paths.
+    expect(result.unmet.some((u) => u.includes("goal_add_criterion"))).toBe(true);
+    expect(result.unmet.some((u) => u.includes("/goal accept"))).toBe(true);
+    // The criterion was NOT marked met by the passing evidence.
+    expect(store.listCriteria(goal.id)[0].met).toBe(false);
+  });
+
+  test("explicit user acceptance resolves the objective-level criterion", async () => {
+    const goal = store.create({
+      sessionID: "ses_a",
+      objective: "make the config handling better",
+    });
+    const criterionID = store.addCriterion(goal.id, "achieved: config handling", {
+      type: "objective",
+    });
+    store.addEvidence({
+      goalID: goal.id,
+      criterionID,
+      kind: "command",
+      ref: "bun run lint",
+      detail: "exit 0",
+      exitCode: 0,
+    });
+
+    const verifier = new GoalVerifier(store, validator());
+    expect((await verifier.verify(goal.id)).verdict).toBe("incomplete");
+
+    // A USER action, recorded for the current generation of the objective.
+    controller.acceptObjective("ses_a", "reviewed the diff; good enough");
+
+    const result = await verifier.verify(goal.id);
+    expect(result.verdict).toBe("complete");
+    expect(result.unmet).toHaveLength(0);
+    expect(store.listCriteria(goal.id)[0].met).toBe(true);
+    expect(store.userAcceptance(goal.id)?.note).toBe("reviewed the diff; good enough");
+  });
+
+  test("acceptance does not carry over to a replacement objective", async () => {
+    const first = store.create({ sessionID: "ses_a", objective: "ship v1" });
+    store.addCriterion(first.id, "achieved: ship v1", { type: "objective" });
+    store.addEvidence({
+      goalID: first.id,
+      kind: "command",
+      ref: "ls",
+      detail: "exit 0",
+      exitCode: 0,
+    });
+    controller.acceptObjective("ses_a");
+    const verifier = new GoalVerifier(store, validator());
+    expect((await verifier.verify(first.id)).verdict).toBe("complete");
+
+    // Replacing the objective requires accepting the new ask afresh.
+    const second = store.replace({
+      sessionID: "ses_a",
+      expectedGeneration: first.generation,
+      objective: "ship v2",
+    });
+    store.addCriterion(second.id, "achieved: ship v2", { type: "objective" });
+    store.addEvidence({
+      goalID: second.id,
+      kind: "command",
+      ref: "ls",
+      detail: "exit 0",
+      exitCode: 0,
+    });
+
+    const result = await verifier.verify(second.id);
+    expect(result.verdict).toBe("incomplete");
+    expect(result.unmet.some((u) => u.includes("criterion unresolved"))).toBe(true);
+    expect(store.userAcceptance(second.id)).toBeUndefined();
+  });
+});
+
+// Audit P2: a completion commit must be rejected when the criteria or
+// evidence changed AFTER the verification decision — the verdict describes a
+// world that no longer exists, so freshness is recomputed, not trusted.
+describe("completion commits only the snapshot that was verified", () => {
+  test("a stale verification cannot complete a goal whose evidence changed", async () => {
+    const goal = store.create({ sessionID: "ses_a", objective: "ship v1" });
+    const criterionID = store.addCriterion(goal.id, "the regression is fixed");
+    store.addEvidence({
+      goalID: goal.id,
+      criterionID,
+      kind: "test",
+      ref: "bun test",
+      detail: "exit 0",
+      exitCode: 0,
+    });
+    store.transition({
+      goalID: goal.id,
+      generation: goal.generation,
+      to: "verifying",
+      actor: "model",
+      reason: "model proposed completion",
+    });
+
+    const verifier = new GoalVerifier(store, validator());
+    const result = await verifier.verify(goal.id);
+    expect(result.verdict).toBe("complete");
+
+    // The world changes after the decision: a new requirement appears.
+    store.addCriterion(goal.id, "the docs mention the flag");
+
+    // The old decision must not commit.
+    expect(() =>
+      controller.commitComplete(goal.id, goal.generation, result.reason, result.snapshot),
+    ).toThrow(/stale/i);
+    expect(store.byID(goal.id)!.status).toBe("verifying");
+
+    // Re-verification sees the changed world and stays honest.
+    const second = await verifier.verify(goal.id);
+    expect(second.verdict).toBe("incomplete");
+
+    // Satisfy the new requirement, re-verify, and the commit goes through.
+    const docCriterion = store
+      .listCriteria(goal.id)
+      .find((c) => c.text === "the docs mention the flag")!;
+    store.addEvidence({
+      goalID: goal.id,
+      criterionID: docCriterion.id,
+      kind: "command",
+      ref: "grep flag docs.md",
+      detail: "exit 0",
+      exitCode: 0,
+    });
+    const third = await verifier.verify(goal.id);
+    expect(third.verdict).toBe("complete");
+    const done = controller.commitComplete(goal.id, goal.generation, third.reason, third.snapshot);
+    expect(done.status).toBe("complete");
+  });
+
+  test("removing a requirement also invalidates the old decision", async () => {
+    const goal = store.create({ sessionID: "ses_a", objective: "ship v2" });
+    const satisfiable = store.addCriterion(goal.id, "the suite is green");
+    store.addEvidence({
+      goalID: goal.id,
+      criterionID: satisfiable,
+      kind: "test",
+      ref: "bun test",
+      detail: "exit 0",
+      exitCode: 0,
+    });
+    // A requirement that will be retired during investigation.
+    const doomed = store.addCriterion(
+      goal.id,
+      "config.yaml contains retries: 3",
+      { type: "file", path: "config.yaml", contains: "retries: 3" },
+      "derived",
+    );
+    store.transition({
+      goalID: goal.id,
+      generation: goal.generation,
+      to: "verifying",
+      actor: "model",
+      reason: "model proposed completion",
+    });
+
+    const verifier = new GoalVerifier(store, validator());
+    const first = await verifier.verify(goal.id);
+    expect(first.verdict).toBe("incomplete");
+
+    // The requirement is superseded: fewer criteria than the verdict checked.
+    store.supersedeCriterion(doomed, "requirement dropped during investigation");
+
+    expect(() =>
+      controller.commitComplete(goal.id, goal.generation, first.reason, first.snapshot),
+    ).toThrow(/stale/i);
+
+    const second = await verifier.verify(goal.id);
+    expect(second.verdict).toBe("complete");
+    const done = controller.commitComplete(goal.id, goal.generation, second.reason, second.snapshot);
+    expect(done.status).toBe("complete");
+  });
+});

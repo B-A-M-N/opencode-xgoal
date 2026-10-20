@@ -8,17 +8,20 @@
  * row and hope the model continues.
  *
  * Behaviour:
- *   - `/goal <objective>` with no current goal starts immediately, no dialog
- *   - with a goal already active, show a confirmation
+ *   - `/goal <objective>` with no current (nonterminal) goal starts immediately
+ *   - with a goal in progress, show a confirmation (a completed goal is
+ *     history: it never triggers "Replace goal?")
  *   - default selection is Replace; Enter confirms; Escape cancels
- *   - pause/resume/budget/health are available without a second command
+ *   - pause/resume/budget/accept/health are available without a second command
  */
 import { Plugin } from "@opencode/plugin/tui";
 import { goalRpcDefinition, type GoalWire } from "./rpc.ts";
 
 /** The RPC surface this companion uses, inferred from the shared definition. */
 interface GoalRpc {
-  "goal.status": (input: { sessionID: string }) => Promise<{ goal: GoalWire | null }>;
+  "goal.status": (input: {
+    sessionID: string;
+  }) => Promise<{ current: GoalWire | null; latest: GoalWire | null }>;
   "goal.create": (input: {
     sessionID: string;
     objective: string;
@@ -37,6 +40,10 @@ interface GoalRpc {
   "goal.budget": (input: {
     sessionID: string;
     budget?: number;
+  }) => Promise<{ goal: GoalWire | null; error?: string }>;
+  "goal.accept": (input: {
+    sessionID: string;
+    note?: string;
   }) => Promise<{ goal: GoalWire | null; error?: string }>;
   "goal.health": (input: { sessionID: string }) => Promise<{ health: Record<string, unknown> }>;
 }
@@ -87,15 +94,30 @@ export default Plugin.define({
       }
     };
 
-    const statusText = (goal: GoalWire | null): string => {
-      if (!goal) return "No active goal. Use /goal <objective>.";
-      const budget =
+    const statusText = (
+      current: GoalWire | null,
+      latest: GoalWire | null,
+    ): string => {
+      // A completed goal is history, not an obstacle: say so and point at how
+      // to start the next one instead of implying a goal is still active.
+      const budget = (goal: GoalWire) =>
         goal.tokenBudget === null
           ? `${goal.tokensUsed ?? 0} tokens`
           : `${goal.tokensUsed ?? 0}/${goal.tokenBudget} tokens`;
+      if (!current && latest) {
+        return [
+          `[${latest.status}] generation ${latest.generation}: ${latest.objective}`,
+          `rounds ${latest.rounds}, ${budget(latest)}`,
+          `No goal in progress. Use /goal <objective> to start the next one.`,
+        ].join("\n");
+      }
+      if (!current) return "No active goal. Use /goal <objective>.";
       return [
-        `[${goal.status}] generation ${goal.generation}: ${goal.objective}`,
-        `rounds ${goal.rounds}, no-progress ${goal.noProgressRounds}, ${budget}`,
+        `[${current.status}] generation ${current.generation}: ${current.objective}`,
+        `rounds ${current.rounds}, no-progress ${current.noProgressRounds}, ${budget(current)}`,
+        ...(current.status === "verifying"
+          ? [`Machine verification is blocked; run /goal accept to record acceptance.`]
+          : []),
       ].join("\n");
     };
 
@@ -106,7 +128,7 @@ export default Plugin.define({
     ) => {
       let expected = expectedGeneration;
       if (expected === undefined) {
-        const current = (await rpc["goal.status"]({ sessionID })).goal;
+        const current = (await rpc["goal.status"]({ sessionID })).current;
         if (!current) {
           await createGoal(sessionID, objective);
           return;
@@ -153,7 +175,7 @@ export default Plugin.define({
       // Bare `/goal` and the explicit control verbs never prompt.
       if (!text || verb === "status") {
         const res = await rpc["goal.status"]({ sessionID });
-        notify(statusText(res.goal), "info", sessionID);
+        notify(statusText(res.current, res.latest), "info", sessionID);
         return;
       }
 
@@ -185,7 +207,7 @@ export default Plugin.define({
       }
 
       if (verb === "budget") {
-        const current = (await rpc["goal.status"]({ sessionID })).goal;
+        const current = (await rpc["goal.status"]({ sessionID })).current;
         if (!current) {
           notify("No active goal.", "warning", sessionID);
           return;
@@ -219,6 +241,16 @@ export default Plugin.define({
         return;
       }
 
+      if (verb === "accept") {
+        const res = await rpc["goal.accept"]({ sessionID, note: arg || undefined });
+        notify(
+          res.error ? `Could not record acceptance: ${res.error}` : "Acceptance recorded for the current generation.",
+          res.error ? "error" : "success",
+          sessionID,
+        );
+        return;
+      }
+
       if (verb === "health") {
         const res = await rpc["goal.health"]({ sessionID });
         notify(JSON.stringify(res.health, null, 2), res.health?.ok === false ? "warning" : "info", sessionID);
@@ -227,7 +259,8 @@ export default Plugin.define({
 
       // `/goal <objective>` — start immediately if nothing is active, otherwise
       // confirm before replacing.
-      const existing = (await rpc["goal.status"]({ sessionID })).goal;
+      // Only a goal in progress can be replaced; a completed one is history.
+      const existing = (await rpc["goal.status"]({ sessionID })).current;
       if (!existing) {
         await createGoal(sessionID, text);
         return;

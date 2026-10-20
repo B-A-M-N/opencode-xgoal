@@ -377,8 +377,133 @@ describe("model tool calls are fenced to their message identity", () => {
     expect(choice).toEqual({ ok: true, ref: { goalID: "legacy_goal", generation: 1 } });
   });
 
-  test("a host without message identity may omit refs for the legacy path", () => {
-    const choice = selectToolRef({}, undefined, undefined);
-    expect(choice).toEqual({ ok: true, ref: { goalID: undefined, generation: undefined } });
+  // Audit P1-3: the old fallback let a call with neither message identity nor
+  // a complete reference through as an empty ref, to be resolved against
+  // whatever goal was current. That is how a delayed callback from a
+  // superseded execution contaminates its replacement.
+  test("a call with neither message identity nor a complete reference fails closed", () => {
+    const bare = selectToolRef({}, undefined, undefined);
+    expect(bare.ok).toBe(false);
+    if (!bare.ok) expect(bare.reason).toContain("neither");
+
+    const partial = selectToolRef({}, { goal_id: "goal_only" }, undefined);
+    expect(partial.ok).toBe(false);
+  });
+});
+
+// Audit P1-4: the model could not register criteria at all, and there was no
+// way to retire a derived criterion investigation proved wrong.
+describe("criterion refinement is additive, idempotent and fenced", () => {
+  test("adding an identical requirement twice returns the existing criterion", () => {
+    const goal = start("ship the feature");
+    const before = controller.store.listCriteria(goal.id).length;
+    const first = controller.addCriterion("ses_a", {
+      ...ref(),
+      text: "the retry backoff is exponential",
+    });
+    const second = controller.addCriterion("ses_a", {
+      ...ref(),
+      // Different case and spacing: normalization must still see one criterion.
+      text: "  The RETRY backoff   is exponential ",
+    });
+
+    expect(first.criterionID).toBeDefined();
+    expect(second.criterionID).toBe(first.criterionID);
+    expect(controller.store.listCriteria(goal.id)).toHaveLength(before + 1);
+  });
+
+  test("the model cannot establish an objective-type criterion", () => {
+    start("ship the feature");
+    const out = controller.addCriterion("ses_a", {
+      ...ref(),
+      text: "everything is good",
+      spec: { type: "objective" },
+    });
+    expect(out.rejected).toContain("objective");
+  });
+
+  test("a derived criterion investigation proved wrong can be superseded", () => {
+    const goal = start("ship the feature");
+    const before = controller.store.listCriteria(goal.id).map((c) => c.id);
+    const derived = controller.addCriterion("ses_a", {
+      ...ref(),
+      text: "config.yaml contains retries: 3",
+      spec: { type: "file", path: "config.yaml", contains: "retries: 3" },
+    });
+
+    const out = controller.supersedeCriterion("ses_a", {
+      ...ref(),
+      criterion_id: derived.criterionID!,
+      reason: "the requirement moved to config.json during investigation",
+    });
+
+    expect(out.superseded).toBe(true);
+    // The superseded row is retained for the audit trail but no longer listed.
+    const after = controller.store.listCriteria(goal.id).map((c) => c.id);
+    expect(after).toEqual(before);
+    expect(after).not.toContain(derived.criterionID);
+    const row = controller.store.db
+      .query<{ superseded: number }, [string]>(
+        `SELECT superseded FROM goal_criteria WHERE id = ?`,
+      )
+      .get(derived.criterionID!);
+    expect(row?.superseded).toBe(1);
+  });
+
+  test("an explicit user requirement cannot be superseded by the model", () => {
+    const goal = start("ship the feature");
+    // start() derives criteria from the objective with source "derived";
+    // establish an explicit user-source one to prove the protection.
+    controller.store.addCriterion(goal.id, "the API stays backward compatible", undefined, "user");
+    const userCriterion = controller.store
+      .listCriteria(goal.id)
+      .find((c) => c.text === "the API stays backward compatible")!;
+
+    const out = controller.supersedeCriterion("ses_a", {
+      ...ref(),
+      criterion_id: userCriterion.id,
+      reason: "inconvenient",
+    });
+
+    expect(out.rejected).toContain("cannot be superseded");
+    expect(controller.store.listCriteria(goal.id).map((c) => c.id)).toContain(userCriterion.id);
+  });
+
+  test("a superseded criterion no longer blocks verification", async () => {
+    const { GoalVerifier } = await import("../src/controller/verification.ts");
+    const goal = start("ship the feature");
+    // A derived file criterion that will never be satisfied, plus one
+    // satisfiable manual criterion.
+    const impossible = controller.store.addCriterion(
+      goal.id,
+      "ghost.txt contains never",
+      { type: "file", path: "ghost.txt", contains: "never" },
+      "derived",
+    );
+    const satisfiable = controller.store.addCriterion(goal.id, "the regression is fixed");
+    controller.store.addEvidence({
+      goalID: goal.id,
+      criterionID: satisfiable,
+      kind: "test",
+      ref: "bun test",
+      exitCode: 0,
+      detail: "exit 0",
+    });
+
+    const verifier = new GoalVerifier(controller.store, {
+      validate: async () => ({ valid: true, reason: "ok" }),
+      checkSpec: async () => ({ valid: false, reason: "file absent" }),
+    });
+    expect((await verifier.verify(goal.id)).verdict).toBe("incomplete");
+
+    controller.supersedeCriterion("ses_a", {
+      ...ref(),
+      criterion_id: impossible,
+      reason: "requirement dropped during investigation",
+    });
+    // The objective-level remainder (derived from the objective) resolves via
+    // explicit user acceptance.
+    controller.acceptObjective("ses_a");
+    expect((await verifier.verify(goal.id)).verdict).toBe("complete");
   });
 });

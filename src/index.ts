@@ -13,7 +13,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { GoalController } from "./controller/controller.ts";
-import { selectToolRef } from "./controller/calls.ts";
+import { attributeMessageGeneration, selectToolRef } from "./controller/calls.ts";
 import { GoalCoordinator } from "./controller/coordinator.ts";
 import { GoalDriver } from "./controller/driver.ts";
 import { RoundObserver, SessionTransport } from "./controller/transport.ts";
@@ -345,34 +345,77 @@ export default {
      *
      * A tool call belongs to the generation that produced the message carrying
      * it — not to whatever goal happens to be current when the callback runs.
-     * The association is derived from durable state (the message's own
-     * timestamp against goal creation times) and cached, so a delayed call from
-     * a superseded execution is fenced to its own generation and rejected by
-     * the controller instead of contaminating its replacement.
+     *
+     * Attribution is by transcript position: walking backward from the
+     * message, the nearest preceding continuation (bound to its generation at
+     * admission) claims it, and a foreign human prompt stops the walk. This
+     * holds even when several generations have overlapping execution
+     * lifetimes, which wall-clock order cannot decide. The timestamp rule
+     * survives only as a compatibility fallback for sessions with exactly one
+     * generation, where it cannot misattribute. The durable mapping is cached,
+     * so a delayed call from a superseded execution stays fenced to its own
+     * generation and is rejected by the controller instead of contaminating
+     * its replacement.
      */
     async function resolveMessageRef(
       sessionID: string | undefined,
       messageID: string | undefined,
     ): Promise<{ goalID?: string; generation?: number }> {
       if (!controller || !sessionID || !messageID) return {};
-      const cached = controller.store.resolveMessageGeneration(sessionID, messageID);
+      const store = controller.store;
+      const cached = store.resolveMessageGeneration(sessionID, messageID);
       if (cached !== undefined) {
-        const goal = controller.store.byGeneration(sessionID, cached);
+        const goal = store.byGeneration(sessionID, cached);
         return goal ? { goalID: goal.id, generation: cached } : {};
       }
-      let atMs: number | undefined;
+
+      let messages: unknown[] = [];
       try {
-        const messages = await ctx.session.context({ sessionID });
-        const message = (messages as any[]).find((m) => m?.id === messageID);
-        if (typeof message?.time?.created === "number") atMs = message.time.created;
+        messages = (await ctx.session.context({ sessionID })) as unknown[];
       } catch (error) {
         record({ event: "call.resolve.error", sessionID, messageID, error: String(error) });
       }
+      const list = messages as Array<{
+        id?: string;
+        type?: string;
+        metadata?: Record<string, unknown>;
+        time?: { created?: number };
+      }>;
+
+      // A message belongs to a goal execution if it is one of our
+      // continuations (durably bound at admission) or carries any other
+      // recorded generation.
+      const generationOf = (message: { id?: string }): number | undefined => {
+        const id = message.id;
+        if (!id) return undefined;
+        const mapped = store.resolveMessageGeneration(sessionID, id);
+        if (mapped !== undefined) return mapped;
+        return store.roundByInboxID(id)?.generation;
+      };
+
+      let generation = attributeMessageGeneration(
+        list.map((m) => ({ id: m.id ?? "", type: m.type, metadata: m.metadata })),
+        messageID,
+        generationOf,
+      );
+      if (generation !== undefined) {
+        store.rememberMessageGeneration(sessionID, messageID, generation, Date.now());
+        const goal = store.byGeneration(sessionID, generation);
+        return goal ? { goalID: goal.id, generation } : {};
+      }
+
+      // Compatibility fallback: timestamp attribution, but only when the
+      // session has exactly one generation. With several, overlapping
+      // execution lifetimes make wall-clock order ambiguous, so attribution
+      // fails closed instead of guessing.
+      if (store.generationCount(sessionID) !== 1) return {};
+      const self = list.find((m) => m.id === messageID);
+      const atMs = typeof self?.time?.created === "number" ? self.time.created : undefined;
       if (atMs === undefined) return {};
-      const generation = controller.store.generationAt(sessionID, atMs);
+      generation = store.generationAt(sessionID, atMs);
       if (generation === undefined) return {};
-      controller.store.rememberMessageGeneration(sessionID, messageID, generation, atMs);
-      const goal = controller.store.byGeneration(sessionID, generation);
+      store.rememberMessageGeneration(sessionID, messageID, generation, atMs);
+      const goal = store.byGeneration(sessionID, generation);
       return goal ? { goalID: goal.id, generation } : {};
     }
 
@@ -452,6 +495,96 @@ export default {
               content: `Checkpoint recorded. Goal is ${out.goal?.status}.`,
               metadata: { status: out.goal?.status, rounds: out.goal?.rounds },
             };
+          },
+        });
+
+        editor.add({
+          name: "goal_add_criterion",
+          description:
+            "Refine the acceptance criteria during investigation: register a concrete, machine-checkable requirement the work must satisfy. Additive and idempotent — adding a requirement that already exists returns the existing criterion. Objective-type specs are refused: only the user can accept the objective itself.",
+          input: obj(
+            {
+              text: str,
+              spec: {
+                type: "object",
+                properties: {
+                  type: {
+                    type: "string",
+                    enum: ["file", "command", "test", "manual"],
+                  },
+                  path: { type: "string" },
+                  equals: { type: "string" },
+                  contains: { type: "string" },
+                  command: { type: "string" },
+                  expectExit: num,
+                },
+                additionalProperties: false,
+              },
+              goal_id: str,
+              generation: num,
+            },
+            ["text"],
+          ),
+          async execute(input: any, toolCtx: any) {
+            if (!controller) return { content: `goal controller unavailable: ${startupError}` };
+            const ref = await resolveMessageRef(toolCtx?.sessionID, toolCtx?.messageID);
+            const target = selectToolRef(ref, input, toolCtx?.messageID);
+            if (!target.ok) return { content: `Goal call rejected: ${target.reason}` };
+            const rawSpec = input?.spec;
+            let spec: Record<string, unknown> | undefined;
+            if (rawSpec && typeof rawSpec === "object") {
+              const parsed: Record<string, unknown> = { ...rawSpec };
+              if (parsed.type === "file" && typeof parsed.path !== "string") {
+                return { content: "Criterion rejected: a file spec requires path." };
+              }
+              if (
+                (parsed.type === "command" || parsed.type === "test") &&
+                typeof parsed.command !== "string"
+              ) {
+                return { content: "Criterion rejected: a command/test spec requires command." };
+              }
+              spec = parsed;
+            }
+            const out = controller.addCriterion(toolCtx?.sessionID, {
+              text: String(input?.text ?? ""),
+              spec: spec as any,
+              goalID: target.ref.goalID,
+              generation: target.ref.generation,
+            });
+            if (out.rejected) return { content: `Criterion rejected: ${out.rejected}` };
+            return {
+              content: `Criterion registered: ${out.criterionID}`,
+              metadata: { criterionID: out.criterionID },
+            };
+          },
+        });
+
+        editor.add({
+          name: "goal_supersede_criterion",
+          description:
+            "Retire a derived or model-added criterion that investigation proved wrong. The criterion is kept for the audit trail but no longer gates verification. Explicit user requirements cannot be superseded; they must be satisfied.",
+          input: obj(
+            {
+              criterion_id: str,
+              reason: str,
+              goal_id: str,
+              generation: num,
+            },
+            ["criterion_id", "reason"],
+          ),
+          async execute(input: any, toolCtx: any) {
+            if (!controller) return { content: `goal controller unavailable: ${startupError}` };
+            const ref = await resolveMessageRef(toolCtx?.sessionID, toolCtx?.messageID);
+            const target = selectToolRef(ref, input, toolCtx?.messageID);
+            if (!target.ok) return { content: `Goal call rejected: ${target.reason}` };
+            const out = controller.supersedeCriterion(toolCtx?.sessionID, {
+              criterion_id: String(input?.criterion_id ?? ""),
+              reason: String(input?.reason ?? ""),
+              goalID: target.ref.goalID,
+              generation: target.ref.generation,
+            });
+            if (out.rejected) return { content: `Supersede rejected: ${out.rejected}` };
+            return { content: "Criterion superseded; it no longer gates verification." };
           },
         });
 
@@ -602,7 +735,7 @@ export default {
       if (controller && ctx.rpc?.register) {
         await ctx.rpc.register(
           goalRpcDefinition as never,
-          goalRpcHandlers(controller, coordinator) as never,
+          goalRpcHandlers(controller, coordinator, verifier) as never,
         );
         record({ event: "rpc.registered", ok: true });
       } else {
@@ -663,6 +796,32 @@ export default {
                 } else {
                   reply(`Resumed: ${controller.resume(sessionID).status}`);
                 }
+                return;
+              }
+              if (verb === "accept") {
+                // Explicit user acceptance of the objective-level remainder.
+                // A USER action only; the model cannot accept its own goal.
+                const accepted = controller.acceptObjective(sessionID, arg || undefined);
+                // If completion was waiting on exactly this, finish the job
+                // now rather than leaving the user to re-trigger the model.
+                if (accepted.status === "verifying" && verifier) {
+                  const result = await verifier.verify(accepted.id);
+                  if (result.verdict === "complete") {
+                    const done = controller.commitComplete(
+                      accepted.id,
+                      accepted.generation,
+                      result.reason,
+                      result.snapshot,
+                    );
+                    record({ event: "completion.verified", goalID: accepted.id, reason: result.reason });
+                    return reply(`Acceptance recorded. Completion verified: ${done.status}`);
+                  }
+                  controller.rejectCompletion(accepted.id, accepted.generation, result.reason);
+                  return reply(
+                    `Acceptance recorded, but completion is still unmet: ${result.unmet.join("; ")}`,
+                  );
+                }
+                reply("Acceptance recorded for the current generation.");
                 return;
               }
               if (verb === "replace") {
@@ -862,6 +1021,26 @@ export default {
           eventsSeen.add(type);
           observer.observe(event);
           record({ event: "event", type, total: eventsSeen.size });
+
+          // A session can be moved to a different working directory (or
+          // deleted) while the plugin is running. The cached workspace would
+          // then send file-criterion checks to the wrong directory — silently
+          // verifying against the old location. Invalidate on any session
+          // lifecycle event; the next check re-resolves.
+          if (type.startsWith("session.")) {
+            const evtSession = String(
+              (event as any)?.data?.sessionID ?? (event as any)?.properties?.sessionID ?? "",
+            );
+            if (
+              evtSession &&
+              (type === "session.updated" ||
+                type === "session.moved" ||
+                type === "session.deleted" ||
+                type === "session.renamed")
+            ) {
+              sessionWorkspaces.delete(evtSession);
+            }
+          }
 
           // Session usage is a running total; charge the delta to the active
           // goal so the budget ceiling is driven by real usage rather than

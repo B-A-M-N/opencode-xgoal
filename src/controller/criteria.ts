@@ -8,15 +8,21 @@
  *
  * Derivation is deliberately conservative and deterministic: for an objective
  * we can parse into concrete file requirements we emit those as specs; anything
- * we cannot parse becomes a single objective-level criterion whose proof is a
- * passing test or a real file change. The original objective is never rewritten,
+ * we cannot parse becomes a single objective-level criterion, which ordinary
+ * evidence cannot prove — it resolves only through concrete sub-criteria or
+ * explicit user acceptance. The original objective is never rewritten,
  * and derived criteria are additive — the model may refine them during
  * investigation but may not remove an explicit requirement to pass.
  */
 
 /** A machine-checkable criterion specification. */
 export type CriterionSpec =
-  /** The objective as a whole; proven by a passing test or a real file change. */
+  /**
+   * The objective as a whole. Deliberately NOT provable by ordinary evidence:
+   * a passing test or a real file change is equally consistent with a partial
+   * job. Resolves through explicit user acceptance or decomposition into
+   * concrete sub-criteria.
+   */
   | { type: "objective" }
   /** A file must exist in the session workspace and match content if given. */
   | { type: "file"; path: string; equals?: string; contains?: string }
@@ -116,11 +122,14 @@ function strip(value: string | undefined): string {
  * Derive preliminary acceptance criteria from an objective.
  *
  * The original objective is always retained verbatim; criteria are additive.
- * Enumerated objectives become one criterion per item. A parsed file
- * requirement becomes a file spec (independently re-checked at verification).
- * Everything else collapses to an objective-level criterion whose proof is a
- * passing test or a real file change. This means an ordinary
- * `/goal <objective>` starts with criteria and verification remains meaningful.
+ * Enumerated objectives become one criterion per item — every explicit
+ * requirement is preserved, with no cap. A parsed file requirement becomes a
+ * file spec (independently re-checked at verification). Everything else
+ * collapses to an objective-level criterion, which cannot be machine-proven
+ * from ordinary evidence: it resolves only through concrete sub-criteria
+ * registered during investigation or explicit user acceptance. This means an
+ * ordinary `/goal <objective>` starts with criteria and verification remains
+ * meaningful.
  */
 export function deriveCriteria(objective: string): DerivedCriterion[] {
   const text = objective.trim();
@@ -151,7 +160,10 @@ export function deriveCriteria(objective: string): DerivedCriterion[] {
   const contentPaths = new Set<string>();
   for (const target of targets) {
     let matched = false;
-    // First pass: content-bearing file requirements.
+    // First pass: content-bearing file requirements. There is deliberately no
+    // cap on how many requirements are kept: truncation silently discarded the
+    // tail of an enumerated objective, letting verification certify a
+    // shortened interpretation of what the user asked for.
     for (const { re, build } of FILE_PATTERNS) {
       for (const match of target.matchAll(re)) {
         const spec = build(match);
@@ -161,35 +173,28 @@ export function deriveCriteria(objective: string): DerivedCriterion[] {
         matched = true;
         contentPaths.add(spec.path);
         push(`${spec.path} contains ${content}`, spec);
-        if (criteria.length >= 8) break;
       }
-      if (criteria.length >= 8) break;
     }
     // Second pass: existence-only requirements, unless a content criterion
     // already covers the same path.
-    if (criteria.length < 8) {
-      for (const { re, build } of FILE_PATTERNS) {
-        if (criteria.length >= 8) break;
-        for (const match of target.matchAll(re)) {
-          const spec = build(match);
-          if (!spec || spec.type !== "file") continue;
-          if ("contains" in spec && spec.contains) continue;
-          if (contentPaths.has(spec.path)) continue;
-          matched = true;
-          push(`${spec.path} exists`, spec);
-          if (criteria.length >= 8) break;
-        }
+    for (const { re, build } of FILE_PATTERNS) {
+      for (const match of target.matchAll(re)) {
+        const spec = build(match);
+        if (!spec || spec.type !== "file") continue;
+        if ("contains" in spec && spec.contains) continue;
+        if (contentPaths.has(spec.path)) continue;
+        matched = true;
+        push(`${spec.path} exists`, spec);
       }
     }
     if (!matched) {
       push(`The requirement is achieved: ${target}`, { type: "objective" });
     }
-    if (criteria.length >= 8) break;
   }
 
   // An open-ended objective we could not decompose becomes a single
-  // objective-level criterion. It is proven by explicitly bound evidence of a
-  // passing test or a real file change — never by counting unrelated commands.
+  // objective-level criterion. It is never proven by ordinary evidence; it
+  // resolves through user acceptance or concrete sub-criteria.
   if (criteria.length === 0) {
     push(`The objective is achieved: ${text}`, { type: "objective" });
   }

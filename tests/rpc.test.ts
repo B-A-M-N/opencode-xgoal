@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GoalController } from "../src/controller/controller.ts";
 import { GoalCoordinator } from "../src/controller/coordinator.ts";
+import { GoalVerifier } from "../src/controller/verification.ts";
 import { goalRpcDefinition, goalRpcHandlers } from "../src/rpc.ts";
 
 let dir: string;
@@ -324,5 +325,134 @@ describe("mutations schedule execution (audit defect 7)", () => {
     const res = await h["goal.health"]({ sessionID: "ses_a" });
     expect(res.health.ok).toBe(false);
     expect((res.health.problems as string[]).join(" ")).toContain("nothing is driving it");
+  });
+});
+
+// Audit P2-8: a terminal goal must not present as "current". The TUI renders
+// its replacement confirmation against `current`, and used to see the finished
+// goal there — triggering a pointless confirmation for work already done.
+describe("goal.status separates current from latest", () => {
+  test("a completed goal is latest but never current", async () => {
+    const start = controller.startOrDescribe("ses_a", "done work");
+    if (!("created" in start)) throw new Error("expected a new goal");
+    const goal = start.created;
+    controller.store.transition({
+      goalID: goal.id,
+      generation: goal.generation,
+      to: "verifying",
+      actor: "model",
+      reason: "proposed",
+    });
+    controller.commitComplete(goal.id, goal.generation, "verified");
+
+    const res = await handlers["goal.status"]({ sessionID: "ses_a" });
+    expect(res.current).toBeNull();
+    expect(res.latest?.status).toBe("complete");
+    // `goal` remains an alias of `latest` for existing consumers.
+    expect(res.goal).toEqual(res.latest);
+  });
+
+  test("an active goal is both current and latest", async () => {
+    controller.startOrDescribe("ses_a", "in progress");
+    const res = await handlers["goal.status"]({ sessionID: "ses_a" });
+    expect(res.current?.status).toBe("active");
+    expect(res.latest?.generation).toBe(res.current?.generation);
+  });
+
+  test("after a replacement both point at the new generation", async () => {
+    controller.startOrDescribe("ses_a", "one");
+    controller.replace("ses_a", "two");
+    const res = await handlers["goal.status"]({ sessionID: "ses_a" });
+    expect(res.current?.generation).toBe(2);
+    expect(res.latest?.generation).toBe(2);
+  });
+});
+
+// Audit P0-2/P2-8: user acceptance is a first-class USER action with a
+// headless RPC path, and it finishes a verifying goal when acceptance is the
+// only thing missing.
+describe("goal.accept", () => {
+  test("records acceptance for the active goal", async () => {
+    controller.startOrDescribe("ses_a", "make it good");
+    const res = await handlers["goal.accept"]({ sessionID: "ses_a", note: "looks right" });
+    expect(res.error).toBeUndefined();
+    expect(res.goal?.status).toBe("active");
+    const goal = controller.status("ses_a");
+    expect(controller.store.userAcceptance(goal!.id)?.note).toBe("looks right");
+  });
+
+  test("acceptance with no goal is an error, not an exception", async () => {
+    const res = await handlers["goal.accept"]({ sessionID: "ses_a" });
+    expect(res.goal).toBeNull();
+    expect(res.error).toBeDefined();
+  });
+
+  test("a missing sessionID is rejected", async () => {
+    const res = await handlers["goal.accept"]({} as never);
+    expect(res.error).toContain("sessionID");
+  });
+
+  test("acceptance completes a verifying goal when acceptance was the only gap", async () => {
+    const start = controller.startOrDescribe("ses_a", "make it good");
+    if (!("created" in start)) throw new Error("expected a new goal");
+    const goal = start.created;
+    // Machine evidence exists so the evidence floor is met; the objective-level
+    // remainder is what acceptance resolves.
+    controller.store.addEvidence({
+      goalID: goal.id,
+      kind: "command",
+      ref: "ls",
+      detail: "exit 0",
+      exitCode: 0,
+    });
+    controller.store.transition({
+      goalID: goal.id,
+      generation: goal.generation,
+      to: "verifying",
+      actor: "model",
+      reason: "proposed",
+    });
+
+    const verifier = new GoalVerifier(controller.store, {
+      validate: async () => ({ valid: true, reason: "ok" }),
+    });
+    const h = goalRpcHandlers(controller, undefined, verifier);
+    const res = await h["goal.accept"]({ sessionID: "ses_a", note: "ship it" });
+    expect(res.error).toBeUndefined();
+    expect(res.goal?.status).toBe("complete");
+  });
+
+  test("acceptance does not complete a goal with unmet machine criteria", async () => {
+    const start = controller.startOrDescribe(
+      "ses_a",
+      "Create a file called a.txt containing exactly: alpha.",
+    );
+    if (!("created" in start)) throw new Error("expected a new goal");
+    const goal = start.created;
+    controller.store.addEvidence({
+      goalID: goal.id,
+      kind: "command",
+      ref: "ls",
+      detail: "exit 0",
+      exitCode: 0,
+    });
+    controller.store.transition({
+      goalID: goal.id,
+      generation: goal.generation,
+      to: "verifying",
+      actor: "model",
+      reason: "proposed",
+    });
+
+    // The file requirement is genuinely unmet: acceptance of the objective
+    // cannot paper over a concrete machine-checkable spec.
+    const verifier = new GoalVerifier(controller.store, {
+      validate: async () => ({ valid: true, reason: "ok" }),
+      checkSpec: async () => ({ valid: false, reason: "file absent" }),
+    });
+    const h = goalRpcHandlers(controller, undefined, verifier);
+    const res = await h["goal.accept"]({ sessionID: "ses_a" });
+    expect(res.error).toContain("unmet");
+    expect(controller.status("ses_a")?.status).toBe("active");
   });
 });

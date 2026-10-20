@@ -148,6 +148,21 @@ export class GoalController {
     return this.store.byID(resumed.id) ?? resumed;
   }
 
+  /**
+   * `/goal accept [note]` — explicit user acceptance of the objective.
+   *
+   * This is the resolution for the part of a goal that cannot be machine-proven
+   * (an `{ type: "objective" }` criterion). It is a USER action only: a model
+   * that could accept its own objective would defeat the entire verification
+   * gate. Acceptance is generation-fenced, so replacing the goal requires
+   * accepting the new objective afresh.
+   */
+  acceptObjective(sessionID: string, note?: string): Goal {
+    const goal = this.requireCurrent(sessionID);
+    this.store.recordUserAcceptance(goal.id, goal.generation, note);
+    return this.store.byID(goal.id) ?? goal;
+  }
+
   status(sessionID: string): Goal | undefined {
     return this.store.current(sessionID);
   }
@@ -346,6 +361,32 @@ export class GoalController {
         "model",
       );
       return { criterionID };
+    } catch (error) {
+      return { rejected: String(error) };
+    }
+  }
+
+  /**
+   * `goal_supersede_criterion` — retire a derived criterion investigation
+   * proved wrong.
+   *
+   * Only derived/model criteria are retireable; an explicit user requirement
+   * must be satisfied, not explained away. The row is retained for the audit
+   * trail.
+   */
+  supersedeCriterion(
+    sessionID: string,
+    input: { criterion_id: string; reason: string } & GoalRef,
+  ): { superseded?: boolean; rejected?: string } {
+    const target = this.resolveTarget(sessionID, input);
+    if (!target.ok) return { rejected: target.rejected };
+    const criterionID = this.resolveCriterion(target.goal.id, input.criterion_id);
+    if (!criterionID) {
+      return { rejected: `criterion ${input.criterion_id} does not exist on this goal` };
+    }
+    try {
+      this.store.supersedeCriterion(criterionID, input.reason);
+      return { superseded: true };
     } catch (error) {
       return { rejected: String(error) };
     }

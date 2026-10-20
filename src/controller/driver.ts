@@ -52,6 +52,12 @@ export interface ContinuationTransport {
     metadata: Record<string, unknown>;
   }): Promise<SubmitResult>;
   probe(input: { sessionID: string; round: GoalRound }): Promise<ProbeResult>;
+  /**
+   * Is an execution for this session observably still running? A verified wait
+   * — not a guess — used so a turn spent waiting on a real background job is
+   * not scored as an unproductive round.
+   */
+  liveWait?(input: { sessionID: string }): boolean;
 }
 
 export interface DriverOptions {
@@ -69,22 +75,36 @@ export interface DriverOptions {
   classify?: (input: {
     goal: Goal;
     round: GoalRound;
+    /** Verifiable evidence only — checkpoint refs are not observations. */
     evidenceCount: number;
-    /** Evidence captured during this round specifically. */
+    /** Verifiable evidence captured during this round specifically. */
     evidenceDelta: number;
+    /** Is a background execution for this session still running? */
+    liveWait: boolean;
   }) => { classification: "progress" | "verifiedWait" | "noProgress" | "blocked"; detail?: string };
 }
 
 const DEFAULT_CLASSIFY = ({
   evidenceDelta,
+  liveWait,
 }: {
   evidenceDelta: number;
-}): { classification: "progress" | "noProgress"; detail?: string } => {
+  liveWait: boolean;
+}): { classification: "progress" | "verifiedWait" | "noProgress"; detail?: string } => {
   // A turn that produced no new machine-verifiable evidence is not progress,
   // even if the model wrote a paragraph. This is what makes the stall policy
   // meaningful instead of letting an active model reset the counter forever.
   if (evidenceDelta > 0) {
     return { classification: "progress", detail: `${evidenceDelta} new evidence item(s)` };
+  }
+  // No new evidence, but an execution is observably still running: waiting on
+  // it is a verified wait, not an unproductive turn, so it must not accumulate
+  // toward a stall.
+  if (liveWait) {
+    return {
+      classification: "verifiedWait",
+      detail: "no new evidence, but a background execution is still running",
+    };
   }
   return { classification: "noProgress", detail: "no new evidence captured this round" };
 };
@@ -226,14 +246,19 @@ export class GoalDriver {
 
   /** Dispatch phase. Transport I/O happens here, outside any transaction. */
   private async dispatch(round: GoalRound, sessionID: string): Promise<DriveOutcome> {
-    // Re-check the world immediately before submitting: replacement may have
-    // happened while we were reserving.
+    // Re-check the world immediately before submitting: replacement or a pause
+    // may have happened while we were reserving. Only an active goal may admit
+    // a continuation — paused, blocked, verifying, stalled or budget-limited
+    // goals must not have new work pushed into the session.
     const goal = this.store.byID(round.goalID);
-    if (!goal || goal.generation !== round.generation || isTerminal(goal.status)) {
+    if (!goal || goal.generation !== round.generation || goal.status !== "active") {
       const detail = goal
-        ? `goal moved to generation ${goal.generation} / ${goal.status}`
+        ? `goal moved to generation ${goal.generation} / status ${goal.status}`
         : "goal no longer exists";
-      this.store.markRoundFailed(round.id, `abandoned before admission: ${detail}`);
+      // No submission was attempted, so this is not a delivery failure.
+      this.store.markRoundFailed(round.id, `abandoned before admission: ${detail}`, {
+        parkGoal: false,
+      });
       return { action: "abandoned", roundID: round.id, detail };
     }
 
@@ -254,6 +279,17 @@ export class GoalDriver {
       if (result.ok) {
         // Admission only. Execution is observed separately.
         this.store.markRoundAdmitted(round.id);
+        // Bind the continuation message to its generation the moment it is
+        // admitted. The synthetic message carries this inbox ID, so any
+        // assistant message that follows it in the transcript is attributable
+        // to this execution by position — independent of wall-clock order
+        // between overlapping generations.
+        this.store.rememberMessageGeneration(
+          sessionID,
+          round.inboxID,
+          round.generation,
+          Date.now(),
+        );
         return { action: "admitted", roundID: round.id, inboxID: round.inboxID };
       }
       if (result.retryable) {
@@ -292,14 +328,12 @@ export class GoalDriver {
     for (const round of this.store.outstandingRounds()) {
       out.push(await this.reconcileRound(round));
     }
-    // Startup recovery: a goal whose continuation terminally failed and which
-    // now has no outstanding round is allowed to dispatch again. This is the
-    // "recovery" path that clears the delivery block.
-    for (const goal of this.store.activeGoals()) {
-      if (goal.deliveryFailed && !this.store.outstandingRound(goal.id)) {
-        this.store.clearDeliveryFailure(goal.id);
-      }
-    }
+    // A terminal delivery failure is deliberately NOT cleared here. Sweeping is
+    // automatic; recovering a definitively rejected goal must not be. Without
+    // this, every periodic sweep would erase the block the retry limit set and
+    // a permanent HTTP 400 would mint continuations forever. Recovery happens
+    // only through `controller.resume()`, an explicit user/model action that
+    // re-requests dispatch after the underlying condition may have changed.
     return out;
   }
 
@@ -311,7 +345,9 @@ export class GoalDriver {
     }
     if (goal.generation !== round.generation || isTerminal(goal.status)) {
       const detail = `superseded (generation ${goal.generation}, status ${goal.status})`;
-      this.store.markRoundFailed(round.id, detail);
+      // The goal itself moved on; a failure attributable to supersession is not
+      // a delivery failure of the goal that now exists.
+      this.store.markRoundFailed(round.id, detail, { parkGoal: false });
       return { action: "failed", roundID: round.id, inboxID: round.inboxID, detail };
     }
 
@@ -333,9 +369,14 @@ export class GoalDriver {
       case "settled": {
         // The round has actually finished. Settle it exactly once, classify it,
         // and then continue the loop if the goal still has work.
-        const evidenceCount = this.store.listEvidence(goal.id).length;
+        // Verifiable evidence only: checkpoint refs are model-annotated
+        // pointers, and counting them would let a model manufacture "progress"
+        // by narrating instead of working.
+        const verifiable = this.store.listEvidence(goal.id).filter((e) => e.kind !== "ref");
+        const evidenceCount = verifiable.length;
         const evidenceDelta = Math.max(0, evidenceCount - round.evidenceBaseline);
-        const verdict = this.classify({ goal, round, evidenceCount, evidenceDelta });
+        const liveWait = this.transport.liveWait?.({ sessionID: goal.sessionID }) ?? false;
+        const verdict = this.classify({ goal, round, evidenceCount, evidenceDelta, liveWait });
         const settledGoal = this.settleRound({
           roundID: round.id,
           classification: verdict.classification,

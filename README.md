@@ -12,7 +12,7 @@ after a completed one and a generation-checked replacement.
 
 ```bash
 bun run build     # required: the package entry is ./index.js
-bun test          # 150 unit/integration tests
+bun test          # 192 unit/integration tests
 bash scripts/parity.sh   # live activation acceptance (real server + model)
 ```
 
@@ -29,7 +29,10 @@ bash scripts/parity.sh   # live activation acceptance (real server + model)
 - **Evidence-gated completion.** `goal_propose_complete` starts verification; it
   does not complete the goal. Criteria are derived from the objective at creation
   and are checked independently (file content, command exit status, explicitly
-  bound evidence). A model statement is never evidence.
+  bound evidence). A model statement is never evidence. A broad objective-level
+  remainder is deliberately *not* provable by ordinary evidence — equally
+  consistent with a partial job — and resolves only through concrete
+  sub-criteria or explicit user acceptance (`/goal accept`).
 - **Exactly-once admission.** A round is reserved before submission, carries a
   caller-supplied inbox id, and is reconciled rather than re-sent. Duplicate
   `session.execution.succeeded` events do not double-count.
@@ -181,28 +184,49 @@ never silently supersedes work.
 ```
 /goal <objective>        set a goal and begin
 /goal status             show the latest goal (including a completed one)
-/goal replace <obj>      supersede the current goal
+/goal replace <obj>      supersede the current goal (fails its outstanding rounds)
+/goal accept [note]      explicitly accept the objective-level remainder
 /goal pause | resume     stop / restart dispatch
 /goal budget <n> | off   set or clear the token ceiling
 /goal health             structured diagnostics
 ```
+
+`/goal pause` stops dispatch only; it never changes the objective or the
+evidence. A goal parked by a permanent delivery failure (repeated transport
+rejection) is *not* resumed by a sweep — only an explicit `/goal resume`
+re-requests dispatch.
 
 The same operations are available over RPC:
 
 ```
 goal.create   goal.status   goal.history   goal.replace
 goal.pause    goal.resume   goal.budget    goal.health
+goal.accept
 ```
+
+`goal.status` reports `{ current, latest, goal }`: `current` is the nonterminal
+goal in progress (what a replacement confirmation must be rendered against —
+a completed goal is never "current"), `latest` is the most recent goal
+including a terminal one, and `goal` is kept as an alias of `latest` for
+existing consumers.
 
 ### Goal tools exposed to the model
 
 `goal_get`, `goal_checkpoint`, `goal_add_criterion`,
-`goal_propose_complete`, `goal_report_blocked`.
+`goal_supersede_criterion`, `goal_propose_complete`, `goal_report_blocked`.
 
 `goal_get` returns the criteria *and* the evidence the controller has captured,
 so the model can bind evidence to a criterion by id or ref. File criteria with a
 machine spec are re-checked independently; other criteria require explicitly
 bound, currently valid evidence.
+
+`goal_add_criterion` is additive and idempotent (an identical normalized
+requirement returns the existing criterion) and fenced like every other tool. It
+cannot create an objective-type criterion — accepting the objective is the
+user's verdict, not the model's. `goal_supersede_criterion` retires a
+derived/model criterion investigation proved wrong; the row is kept for the
+audit trail, and an explicit user requirement can never be superseded — it must
+be satisfied or the objective replaced.
 
 ---
 
@@ -239,7 +263,7 @@ inspection. It never touches the user's database or sessions.
 ## Verification
 
 ```bash
-bun test          # 150 unit/integration tests, 446 assertions
+bun test          # 192 unit/integration tests, 553 assertions
 bun run typecheck # clean
 bash scripts/parity.sh  # 17/17 live acceptance checks
 ```
@@ -305,14 +329,32 @@ Rules that are deliberate, not accidental:
   transaction guarded by generation and the verification snapshot.
 - Blocker acceptance counts distinct rounds with the same normalized reason.
   Repeating a preference is not a blocker.
-- Round classification compares the evidence count at settlement with the
-  baseline captured at preparation. Text-only turns are `noProgress`.
+- Round classification compares the *verifiable* evidence count at settlement
+  with the baseline captured at preparation. Checkpoint refs are model-annotated
+  pointers and never count as observations, so narrating via `goal_checkpoint`
+  cannot keep a goal alive. Text-only turns are `noProgress`; a turn waiting on
+  an observably running execution is `verifiedWait` and does not accumulate
+  toward a stall.
+- Tool-call ownership is attributed by **transcript position**: the nearest
+  preceding continuation (bound to its generation at admission) claims a
+  message, and a foreign human prompt stops the walk. Timestamp attribution
+  survives only for sessions with exactly one generation, where it cannot
+  misattribute.
+- Completion freshness is **recomputed**, not trusted: `completeGoal` re-hashes
+  the current criteria+evidence and refuses a commit whose verified snapshot no
+  longer matches the world.
 
 ### Where the evidence lives
 
 `~/.local/share/opencode-xgoal/goals.db` by default (`XGOAL_DB` overrides it).
 The database is the source of truth; the event stream and the in-memory observer
 are caches.
+
+**Legacy goal files are not this plugin.** The `.opencode/goals/*.json` files in
+this repository (e.g. `072e0449f40574c72e13daf765e2441b.json`) belong to an
+older file-based goal plugin, not to OpenCode-XGoal. They are left untouched on
+purpose: this plugin never reads or writes them, and they are not authoritative
+for any controller state here.
 
 ### What is not proven
 
@@ -358,6 +400,37 @@ drove the session. The audit fixes are now in the tree:
    `context.client.rpc(RpcDefinition)`.
 7. **One dispatch path** — `GoalCoordinator` creates/replaces/resumes state and
    schedules native execution; the command, TUI, and RPC all use it.
+
+A second independent audit then found subtler gaps; all are fixed with
+regression tests:
+
+8. **No permanent-failure redrive (P0)** — the periodic sweep no longer clears
+   the terminal delivery-failure park, so a permanently rejected transport
+   cannot mint fresh continuations forever; recovery is `/goal resume` only.
+   Dispatch re-checks the goal is still `active` immediately before admission.
+9. **Objective-level completion is a user verdict (P0)** — ordinary evidence
+   can no longer prove a broad objective, and the criteria derivation no longer
+   silently truncates at 8 items. `/goal accept` / `goal.accept` records
+   acceptance for the current generation (never carried across a replace) and
+   finishes a verifying goal when acceptance was the only gap.
+10. **Execution-ownership fencing (P1)** — tool calls are attributed by
+    transcript position rather than wall-clock overlap, with a fail-closed
+    `selectToolRef` when neither a message identity nor a complete goal
+    reference exists; continuations are bound to their generation at admission.
+11. **Criterion refinement (P1)** — `goal_add_criterion` (idempotent, no
+    objective-type specs from the model) and `goal_supersede_criterion`
+    (user-source requirements are protected) are registered with the same
+    fencing as every other tool.
+12. **Honest progress classification (P1)** — only non-`ref` evidence counts
+    toward the stall threshold, and an observably running execution classifies
+    as `verifiedWait` instead of accumulating `noProgress`.
+13. **Settlement correlation (P1)** — the probe bounds its scan at the first
+    foreign human prompt, so a terminal assistant answering an interleaved
+    human turn is never scored as settlement of the round; session workspace
+    caches are invalidated on session lifecycle events.
+14. **Atomic supersession (P1)** — replacing a goal fails its outstanding
+    rounds in the same transaction, and completion recomputes the
+    criteria+evidence snapshot so a stale verification cannot commit (P2).
 
 Additional fixes: generation fencing on every model tool, per-round blocker
 claims, checkpoint-as-annotation, round evidence baselines, `unknown → admitted`

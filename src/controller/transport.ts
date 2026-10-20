@@ -19,7 +19,24 @@ interface Observed {
   delivered: boolean;
   running: boolean;
   finished: boolean;
+  /**
+   * Whether this execution currently holds a reference in `runningBySession`.
+   * Tied to the slot so settlement can release it — a completion event that
+   * never arrives cannot leak the reference forever.
+   */
+  counted?: boolean;
+  sessionID?: string;
 }
+
+/**
+ * A busy reference older than this is treated as stale.
+ *
+ * Safety net for the residue the slot bookkeeping cannot cover: an execution
+ * whose completion event was dropped AND whose settlement is never observed in
+ * any transcript. Prefer stalling a goal late (the user is asked) over letting
+ * an unproductive session classify `verifiedWait` forever.
+ */
+const LIVE_WAIT_TTL_MS = 15 * 60 * 1000;
 
 /**
  * Tracks continuation messages by inbox ID from the event stream.
@@ -30,6 +47,8 @@ interface Observed {
  */
 export class RoundObserver {
   private readonly seen = new Map<string, Observed>();
+  /** Running executions per session, from execution lifecycle events. */
+  private readonly runningBySession = new Map<string, { count: number; touchedMs: number }>();
 
   private slot(inboxID: string): Observed {
     let s = this.seen.get(inboxID);
@@ -38,6 +57,24 @@ export class RoundObserver {
       this.seen.set(inboxID, s);
     }
     return s;
+  }
+
+  private addBusy(sessionID: string): void {
+    const now = Date.now();
+    const entry = this.runningBySession.get(sessionID);
+    if (entry) {
+      entry.count += 1;
+      entry.touchedMs = now;
+    } else {
+      this.runningBySession.set(sessionID, { count: 1, touchedMs: now });
+    }
+  }
+
+  private removeBusy(sessionID: string): void {
+    const entry = this.runningBySession.get(sessionID);
+    if (!entry) return;
+    entry.count -= 1;
+    if (entry.count <= 0) this.runningBySession.delete(sessionID);
   }
 
   /** Feed one event. Unknown shapes are ignored rather than guessed at. */
@@ -63,6 +100,44 @@ export class RoundObserver {
       (pick("messageId") as string | undefined) ??
       ((pick("message") as { id?: string } | undefined)?.id as string | undefined) ??
       ((pick("info") as { id?: string } | undefined)?.id as string | undefined);
+
+    // Session-level execution liveness: a verified wait must be able to see a
+    // real running execution, not infer one from silence. For our own
+    // continuations the reference is tied to the message slot, so authoritative
+    // settlement (which knows the slot) can release it even when the completion
+    // event was never observed; duplicate `started` events are idempotent.
+    if (type.startsWith("session.execution.")) {
+      const sessionID = pick("sessionID") as string | undefined;
+      if (sessionID) {
+        const continuation = id?.startsWith("msg_xgoal_") ? this.slot(id) : undefined;
+        if (continuation) {
+          continuation.sessionID = sessionID;
+          if (type === "session.execution.started") {
+            if (!continuation.counted) {
+              continuation.counted = true;
+              this.addBusy(sessionID);
+            }
+          } else if (
+            (type === "session.execution.succeeded" || type === "session.execution.failed") &&
+            continuation.counted
+          ) {
+            continuation.counted = false;
+            this.removeBusy(sessionID);
+          }
+        } else {
+          const entry = this.runningBySession.get(sessionID);
+          if (type === "session.execution.started") {
+            this.addBusy(sessionID);
+          } else if (
+            (type === "session.execution.succeeded" || type === "session.execution.failed") &&
+            entry
+          ) {
+            this.removeBusy(sessionID);
+          }
+        }
+      }
+    }
+
     if (!id || !id.startsWith("msg_xgoal_")) return;
 
     const s = this.slot(id);
@@ -99,8 +174,33 @@ export class RoundObserver {
     return "unknown";
   }
 
-  /** Forget a round once it has settled, so the map cannot grow unbounded. */
+  /**
+   * Is an execution for this session observably still running?
+   *
+   * A busy reference is released by its completion event OR by authoritative
+   * transcript settlement of the round (see `forget`); a reference older than
+   * the TTL is stale and ignored rather than pinning the session busy forever.
+   */
+  isBusy(sessionID: string): boolean {
+    const entry = this.runningBySession.get(sessionID);
+    if (!entry || entry.count <= 0) return false;
+    return Date.now() - entry.touchedMs < LIVE_WAIT_TTL_MS;
+  }
+
+  /**
+   * Forget a round once it has settled, so the map cannot grow unbounded.
+   *
+   * Settlement is authoritative: the transcript showed the execution end. If
+   * the completion event was missed, this is what releases the slot's busy
+   * reference — event loss can no longer classify every future round as a
+   * verified wait.
+   */
   forget(inboxID: string): void {
+    const slot = this.seen.get(inboxID);
+    if (slot?.counted && slot.sessionID) {
+      slot.counted = false;
+      this.removeBusy(slot.sessionID);
+    }
     this.seen.delete(inboxID);
   }
 }
@@ -180,6 +280,11 @@ export class SessionTransport implements ContinuationTransport {
     }
   }
 
+  /** Is an execution for this session observably still running? */
+  liveWait(input: { sessionID: string }): boolean {
+    return this.observer.isBusy(input.sessionID);
+  }
+
   /**
    * Probe the authoritative session state, not just our own memory.
    *
@@ -206,12 +311,11 @@ export class SessionTransport implements ContinuationTransport {
     }
 
     const queued = state.inbox.some((item) => item.id === input.round.inboxID);
-    const index = state.messages.findIndex(
-      (message) =>
-        message.id === input.round.inboxID ||
-        message.metadata?.inboxID === input.round.inboxID ||
-        message.metadata?.roundID === input.round.id,
-    );
+    const isOwn = (message: SessionState["messages"][number]): boolean =>
+      message.id === input.round.inboxID ||
+      message.metadata?.inboxID === input.round.inboxID ||
+      message.metadata?.roundID === input.round.id;
+    const index = state.messages.findIndex(isOwn);
 
     // Not in the transcript yet. If it is still in the inbox it is queued;
     // otherwise the outcome is genuinely unknown, which keeps it outstanding.
@@ -220,23 +324,41 @@ export class SessionTransport implements ContinuationTransport {
       return cached === "unknown" ? "unknown" : cached;
     }
 
-    // Delivered. The turn is over when the session has gone idle or the last
-    // assistant message finished. `tool-calls` is not a finish: the loop
-    // continues with more tool work.
-    const after = state.messages.slice(index + 1);
-    const idle = after.some((message) => message.type === "idle");
-    const lastAssistant = [...after].reverse().find((message) => message.type === "assistant");
-    const finished =
-      idle ||
-      lastAssistant?.finish === "stop" ||
-      lastAssistant?.finish === "length" ||
-      lastAssistant?.finish === "content-filter" ||
-      lastAssistant?.finish === "error";
-
-    if (finished) {
-      this.observer.forget(input.round.inboxID);
-      return "settled";
+    // Delivered. Scan FORWARD from the round message for evidence the turn
+    // ended: the session went idle, or an assistant message reached a terminal
+    // finish. `tool-calls` is not a finish: the loop continues with more tool
+    // work.
+    //
+    // The scan is bounded by the first foreign user message. A human prompt
+    // interleaved after our continuation starts a NEW turn: everything after
+    // it belongs to that turn, so a terminal assistant answering the human
+    // must not be scored as settlement of our round. If the foreign prompt
+    // comes first, the round's fate is genuinely unknown — never "settled".
+    for (let i = index + 1; i < state.messages.length; i++) {
+      const message = state.messages[i];
+      const foreign =
+        message.type === "user" &&
+        message.id !== input.round.inboxID &&
+        !isOwn(message);
+      if (foreign) {
+        return cached === "running" ? "running" : "unknown";
+      }
+      if (message.type === "idle") {
+        this.observer.forget(input.round.inboxID);
+        return "settled";
+      }
+      if (
+        message.type === "assistant" &&
+        (message.finish === "stop" ||
+          message.finish === "length" ||
+          message.finish === "content-filter" ||
+          message.finish === "error")
+      ) {
+        this.observer.forget(input.round.inboxID);
+        return "settled";
+      }
     }
+    // No terminal signal and no foreign prompt: the turn may still be running.
     return "running";
   }
 }

@@ -67,4 +67,21 @@ describe("deriveCriteria", () => {
     expect(criteria).toHaveLength(3);
     expect(criteria.every((c) => c.spec.type === "file")).toBe(true);
   });
+
+  // Audit P0-2: derivation used to stop after 8 parsed items, silently
+  // discarding the tail of an enumerated objective — verification could then
+  // certify a shortened interpretation of what the user asked for.
+  test("no requirement is silently truncated, however long the list", () => {
+    const names = "abcdefghijkl".split("");
+    const objective = [
+      "Complete all of the following:",
+      ...names.map(
+        (n, i) => `${i + 1}. Create a file called ${n}.txt containing exactly: content-${n}`,
+      ),
+    ].join("\n");
+    const criteria = deriveCriteria(objective);
+    const paths = criteria.map((c) => (c.spec as { path: string }).path);
+    expect(criteria).toHaveLength(names.length);
+    expect(new Set(paths).size).toBe(names.length);
+  });
 });

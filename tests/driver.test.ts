@@ -10,6 +10,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GoalStore } from "../src/controller/store.ts";
+import { GoalController } from "../src/controller/controller.ts";
 import {
   GoalDriver,
   newInboxID,
@@ -45,6 +46,8 @@ class FakeTransport implements ContinuationTransport {
   probeResult: ProbeResult = "unknown";
   /** Throw instead of returning, to simulate a transport-level explosion. */
   throwOnSubmit = false;
+  /** Reported by liveWait: whether a background execution is still running. */
+  liveWaitResult = false;
   /** Runs inside submit, before returning — lets a test inspect DB state. */
   onSubmit?: (inboxID: string) => void;
 
@@ -63,6 +66,10 @@ class FakeTransport implements ContinuationTransport {
   async probe(input: { sessionID: string; round: { id: string } }): Promise<ProbeResult> {
     this.probed.push(input.round.id);
     return this.probeResult;
+  }
+
+  liveWait(): boolean {
+    return this.liveWaitResult;
   }
 }
 
@@ -263,14 +270,20 @@ describe("concurrency", () => {
 });
 
 describe("fencing and recovery", () => {
-  test("a round for a superseded goal is failed, never re-submitted", async () => {
+  test("a round for a superseded goal is failed at replace time, never re-submitted", async () => {
     const { transport, driver, goal } = setup();
     // Reserve, then supersede before dispatch.
-    store.prepareRound({ goalID: goal.id, generation: 1, inboxID: newInboxID() });
+    const stale = store.prepareRound({ goalID: goal.id, generation: 1, inboxID: newInboxID() });
     store.replace({ sessionID: "ses_a", expectedGeneration: 1, objective: "new objective" });
 
+    // The replacement fails the stale round in its own transaction — before
+    // any reconcile sweep runs.
+    expect(store.roundByID(stale.id)!.status).toBe("failed");
+    expect(store.roundByID(stale.id)!.detail).toContain("superseded");
+
+    // Nothing outstanding remains for the sweep to find, and nothing was sent.
     const outcomes = await driver.reconcile();
-    expect(outcomes[0].action).toBe("failed");
+    expect(outcomes.filter((o) => "roundID" in o && o.roundID === stale.id)).toHaveLength(0);
     expect(transport.submitted).toHaveLength(0);
   });
 
@@ -295,14 +308,13 @@ describe("fencing and recovery", () => {
     expect(transport.submitted[0].text).toContain("newer objective");
     expect(transport.submitted[0].text).not.toContain("build the replacement");
 
-    // The stale round is still outstanding until reconciled, then failed with a
-    // reason. It must never be re-submitted.
-    transport.probeResult = "notDelivered";
-    const outcomes = await driver.reconcile();
-    const staleOutcome = outcomes.find((o) => "roundID" in o && o.roundID === stale.id);
-    expect(staleOutcome?.action).toBe("failed");
+    // The stale round is failed by the replacement itself, with a reason. It
+    // must never be re-submitted.
     expect(store.roundByID(stale.id)!.status).toBe("failed");
     expect(store.roundByID(stale.id)!.detail).toContain("superseded");
+    const outcomes = await driver.reconcile();
+    const staleOutcome = outcomes.find((o) => "roundID" in o && o.roundID === stale.id);
+    expect(staleOutcome).toBeUndefined();
 
     // The real invariant: nothing submitted ever carried the superseded
     // objective. (The replacement's own undelivered round is legitimately
@@ -358,6 +370,81 @@ describe("fencing and recovery", () => {
     }
     // The goal is still active, so the loop continues with a NEW continuation.
     expect(transport2.submitted).toHaveLength(1);
+  });
+});
+
+describe("permanent delivery failure is parked until explicit recovery", () => {
+  test("a definitive rejection is never redriven by recovery sweeps", async () => {
+    const { transport, driver, goal } = setup();
+    // A permanent HTTP 400: not retryable.
+    transport.submitResult = { ok: false, retryable: false, error: "400 bad request" };
+    const out = await driver.drive("ses_a");
+    expect(out.action).toBe("failed");
+    expect(store.byID(goal.id)!.deliveryFailed).toBe(true);
+
+    // 100 automatic sweeps. The old behaviour cleared the delivery block on
+    // each sweep, minting a fresh continuation every time — an unbounded
+    // retry loop against a permanently failing endpoint.
+    transport.submitResult = { ok: true };
+    for (let i = 0; i < 100; i++) {
+      await driver.reconcile();
+      await driver.drive("ses_a");
+    }
+    // Exactly one submission: the original rejected one. No redrive.
+    expect(transport.submitted).toHaveLength(1);
+    expect(store.roundsFor(goal.id)).toHaveLength(1);
+    expect(store.byID(goal.id)!.deliveryFailed).toBe(true);
+
+    // Explicit recovery: exactly one permitted retry, using a fresh id (the
+    // rejected round is settled; its id is not reused).
+    const controller = new GoalController({ dbPath });
+    try {
+      controller.resume("ses_a");
+    } finally {
+      controller.close();
+    }
+    expect(store.byID(goal.id)!.deliveryFailed).toBe(false);
+    const retry = await driver.drive("ses_a");
+    expect(retry.action).toBe("admitted");
+    expect(transport.submitted).toHaveLength(2);
+    // And the recovered goal does not immediately fail again in a loop.
+    await driver.reconcile();
+    expect(transport.submitted).toHaveLength(2);
+  });
+
+  test("a round abandoned because the goal was paused is not a delivery failure", async () => {
+    const { transport, driver, goal } = setup();
+    // Reserve, then pause before the transport is ever called.
+    const round = store.prepareRound({
+      goalID: goal.id,
+      generation: 1,
+      inboxID: newInboxID(),
+    });
+    store.transition({ goalID: goal.id, generation: 1, to: "paused", actor: "user" });
+
+    transport.probeResult = "notDelivered";
+    await driver.reconcile();
+
+    expect(store.roundByID(round.id)!.status).toBe("failed");
+    // Nothing was submitted, so no delivery failure may be recorded — a pause
+    // must not require an "explicit recovery" the user never caused.
+    expect(store.byID(goal.id)!.deliveryFailed).toBe(false);
+    expect(transport.submitted).toHaveLength(0);
+  });
+
+  test("a superseded goal's failed round does not park the replacement", async () => {
+    const { transport, driver, goal } = setup();
+    const stale = store.prepareRound({ goalID: goal.id, generation: 1, inboxID: newInboxID() });
+    store.replace({ sessionID: "ses_a", expectedGeneration: 1, objective: "new objective" });
+
+    transport.probeResult = "notDelivered";
+    await driver.reconcile();
+
+    expect(store.roundByID(stale.id)!.status).toBe("failed");
+    // The replacement must be immediately drivable: supersession is not a
+    // transport failure of anything.
+    const out = await driver.drive("ses_a");
+    expect(out.action).toBe("admitted");
   });
 });
 
@@ -503,5 +590,95 @@ describe("settled rounds drive the next continuation", () => {
     // before reserving another continuation.
     expect(store.current("ses_a")!.rounds).toBe(2);
     expect(store.current("ses_a")!.noProgressRounds).toBe(2);
+  });
+});
+
+// Audit P1-5: progress classification used the DEFAULT classifier wired to
+// real evidence, but counted checkpoint refs as evidence — so a model could
+// avoid the stall threshold by narrating (goal_checkpoint) instead of working.
+describe("progress classification counts only verifiable evidence", () => {
+  test("checkpoint spam cannot avoid the stall threshold", async () => {
+    const transport = new FakeTransport();
+    // Production configuration: no custom classifier, so DEFAULT_CLASSIFY runs.
+    const driver = new GoalDriver(store, transport, { maxNoProgressRounds: 3 });
+    const goal = store.create({ sessionID: "ses_a", objective: "build the replacement" });
+
+    // Ten rounds, each doing nothing but emitting a checkpoint (ref evidence).
+    for (let i = 0; i < 10; i++) {
+      await driver.drive("ses_a");
+      store.addEvidence({
+        goalID: goal.id,
+        kind: "ref",
+        ref: `checkpoint narrative ${i}`,
+        detail: "progress notes",
+      });
+      transport.probeResult = "settled";
+      await driver.drive("ses_a");
+      if (store.current("ses_a")!.status === "stalled") break;
+    }
+
+    // The refs never counted: the goal stalled at the configured threshold
+    // instead of being kept alive by narration.
+    expect(store.current("ses_a")!.status).toBe("stalled");
+    expect(store.current("ses_a")!.noProgressRounds).toBe(3);
+    // Checkpoints WERE captured — and still no round counted as progress.
+    expect(store.listEvidence(goal.id).filter((e) => e.kind === "ref").length).toBeGreaterThan(0);
+  });
+
+  test("a legitimate investigation with new observations counts as progress", async () => {
+    const transport = new FakeTransport();
+    const driver = new GoalDriver(store, transport, { maxNoProgressRounds: 1 });
+    const goal = store.create({ sessionID: "ses_a", objective: "diagnose the flake" });
+
+    // Dispatch the first continuation.
+    await driver.drive("ses_a");
+
+    // A multi-turn investigation: each turn runs a command (machine-observed
+    // evidence) and settles. No file is edited — that is still real progress,
+    // and with the threshold at 1 a single miscount would stall the goal.
+    for (let i = 0; i < 5; i++) {
+      store.addEvidence({
+        goalID: goal.id,
+        kind: "command",
+        ref: `cat logs/attempt-${i}.log`,
+        detail: "exit 0",
+        exitCode: 0,
+      });
+      transport.probeResult = "settled";
+      await driver.drive("ses_a");
+    }
+
+    expect(store.current("ses_a")!.status).toBe("active");
+    expect(store.current("ses_a")!.noProgressRounds).toBe(0);
+  });
+
+  test("a verified live wait does not accumulate toward a stall", async () => {
+    const transport = new FakeTransport();
+    const driver = new GoalDriver(store, transport, { maxNoProgressRounds: 2 });
+    store.create({ sessionID: "ses_a", objective: "wait for the migration" });
+
+    // Three settled rounds with no new evidence, but an execution observably
+    // running each time: waiting on a real job, not spinning.
+    transport.liveWaitResult = true;
+    for (let i = 0; i < 3; i++) {
+      await driver.drive("ses_a");
+      transport.probeResult = "settled";
+      await driver.drive("ses_a");
+    }
+
+    expect(store.current("ses_a")!.status).toBe("active");
+    expect(store.current("ses_a")!.noProgressRounds).toBe(0);
+    const settled = store
+      .roundsFor(store.current("ses_a")!.id)
+      .filter((r) => r.status === "settled");
+    expect(settled.every((r) => r.classification === "verifiedWait")).toBe(true);
+
+    // Once the job finishes (no more live wait), unproductive rounds count
+    // again — the stall policy still applies to genuine spinning.
+    transport.liveWaitResult = false;
+    await driver.drive("ses_a");
+    expect(store.current("ses_a")!.noProgressRounds).toBe(1);
+    await driver.drive("ses_a");
+    expect(store.current("ses_a")!.status).toBe("stalled");
   });
 });

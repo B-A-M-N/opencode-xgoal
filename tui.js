@@ -129,7 +129,10 @@ var goalRpcDefinition = {
   methods: {
     "goal.status": {
       input: { type: "object", properties: { sessionID: str }, required: ["sessionID"] },
-      output: { type: "object", properties: { goal: goalOrNull } }
+      output: {
+        type: "object",
+        properties: { current: goalOrNull, latest: goalOrNull, goal: goalOrNull }
+      }
     },
     "goal.history": {
       input: { type: "object", properties: { sessionID: str }, required: ["sessionID"] },
@@ -164,6 +167,14 @@ var goalRpcDefinition = {
     },
     "goal.resume": {
       input: { type: "object", properties: { sessionID: str }, required: ["sessionID"] },
+      output: { type: "object", properties: { goal: goalOrNull, error: str } }
+    },
+    "goal.accept": {
+      input: {
+        type: "object",
+        properties: { sessionID: str, note: str },
+        required: ["sessionID"]
+      },
       output: { type: "object", properties: { goal: goalOrNull, error: str } }
     },
     "goal.health": {
@@ -225,20 +236,29 @@ var tui_default = exports_plugin.define({
         context.ui.toast.show({ title: "OpenCode-XGoal", message, variant, sessionID });
       } catch {}
     };
-    const statusText = (goal) => {
-      if (!goal)
+    const statusText = (current, latest) => {
+      const budget = (goal) => goal.tokenBudget === null ? `${goal.tokensUsed ?? 0} tokens` : `${goal.tokensUsed ?? 0}/${goal.tokenBudget} tokens`;
+      if (!current && latest) {
+        return [
+          `[${latest.status}] generation ${latest.generation}: ${latest.objective}`,
+          `rounds ${latest.rounds}, ${budget(latest)}`,
+          `No goal in progress. Use /goal <objective> to start the next one.`
+        ].join(`
+`);
+      }
+      if (!current)
         return "No active goal. Use /goal <objective>.";
-      const budget = goal.tokenBudget === null ? `${goal.tokensUsed ?? 0} tokens` : `${goal.tokensUsed ?? 0}/${goal.tokenBudget} tokens`;
       return [
-        `[${goal.status}] generation ${goal.generation}: ${goal.objective}`,
-        `rounds ${goal.rounds}, no-progress ${goal.noProgressRounds}, ${budget}`
+        `[${current.status}] generation ${current.generation}: ${current.objective}`,
+        `rounds ${current.rounds}, no-progress ${current.noProgressRounds}, ${budget(current)}`,
+        ...current.status === "verifying" ? [`Machine verification is blocked; run /goal accept to record acceptance.`] : []
       ].join(`
 `);
     };
     const replaceGoal = async (sessionID, objective, expectedGeneration) => {
       let expected = expectedGeneration;
       if (expected === undefined) {
-        const current = (await rpc["goal.status"]({ sessionID })).goal;
+        const current = (await rpc["goal.status"]({ sessionID })).current;
         if (!current) {
           await createGoal(sessionID, objective);
           return;
@@ -271,7 +291,7 @@ var tui_default = exports_plugin.define({
       const arg = rest.join(" ").trim();
       if (!text || verb === "status") {
         const res = await rpc["goal.status"]({ sessionID });
-        notify(statusText(res.goal), "info", sessionID);
+        notify(statusText(res.current, res.latest), "info", sessionID);
         return;
       }
       if (verb === "pause" || verb === "resume") {
@@ -293,7 +313,7 @@ var tui_default = exports_plugin.define({
         return;
       }
       if (verb === "budget") {
-        const current = (await rpc["goal.status"]({ sessionID })).goal;
+        const current = (await rpc["goal.status"]({ sessionID })).current;
         if (!current) {
           notify("No active goal.", "warning", sessionID);
           return;
@@ -316,12 +336,17 @@ var tui_default = exports_plugin.define({
         notify(res.error ? `Could not set the budget: ${res.error}` : `Token budget set to ${Math.floor(n)}.`, res.error ? "error" : "success", sessionID);
         return;
       }
+      if (verb === "accept") {
+        const res = await rpc["goal.accept"]({ sessionID, note: arg || undefined });
+        notify(res.error ? `Could not record acceptance: ${res.error}` : "Acceptance recorded for the current generation.", res.error ? "error" : "success", sessionID);
+        return;
+      }
       if (verb === "health") {
         const res = await rpc["goal.health"]({ sessionID });
         notify(JSON.stringify(res.health, null, 2), res.health?.ok === false ? "warning" : "info", sessionID);
         return;
       }
-      const existing = (await rpc["goal.status"]({ sessionID })).goal;
+      const existing = (await rpc["goal.status"]({ sessionID })).current;
       if (!existing) {
         await createGoal(sessionID, text);
         return;

@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 
 // src/controller/store.ts
 import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
 
 // src/controller/state.ts
 var TERMINAL_STATUSES = ["complete", "superseded"];
@@ -164,6 +165,10 @@ CREATE TABLE IF NOT EXISTS goal_criteria (
   -- verification.
   source      TEXT NOT NULL DEFAULT 'derived',
   met         INTEGER NOT NULL DEFAULT 0,
+  -- A derived/model criterion that investigation proved wrong is superseded,
+  -- not deleted: the row stays for the audit trail but no longer gates
+  -- verification. User-source criteria cannot be superseded by the model.
+  superseded  INTEGER NOT NULL DEFAULT 0,
   created_at_ms INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS goal_criteria_goal ON goal_criteria (goal_id);
@@ -240,6 +245,21 @@ CREATE TABLE IF NOT EXISTS session_usage (
   updated_at_ms INTEGER NOT NULL
 );
 
+-- Explicit user acceptance of an objective-level criterion.
+--
+-- A broad objective ("fix the flaky tests", "clean up the config handling")
+-- cannot be machine-proven from ordinary evidence: any passing test or file
+-- change is consistent with a partial job. Rather than pretend completeness is
+-- established, the verifier leaves such criteria unresolved until the user
+-- either accepts the objective explicitly (this table, generation-fenced) or
+-- the model registers concrete machine-checkable sub-criteria.
+CREATE TABLE IF NOT EXISTS goal_acceptances (
+  goal_id     TEXT PRIMARY KEY,
+  generation  INTEGER NOT NULL,
+  note        TEXT,
+  at_ms       INTEGER NOT NULL
+);
+
 -- Continuation ledger. One row per continuation attempt.
 --
 -- inbox_id is the OpenCode message ID we reserve BEFORE submitting, and it is
@@ -308,6 +328,20 @@ function newID(prefix) {
   counter += 1;
   return `${prefix}_${Date.now().toString(36)}_${counter.toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
 }
+function snapshotHash(criteria, evidence) {
+  const canonical = JSON.stringify({
+    criteria: criteria.map((c) => [c.id, c.text, c.spec ?? null]),
+    evidence: evidence.map((e) => [
+      e.id,
+      e.kind,
+      e.ref,
+      e.exitCode ?? null,
+      e.hash ?? null,
+      e.criterionID ?? null
+    ])
+  });
+  return createHash("sha256").update(canonical).digest("hex").slice(0, 32);
+}
 
 class GoalStore {
   db;
@@ -318,6 +352,13 @@ class GoalStore {
     this.db.exec("PRAGMA foreign_keys = ON");
     this.db.exec("PRAGMA busy_timeout = 5000");
     this.db.exec(SCHEMA);
+    this.migrate();
+  }
+  migrate() {
+    const columns = this.db.query(`PRAGMA table_info(goal_criteria)`).all().map((row) => row.name);
+    if (!columns.includes("superseded")) {
+      this.db.exec(`ALTER TABLE goal_criteria ADD COLUMN superseded INTEGER NOT NULL DEFAULT 0`);
+    }
   }
   close() {
     this.db.close();
@@ -431,6 +472,10 @@ class GoalStore {
         actor: input.actor ?? "user",
         detail: input.reason ?? `replaced by ${newIDValue}`
       });
+      const stale = this.outstandingRound(existing.id);
+      if (stale) {
+        this.markRoundFailed(stale.id, `superseded by ${newIDValue}`, { parkGoal: false });
+      }
       this.db.query(`INSERT INTO goals (id, session_id, generation, objective, status, rounds,
              no_progress_rounds, repeated_blocker_rounds, token_budget, version,
              created_at_ms, updated_at_ms)
@@ -535,11 +580,62 @@ class GoalStore {
     if (!isNonTerminal(goal.status)) {
       throw new TransitionRejectedError(`cannot add criteria to terminal goal ${goalID}`);
     }
+    const normalized = text.trim().toLowerCase().replace(/\s+/g, " ");
+    if (source === "model" && spec?.type === "objective") {
+      throw new TransitionRejectedError("the model cannot establish an objective-type criterion; only the user can accept the objective");
+    }
     let id = "";
     this.tx(() => {
+      const existingRows = this.db.query(`SELECT id, text FROM goal_criteria WHERE goal_id = ? AND superseded = 0`).all(goalID);
+      const existing = existingRows.find((r) => r.text.trim().toLowerCase().replace(/\s+/g, " ") === normalized);
+      if (existing) {
+        id = existing.id;
+        return;
+      }
       id = this.insertCriterion(goalID, goal.generation, { text, spec, source }, Date.now());
     });
     return id;
+  }
+  supersedeCriterion(criterionID, reason) {
+    this.tx(() => {
+      const row = this.db.query(`SELECT goal_id, generation, source, superseded FROM goal_criteria WHERE id = ?`).get(criterionID);
+      if (!row)
+        throw new GoalConflictError(`unknown criterion ${criterionID}`);
+      if (row.source === "user") {
+        throw new TransitionRejectedError("an explicit user requirement cannot be superseded; it must be satisfied or the objective replaced");
+      }
+      if (row.superseded === 1)
+        return;
+      this.db.query(`UPDATE goal_criteria SET superseded = 1, met = 0 WHERE id = ?`).run(criterionID);
+      this.appendEvent(row.goal_id, row.generation, "criterion-superseded", {
+        actor: "model",
+        detail: reason.slice(0, 300)
+      });
+    });
+  }
+  recordUserAcceptance(goalID, generation, note) {
+    this.tx(() => {
+      const goal = this.byID(goalID);
+      if (!goal)
+        throw new GoalConflictError(`unknown goal ${goalID}`);
+      if (goal.generation !== generation) {
+        throw new GoalConflictError(`stale generation: goal ${goalID} is generation ${goal.generation}, acceptance claimed ${generation}`);
+      }
+      this.db.query(`INSERT INTO goal_acceptances (goal_id, generation, note, at_ms)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(goal_id) DO UPDATE SET generation=excluded.generation,
+             note=excluded.note, at_ms=excluded.at_ms`).run(goalID, generation, note ?? null, Date.now());
+      this.appendEvent(goalID, generation, "accepted", {
+        actor: "user",
+        detail: note ?? "user accepted the objective"
+      });
+    });
+  }
+  userAcceptance(goalID) {
+    const row = this.db.query(`SELECT generation, note, at_ms FROM goal_acceptances WHERE goal_id = ?`).get(goalID);
+    if (!row)
+      return;
+    return { generation: row.generation, note: row.note ?? undefined, atMs: row.at_ms };
   }
   addEvidence(input) {
     const goal = this.byID(input.goalID);
@@ -551,7 +647,8 @@ class GoalStore {
     });
   }
   listCriteria(goalID) {
-    return this.db.query(`SELECT id, text, met, spec, source FROM goal_criteria WHERE goal_id = ? ORDER BY created_at_ms ASC`).all(goalID).map((r) => ({
+    return this.db.query(`SELECT id, text, met, spec, source FROM goal_criteria
+          WHERE goal_id = ? AND superseded = 0 ORDER BY created_at_ms ASC`).all(goalID).map((r) => ({
       id: r.id,
       text: r.text,
       met: r.met === 1,
@@ -704,7 +801,7 @@ class GoalStore {
       }
       const id = newID("round");
       const now = Date.now();
-      const baseline = this.db.query(`SELECT COUNT(*) AS n FROM goal_evidence WHERE goal_id = ?`).get(input.goalID).n;
+      const baseline = this.db.query(`SELECT COUNT(*) AS n FROM goal_evidence WHERE goal_id = ? AND kind != 'ref'`).get(input.goalID).n;
       this.db.query(`INSERT INTO goal_rounds
              (id, goal_id, generation, inbox_id, status, attempts, evidence_baseline, prepared_at_ms)
            VALUES (?, ?, ?, ?, 'prepared', 1, ?, ?)`).run(id, input.goalID, input.generation, input.inboxID, baseline, now);
@@ -777,14 +874,15 @@ class GoalStore {
       return this.roundByID(roundID);
     });
   }
-  markRoundFailed(roundID, detail) {
+  markRoundFailed(roundID, detail, options = {}) {
+    const parkGoal = options.parkGoal ?? true;
     return this.tx(() => {
       const round = this.roundByID(roundID);
       if (!round)
         throw new GoalConflictError(`unknown round ${roundID}`);
       this.db.query(`UPDATE goal_rounds SET status='failed', detail=?, settled_at_ms=? WHERE id=?`).run(detail, Date.now(), roundID);
       const goal = this.byID(round.goalID);
-      if (goal) {
+      if (goal && parkGoal) {
         this.db.query(`UPDATE goals SET delivery_failed=1, updated_at_ms=?, version=version+1
               WHERE id=? AND version=?`).run(Date.now(), goal.id, goal.version);
       }
@@ -844,6 +942,9 @@ class GoalStore {
       return { round: this.roundByID(input.roundID), goal };
     });
   }
+  snapshotOf(goalID) {
+    return snapshotHash(this.listCriteria(goalID), this.listEvidence(goalID));
+  }
   completeGoal(input) {
     return this.tx(() => {
       const goal = this.byID(input.goalID);
@@ -855,8 +956,11 @@ class GoalStore {
       if (goal.status !== "verifying") {
         throw new TransitionRejectedError(`cannot complete goal ${input.goalID} from status ${goal.status}; verification is required first`);
       }
-      if (input.snapshot !== undefined && goal.verificationSnapshot !== input.snapshot) {
-        throw new GoalConflictError(`verification snapshot mismatch: the verifier checked ${goal.verificationSnapshot ?? "none"}, ` + `this completion claims ${input.snapshot}`);
+      if (input.snapshot !== undefined) {
+        const current = this.snapshotOf(input.goalID);
+        if (current !== input.snapshot) {
+          throw new GoalConflictError(`verification is stale: the criteria or evidence changed after the verifier checked ` + `${input.snapshot} (now ${current}); re-verify before completing`);
+        }
       }
       const outstanding = this.outstandingRound(input.goalID);
       if (outstanding) {
@@ -886,6 +990,10 @@ class GoalStore {
           WHERE session_id = ? AND created_at_ms <= ?
           ORDER BY created_at_ms DESC LIMIT 1`).get(sessionID, atMs);
     return row?.generation;
+  }
+  generationCount(sessionID) {
+    const row = this.db.query(`SELECT COUNT(*) AS n FROM goals WHERE session_id = ?`).get(sessionID);
+    return row?.n ?? 0;
   }
 }
 function toRound(r) {
@@ -991,36 +1099,24 @@ function deriveCriteria(objective) {
         matched = true;
         contentPaths.add(spec.path);
         push(`${spec.path} contains ${content}`, spec);
-        if (criteria.length >= 8)
-          break;
       }
-      if (criteria.length >= 8)
-        break;
     }
-    if (criteria.length < 8) {
-      for (const { re, build } of FILE_PATTERNS) {
-        if (criteria.length >= 8)
-          break;
-        for (const match of target.matchAll(re)) {
-          const spec = build(match);
-          if (!spec || spec.type !== "file")
-            continue;
-          if ("contains" in spec && spec.contains)
-            continue;
-          if (contentPaths.has(spec.path))
-            continue;
-          matched = true;
-          push(`${spec.path} exists`, spec);
-          if (criteria.length >= 8)
-            break;
-        }
+    for (const { re, build } of FILE_PATTERNS) {
+      for (const match of target.matchAll(re)) {
+        const spec = build(match);
+        if (!spec || spec.type !== "file")
+          continue;
+        if ("contains" in spec && spec.contains)
+          continue;
+        if (contentPaths.has(spec.path))
+          continue;
+        matched = true;
+        push(`${spec.path} exists`, spec);
       }
     }
     if (!matched) {
       push(`The requirement is achieved: ${target}`, { type: "objective" });
     }
-    if (criteria.length >= 8)
-      break;
   }
   if (criteria.length === 0) {
     push(`The objective is achieved: ${text}`, { type: "objective" });
@@ -1096,6 +1192,11 @@ class GoalController {
     if (resumed.deliveryFailed)
       this.store.clearDeliveryFailure(resumed.id);
     return this.store.byID(resumed.id) ?? resumed;
+  }
+  acceptObjective(sessionID, note) {
+    const goal = this.requireCurrent(sessionID);
+    this.store.recordUserAcceptance(goal.id, goal.generation, note);
+    return this.store.byID(goal.id) ?? goal;
   }
   status(sessionID) {
     return this.store.current(sessionID);
@@ -1231,6 +1332,21 @@ class GoalController {
     try {
       const criterionID = this.store.addCriterion(target.goal.id, input.text, input.spec, "model");
       return { criterionID };
+    } catch (error) {
+      return { rejected: String(error) };
+    }
+  }
+  supersedeCriterion(sessionID, input) {
+    const target = this.resolveTarget(sessionID, input);
+    if (!target.ok)
+      return { rejected: target.rejected };
+    const criterionID = this.resolveCriterion(target.goal.id, input.criterion_id);
+    if (!criterionID) {
+      return { rejected: `criterion ${input.criterion_id} does not exist on this goal` };
+    }
+    try {
+      this.store.supersedeCriterion(criterionID, input.reason);
+      return { superseded: true };
     } catch (error) {
       return { rejected: String(error) };
     }
@@ -1402,7 +1518,29 @@ function selectToolRef(resolved, input, messageID) {
       reason: "this call could not be attributed to a goal generation from its message; call goal_get and retry from the current turn"
     };
   }
-  return { ok: true, ref: { goalID: input?.goal_id, generation: input?.generation } };
+  if (input?.goal_id && input.generation !== undefined) {
+    return { ok: true, ref: { goalID: input.goal_id, generation: input.generation } };
+  }
+  return {
+    ok: false,
+    reason: "this call carries neither a resolvable message identity nor a complete goal reference (goal_id and generation); call goal_get and retry"
+  };
+}
+function attributeMessageGeneration(messages, messageID, generationOf) {
+  const index = messages.findIndex((m) => m?.id === messageID);
+  if (index === -1)
+    return;
+  for (let i = index - 1;i >= 0; i--) {
+    const message = messages[i];
+    if (!message)
+      continue;
+    const generation = generationOf(message);
+    if (generation !== undefined)
+      return generation;
+    if (message.type === "user")
+      return;
+  }
+  return;
 }
 
 // src/controller/coordinator.ts
@@ -1450,10 +1588,17 @@ class GoalCoordinator {
 
 // src/controller/driver.ts
 var DEFAULT_CLASSIFY = ({
-  evidenceDelta
+  evidenceDelta,
+  liveWait
 }) => {
   if (evidenceDelta > 0) {
     return { classification: "progress", detail: `${evidenceDelta} new evidence item(s)` };
+  }
+  if (liveWait) {
+    return {
+      classification: "verifiedWait",
+      detail: "no new evidence, but a background execution is still running"
+    };
   }
   return { classification: "noProgress", detail: "no new evidence captured this round" };
 };
@@ -1548,9 +1693,11 @@ class GoalDriver {
   }
   async dispatch(round, sessionID) {
     const goal = this.store.byID(round.goalID);
-    if (!goal || goal.generation !== round.generation || isTerminal(goal.status)) {
-      const detail = goal ? `goal moved to generation ${goal.generation} / ${goal.status}` : "goal no longer exists";
-      this.store.markRoundFailed(round.id, `abandoned before admission: ${detail}`);
+    if (!goal || goal.generation !== round.generation || goal.status !== "active") {
+      const detail = goal ? `goal moved to generation ${goal.generation} / status ${goal.status}` : "goal no longer exists";
+      this.store.markRoundFailed(round.id, `abandoned before admission: ${detail}`, {
+        parkGoal: false
+      });
       return { action: "abandoned", roundID: round.id, detail };
     }
     try {
@@ -1567,6 +1714,7 @@ class GoalDriver {
       });
       if (result.ok) {
         this.store.markRoundAdmitted(round.id);
+        this.store.rememberMessageGeneration(sessionID, round.inboxID, round.generation, Date.now());
         return { action: "admitted", roundID: round.id, inboxID: round.inboxID };
       }
       if (result.retryable) {
@@ -1596,11 +1744,6 @@ class GoalDriver {
     for (const round of this.store.outstandingRounds()) {
       out.push(await this.reconcileRound(round));
     }
-    for (const goal of this.store.activeGoals()) {
-      if (goal.deliveryFailed && !this.store.outstandingRound(goal.id)) {
-        this.store.clearDeliveryFailure(goal.id);
-      }
-    }
     return out;
   }
   async reconcileRound(round) {
@@ -1611,7 +1754,7 @@ class GoalDriver {
     }
     if (goal.generation !== round.generation || isTerminal(goal.status)) {
       const detail = `superseded (generation ${goal.generation}, status ${goal.status})`;
-      this.store.markRoundFailed(round.id, detail);
+      this.store.markRoundFailed(round.id, detail, { parkGoal: false });
       return { action: "failed", roundID: round.id, inboxID: round.inboxID, detail };
     }
     if (round.attempts > this.maxRoundAttempts) {
@@ -1625,9 +1768,11 @@ class GoalDriver {
         this.store.markRoundRunning(round.id);
         return { action: "reconcile", roundID: round.id, status: "running" };
       case "settled": {
-        const evidenceCount = this.store.listEvidence(goal.id).length;
+        const verifiable = this.store.listEvidence(goal.id).filter((e) => e.kind !== "ref");
+        const evidenceCount = verifiable.length;
         const evidenceDelta = Math.max(0, evidenceCount - round.evidenceBaseline);
-        const verdict = this.classify({ goal, round, evidenceCount, evidenceDelta });
+        const liveWait = this.transport.liveWait?.({ sessionID: goal.sessionID }) ?? false;
+        const verdict = this.classify({ goal, round, evidenceCount, evidenceDelta, liveWait });
         const settledGoal = this.settleRound({
           roundID: round.id,
           classification: verdict.classification,
@@ -1689,6 +1834,7 @@ class GoalDriver {
 // src/controller/transport.ts
 class RoundObserver {
   seen = new Map;
+  runningBySession = new Map;
   slot(inboxID) {
     let s = this.seen.get(inboxID);
     if (!s) {
@@ -1705,6 +1851,17 @@ class RoundObserver {
     const d = e?.data ?? {};
     const p = e?.properties ?? {};
     const pick = (k) => d[k] ?? p[k];
+    if (type.startsWith("session.execution.")) {
+      const sessionID = pick("sessionID");
+      if (sessionID) {
+        const running = this.runningBySession.get(sessionID) ?? 0;
+        if (type === "session.execution.started") {
+          this.runningBySession.set(sessionID, running + 1);
+        } else if ((type === "session.execution.succeeded" || type === "session.execution.failed") && running > 0) {
+          this.runningBySession.set(sessionID, running - 1);
+        }
+      }
+    }
     const id = pick("messageID") ?? pick("messageId") ?? pick("message")?.id ?? pick("info")?.id;
     if (!id || !id.startsWith("msg_xgoal_"))
       return;
@@ -1742,6 +1899,9 @@ class RoundObserver {
       return "running";
     return "unknown";
   }
+  isBusy(sessionID) {
+    return (this.runningBySession.get(sessionID) ?? 0) > 0;
+  }
   forget(inboxID) {
     this.seen.delete(inboxID);
   }
@@ -1776,6 +1936,9 @@ class SessionTransport {
       return classify(error);
     }
   }
+  liveWait(input) {
+    return this.observer.isBusy(input.sessionID);
+  }
   async probe(input) {
     const cached = this.observer.probe(input.round.inboxID);
     if (cached === "settled") {
@@ -1791,26 +1954,34 @@ class SessionTransport {
       return cached;
     }
     const queued = state.inbox.some((item) => item.id === input.round.inboxID);
-    const index = state.messages.findIndex((message) => message.id === input.round.inboxID || message.metadata?.inboxID === input.round.inboxID || message.metadata?.roundID === input.round.id);
+    const isOwn = (message) => message.id === input.round.inboxID || message.metadata?.inboxID === input.round.inboxID || message.metadata?.roundID === input.round.id;
+    const index = state.messages.findIndex(isOwn);
     if (index === -1) {
       if (queued)
         return "running";
       return cached === "unknown" ? "unknown" : cached;
     }
-    const after = state.messages.slice(index + 1);
-    const idle = after.some((message) => message.type === "idle");
-    const lastAssistant = [...after].reverse().find((message) => message.type === "assistant");
-    const finished = idle || lastAssistant?.finish === "stop" || lastAssistant?.finish === "length" || lastAssistant?.finish === "content-filter" || lastAssistant?.finish === "error";
-    if (finished) {
-      this.observer.forget(input.round.inboxID);
-      return "settled";
+    for (let i = index + 1;i < state.messages.length; i++) {
+      const message = state.messages[i];
+      const foreign = message.type === "user" && message.id !== input.round.inboxID && !isOwn(message);
+      if (foreign) {
+        return cached === "running" ? "running" : "unknown";
+      }
+      if (message.type === "idle") {
+        this.observer.forget(input.round.inboxID);
+        return "settled";
+      }
+      if (message.type === "assistant" && (message.finish === "stop" || message.finish === "length" || message.finish === "content-filter" || message.finish === "error")) {
+        this.observer.forget(input.round.inboxID);
+        return "settled";
+      }
     }
     return "running";
   }
 }
 
 // src/controller/workspace.ts
-import { createHash } from "node:crypto";
+import { createHash as createHash2 } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 function resolveWorkspacePath(ref, workspace) {
@@ -1824,16 +1995,13 @@ function sessionWorkspace() {
 }
 function hashFile(path) {
   try {
-    return createHash("sha256").update(readFileSync(path)).digest("hex").slice(0, 32);
+    return createHash2("sha256").update(readFileSync(path)).digest("hex").slice(0, 32);
   } catch {
     return "";
   }
 }
 
 // src/controller/verification.ts
-import { createHash as createHash2 } from "node:crypto";
-var OBJECTIVE_PROOF_KINDS = new Set(["test", "file"]);
-
 class EvidenceLedger {
   store;
   constructor(store) {
@@ -1923,13 +2091,6 @@ function extractExitCode(result) {
 `) : typeof r.output === "string" ? r.output : "";
   const match = /\bexit(?:\s+code)?\s*[:=]?\s*(-?\d+)\b/i.exec(text);
   return match ? Number(match[1]) : undefined;
-}
-function snapshotOf(criteria, evidence) {
-  const canonical = JSON.stringify({
-    criteria: criteria.map((c) => [c.id, c.text, c.spec ?? null]),
-    evidence: evidence.map((e) => [e.id, e.kind, e.ref, e.exitCode ?? null, e.hash ?? null, e.criterionID ?? null])
-  });
-  return createHash2("sha256").update(canonical).digest("hex").slice(0, 32);
 }
 
 class GoalVerifier {
@@ -2027,25 +2188,25 @@ class GoalVerifier {
         continue;
       }
       if (criterion.spec?.type === "objective") {
-        const proof = bound.filter((e) => OBJECTIVE_PROOF_KINDS.has(e.kind));
-        if (proof.length === 0) {
+        const acceptance = this.store.userAcceptance(goal.id);
+        if (acceptance && acceptance.generation === goal.generation) {
           proofs.push({
             criterionID: criterion.id,
-            evidenceIDs: [],
-            validatorID: "objective-evidence",
-            verdict: "fail",
-            detail: "no bound passing test or file change"
-          });
-          unmet.push(`criterion not evidenced: ${criterion.text} (no bound passing test or file change)`);
-        } else {
-          proofs.push({
-            criterionID: criterion.id,
-            evidenceIDs: proof.map((e) => e.id),
-            validatorID: "objective-evidence",
+            evidenceIDs: bound.map((e) => e.id),
+            validatorID: "user-acceptance",
             verdict: "pass",
-            detail: `${proof.length} bound test/file evidence item(s)`
+            detail: acceptance.note ? `user accepted the objective: ${acceptance.note}` : "user accepted the objective"
           });
+          continue;
         }
+        proofs.push({
+          criterionID: criterion.id,
+          evidenceIDs: bound.map((e) => e.id),
+          validatorID: "objective-acceptance",
+          verdict: "unknown",
+          detail: "broad objective; cannot establish completeness from ordinary evidence — needs concrete sub-criteria or explicit user acceptance"
+        });
+        unmet.push(`criterion unresolved: ${criterion.text} — register concrete machine-checkable criteria with goal_add_criterion, or ask the user to run /goal accept`);
         continue;
       }
       if (bound.length === 0) {
@@ -2067,7 +2228,7 @@ class GoalVerifier {
         });
       }
     }
-    const snapshot = snapshotOf(criteria, evidence);
+    const snapshot = snapshotHash(criteria, evidence);
     this.store.recordProofs(goalID, proofs, snapshot);
     if (unmet.length > 0) {
       return {
@@ -2116,7 +2277,10 @@ var goalRpcDefinition = {
   methods: {
     "goal.status": {
       input: { type: "object", properties: { sessionID: str }, required: ["sessionID"] },
-      output: { type: "object", properties: { goal: goalOrNull } }
+      output: {
+        type: "object",
+        properties: { current: goalOrNull, latest: goalOrNull, goal: goalOrNull }
+      }
     },
     "goal.history": {
       input: { type: "object", properties: { sessionID: str }, required: ["sessionID"] },
@@ -2153,6 +2317,14 @@ var goalRpcDefinition = {
       input: { type: "object", properties: { sessionID: str }, required: ["sessionID"] },
       output: { type: "object", properties: { goal: goalOrNull, error: str } }
     },
+    "goal.accept": {
+      input: {
+        type: "object",
+        properties: { sessionID: str, note: str },
+        required: ["sessionID"]
+      },
+      output: { type: "object", properties: { goal: goalOrNull, error: str } }
+    },
     "goal.health": {
       input: { type: "object", properties: { sessionID: str }, required: ["sessionID"] },
       output: { type: "object", properties: { health: { type: "object" } } }
@@ -2175,12 +2347,14 @@ var goalRpcDefinition = {
     }
   }
 };
-function goalRpcHandlers(controller, coordinator) {
+function goalRpcHandlers(controller, coordinator, verifier) {
   return {
     "goal.status": async (input) => {
       if (!input?.sessionID)
-        return { goal: null };
-      return { goal: wire(controller, controller.latest(input.sessionID)) };
+        return { current: null, latest: null, goal: null };
+      const latest = wire(controller, controller.latest(input.sessionID));
+      const current = wire(controller, controller.status(input.sessionID));
+      return { current, latest, goal: latest };
     },
     "goal.history": async (input) => {
       if (!input?.sessionID)
@@ -2246,6 +2420,28 @@ function goalRpcHandlers(controller, coordinator) {
           return { goal: wire(controller, result.goal), drive: result.drive ?? null };
         }
         return { goal: wire(controller, controller.resume(input.sessionID)) };
+      } catch (error) {
+        return { goal: null, error: String(error) };
+      }
+    },
+    "goal.accept": async (input) => {
+      if (!input?.sessionID)
+        return { goal: null, error: "sessionID is required" };
+      try {
+        const accepted = controller.acceptObjective(input.sessionID, input.note);
+        if (accepted.status === "verifying" && verifier) {
+          const result = await verifier.verify(accepted.id);
+          if (result.verdict === "complete") {
+            const done = controller.commitComplete(accepted.id, accepted.generation, result.reason, result.snapshot);
+            return { goal: wire(controller, done) };
+          }
+          controller.rejectCompletion(accepted.id, accepted.generation, result.reason);
+          return {
+            goal: wire(controller, controller.status(input.sessionID)),
+            error: `acceptance recorded, but completion is still unmet: ${result.unmet.join("; ")}`
+          };
+        }
+        return { goal: wire(controller, accepted) };
       } catch (error) {
         return { goal: null, error: String(error) };
       }
@@ -2506,27 +2702,45 @@ var src_default = {
     async function resolveMessageRef(sessionID, messageID) {
       if (!controller || !sessionID || !messageID)
         return {};
-      const cached = controller.store.resolveMessageGeneration(sessionID, messageID);
+      const store = controller.store;
+      const cached = store.resolveMessageGeneration(sessionID, messageID);
       if (cached !== undefined) {
-        const goal2 = controller.store.byGeneration(sessionID, cached);
+        const goal2 = store.byGeneration(sessionID, cached);
         return goal2 ? { goalID: goal2.id, generation: cached } : {};
       }
-      let atMs;
+      let messages = [];
       try {
-        const messages = await ctx.session.context({ sessionID });
-        const message = messages.find((m) => m?.id === messageID);
-        if (typeof message?.time?.created === "number")
-          atMs = message.time.created;
+        messages = await ctx.session.context({ sessionID });
       } catch (error) {
         record({ event: "call.resolve.error", sessionID, messageID, error: String(error) });
       }
+      const list = messages;
+      const generationOf = (message) => {
+        const id = message.id;
+        if (!id)
+          return;
+        const mapped = store.resolveMessageGeneration(sessionID, id);
+        if (mapped !== undefined)
+          return mapped;
+        return store.roundByInboxID(id)?.generation;
+      };
+      let generation = attributeMessageGeneration(list.map((m) => ({ id: m.id ?? "", type: m.type, metadata: m.metadata })), messageID, generationOf);
+      if (generation !== undefined) {
+        store.rememberMessageGeneration(sessionID, messageID, generation, Date.now());
+        const goal2 = store.byGeneration(sessionID, generation);
+        return goal2 ? { goalID: goal2.id, generation } : {};
+      }
+      if (store.generationCount(sessionID) !== 1)
+        return {};
+      const self = list.find((m) => m.id === messageID);
+      const atMs = typeof self?.time?.created === "number" ? self.time.created : undefined;
       if (atMs === undefined)
         return {};
-      const generation = controller.store.generationAt(sessionID, atMs);
+      generation = store.generationAt(sessionID, atMs);
       if (generation === undefined)
         return {};
-      controller.store.rememberMessageGeneration(sessionID, messageID, generation, atMs);
-      const goal = controller.store.byGeneration(sessionID, generation);
+      store.rememberMessageGeneration(sessionID, messageID, generation, atMs);
+      const goal = store.byGeneration(sessionID, generation);
       return goal ? { goalID: goal.id, generation } : {};
     }
     try {
@@ -2597,6 +2811,89 @@ var src_default = {
               content: `Checkpoint recorded. Goal is ${out.goal?.status}.`,
               metadata: { status: out.goal?.status, rounds: out.goal?.rounds }
             };
+          }
+        });
+        editor.add({
+          name: "goal_add_criterion",
+          description: "Refine the acceptance criteria during investigation: register a concrete, machine-checkable requirement the work must satisfy. Additive and idempotent — adding a requirement that already exists returns the existing criterion. Objective-type specs are refused: only the user can accept the objective itself.",
+          input: obj({
+            text: str2,
+            spec: {
+              type: "object",
+              properties: {
+                type: {
+                  type: "string",
+                  enum: ["file", "command", "test", "manual"]
+                },
+                path: { type: "string" },
+                equals: { type: "string" },
+                contains: { type: "string" },
+                command: { type: "string" },
+                expectExit: num2
+              },
+              additionalProperties: false
+            },
+            goal_id: str2,
+            generation: num2
+          }, ["text"]),
+          async execute(input, toolCtx) {
+            if (!controller)
+              return { content: `goal controller unavailable: ${startupError}` };
+            const ref = await resolveMessageRef(toolCtx?.sessionID, toolCtx?.messageID);
+            const target = selectToolRef(ref, input, toolCtx?.messageID);
+            if (!target.ok)
+              return { content: `Goal call rejected: ${target.reason}` };
+            const rawSpec = input?.spec;
+            let spec;
+            if (rawSpec && typeof rawSpec === "object") {
+              const parsed = { ...rawSpec };
+              if (parsed.type === "file" && typeof parsed.path !== "string") {
+                return { content: "Criterion rejected: a file spec requires path." };
+              }
+              if ((parsed.type === "command" || parsed.type === "test") && typeof parsed.command !== "string") {
+                return { content: "Criterion rejected: a command/test spec requires command." };
+              }
+              spec = parsed;
+            }
+            const out = controller.addCriterion(toolCtx?.sessionID, {
+              text: String(input?.text ?? ""),
+              spec,
+              goalID: target.ref.goalID,
+              generation: target.ref.generation
+            });
+            if (out.rejected)
+              return { content: `Criterion rejected: ${out.rejected}` };
+            return {
+              content: `Criterion registered: ${out.criterionID}`,
+              metadata: { criterionID: out.criterionID }
+            };
+          }
+        });
+        editor.add({
+          name: "goal_supersede_criterion",
+          description: "Retire a derived or model-added criterion that investigation proved wrong. The criterion is kept for the audit trail but no longer gates verification. Explicit user requirements cannot be superseded; they must be satisfied.",
+          input: obj({
+            criterion_id: str2,
+            reason: str2,
+            goal_id: str2,
+            generation: num2
+          }, ["criterion_id", "reason"]),
+          async execute(input, toolCtx) {
+            if (!controller)
+              return { content: `goal controller unavailable: ${startupError}` };
+            const ref = await resolveMessageRef(toolCtx?.sessionID, toolCtx?.messageID);
+            const target = selectToolRef(ref, input, toolCtx?.messageID);
+            if (!target.ok)
+              return { content: `Goal call rejected: ${target.reason}` };
+            const out = controller.supersedeCriterion(toolCtx?.sessionID, {
+              criterion_id: String(input?.criterion_id ?? ""),
+              reason: String(input?.reason ?? ""),
+              goalID: target.ref.goalID,
+              generation: target.ref.generation
+            });
+            if (out.rejected)
+              return { content: `Supersede rejected: ${out.rejected}` };
+            return { content: "Criterion superseded; it no longer gates verification." };
           }
         });
         editor.add({
@@ -2722,7 +3019,7 @@ ${result.unmet.map((u) => `- ${u}`).join(`
     }
     try {
       if (controller && ctx.rpc?.register) {
-        await ctx.rpc.register(goalRpcDefinition, goalRpcHandlers(controller, coordinator));
+        await ctx.rpc.register(goalRpcDefinition, goalRpcHandlers(controller, coordinator, verifier));
         record({ event: "rpc.registered", ok: true });
       } else {
         record({ event: "rpc.registered", ok: false, reason: "rpc domain unavailable" });
@@ -2771,6 +3068,21 @@ ${result.unmet.map((u) => `- ${u}`).join(`
                 } else {
                   reply(`Resumed: ${controller.resume(sessionID).status}`);
                 }
+                return;
+              }
+              if (verb === "accept") {
+                const accepted = controller.acceptObjective(sessionID, arg || undefined);
+                if (accepted.status === "verifying" && verifier) {
+                  const result = await verifier.verify(accepted.id);
+                  if (result.verdict === "complete") {
+                    const done = controller.commitComplete(accepted.id, accepted.generation, result.reason, result.snapshot);
+                    record({ event: "completion.verified", goalID: accepted.id, reason: result.reason });
+                    return reply(`Acceptance recorded. Completion verified: ${done.status}`);
+                  }
+                  controller.rejectCompletion(accepted.id, accepted.generation, result.reason);
+                  return reply(`Acceptance recorded, but completion is still unmet: ${result.unmet.join("; ")}`);
+                }
+                reply("Acceptance recorded for the current generation.");
                 return;
               }
               if (verb === "replace") {
@@ -2948,6 +3260,12 @@ ${unmet.join(`
           eventsSeen.add(type);
           observer.observe(event);
           record({ event: "event", type, total: eventsSeen.size });
+          if (type.startsWith("session.")) {
+            const evtSession = String(event?.data?.sessionID ?? event?.properties?.sessionID ?? "");
+            if (evtSession && (type === "session.updated" || type === "session.moved" || type === "session.deleted" || type === "session.renamed")) {
+              sessionWorkspaces.delete(evtSession);
+            }
+          }
           if (controller && type === "session.usage.updated") {
             const data = event?.data;
             const usageSession = data?.sessionID;

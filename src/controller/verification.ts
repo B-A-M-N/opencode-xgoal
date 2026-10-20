@@ -15,7 +15,7 @@ import type { GoalStore, GoalRound } from "./store.ts";
 import type { Goal } from "./state.ts";
 import type { CriterionSpec } from "./criteria.ts";
 import { existsSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { snapshotHash } from "./store.ts";
 import { hashFile, resolveWorkspacePath, sessionWorkspace } from "./workspace.ts";
 
 export { hashFile, resolveWorkspacePath } from "./workspace.ts";
@@ -89,10 +89,6 @@ export interface CriterionProof {
   verdict: "pass" | "fail" | "unknown";
   detail: string;
 }
-
-/** Evidence kinds that can prove an objective-level criterion. A bare command
- *  is deliberately excluded: `pwd` exits zero but proves nothing. */
-const OBJECTIVE_PROOF_KINDS = new Set<EvidenceKind>(["test", "file"]);
 
 /**
  * Records evidence the controller observed, keyed by goal.
@@ -224,18 +220,6 @@ function extractExitCode(result: unknown): number | undefined {
           : "";
   const match = /\bexit(?:\s+code)?\s*[:=]?\s*(-?\d+)\b/i.exec(text);
   return match ? Number(match[1]) : undefined;
-}
-
-/** Hash the criteria + evidence snapshot a verification will check. */
-function snapshotOf(
-  criteria: { id: string; text: string; spec?: CriterionSpec }[],
-  evidence: { id: string; kind: string; ref: string; exitCode?: number; hash?: string; criterionID?: string }[],
-): string {
-  const canonical = JSON.stringify({
-    criteria: criteria.map((c) => [c.id, c.text, c.spec ?? null]),
-    evidence: evidence.map((e) => [e.id, e.kind, e.ref, e.exitCode ?? null, e.hash ?? null, e.criterionID ?? null]),
-  });
-  return createHash("sha256").update(canonical).digest("hex").slice(0, 32);
 }
 
 export class GoalVerifier {
@@ -373,27 +357,35 @@ export class GoalVerifier {
       }
 
       if (criterion.spec?.type === "objective") {
-        // An objective-level criterion needs explicitly bound evidence of a
-        // passing test or a real file change. A bare command is not proof.
-        const proof = bound.filter((e) => OBJECTIVE_PROOF_KINDS.has(e.kind as EvidenceKind));
-        if (proof.length === 0) {
+        // An objective-level criterion is the part of the goal that cannot be
+        // decomposed into a machine-checkable requirement. Ordinary evidence
+        // cannot prove it: a passing test or a real file change is equally
+        // consistent with a partial job. It resolves only when the user
+        // explicitly accepts this generation of the objective.
+        const acceptance = this.store.userAcceptance(goal.id);
+        if (acceptance && acceptance.generation === goal.generation) {
           proofs.push({
             criterionID: criterion.id,
-            evidenceIDs: [],
-            validatorID: "objective-evidence",
-            verdict: "fail",
-            detail: "no bound passing test or file change",
-          });
-          unmet.push(`criterion not evidenced: ${criterion.text} (no bound passing test or file change)`);
-        } else {
-          proofs.push({
-            criterionID: criterion.id,
-            evidenceIDs: proof.map((e) => e.id),
-            validatorID: "objective-evidence",
+            evidenceIDs: bound.map((e) => e.id),
+            validatorID: "user-acceptance",
             verdict: "pass",
-            detail: `${proof.length} bound test/file evidence item(s)`,
+            detail: acceptance.note
+              ? `user accepted the objective: ${acceptance.note}`
+              : "user accepted the objective",
           });
+          continue;
         }
+        proofs.push({
+          criterionID: criterion.id,
+          evidenceIDs: bound.map((e) => e.id),
+          validatorID: "objective-acceptance",
+          verdict: "unknown",
+          detail:
+            "broad objective; cannot establish completeness from ordinary evidence — needs concrete sub-criteria or explicit user acceptance",
+        });
+        unmet.push(
+          `criterion unresolved: ${criterion.text} — register concrete machine-checkable criteria with goal_add_criterion, or ask the user to run /goal accept`,
+        );
         continue;
       }
 
@@ -419,7 +411,10 @@ export class GoalVerifier {
       }
     }
 
-    const snapshot = snapshotOf(criteria, evidence);
+    // The snapshot hash is the store's canonical rule (snapshotHash): this
+    // verifier records its decision against exactly the rows it read, and
+    // completeGoal re-hashes the current rows to reject a stale decision.
+    const snapshot = snapshotHash(criteria, evidence);
     this.store.recordProofs(goalID, proofs, snapshot);
 
     if (unmet.length > 0) {
