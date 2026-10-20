@@ -1,0 +1,17 @@
+{
+  "name": "opencode-xgoal",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "displayName": "OpenCode-XGoal",
+  "description": "OpenCode-XGoal: a session-native Goal Controller for OpenCode 2, reproducing Codex's Goal behavioral contract.",
+  "main": "index.js",
+  "scripts": {
+    "build": "bun build ./src/index.ts --outdir . --target node --format esm",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": "*"
+  }
+}
