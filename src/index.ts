@@ -20,6 +20,7 @@ import {
   GoalVerifier,
   type EvidenceValidator,
 } from "./controller/verification.ts";
+import { goalRpcDefinition, goalRpcHandlers } from "./rpc.ts";
 
 const LOG = process.env.XGOAL_HARNESS_LOG ?? "";
 
@@ -332,6 +333,21 @@ export default {
       record({ event: "tools.registered", ok: false, error: String(error) });
     }
 
+    // ---------------------------------------------------------------- rpc
+    // The TUI companion talks to the controller through this surface. The
+    // generation check lives here, on the server, so a confirmation rendered
+    // against generation N cannot replace generation N+1.
+    try {
+      if (controller && ctx.rpc?.register) {
+        await ctx.rpc.register(goalRpcDefinition as never, goalRpcHandlers(controller) as never);
+        record({ event: "rpc.registered", ok: true });
+      } else {
+        record({ event: "rpc.registered", ok: false, reason: "rpc domain unavailable" });
+      }
+    } catch (error) {
+      record({ event: "rpc.registered", ok: false, error: String(error) });
+    }
+
     // -------------------------------------------------------------- command
     try {
       await ctx.command.transform((editor: any) => {
@@ -384,6 +400,25 @@ export default {
                 if (!arg) return reply("Usage: /goal replace <objective>");
                 const goal = controller.replace(sessionID, arg);
                 reply(`Replaced. Generation ${goal.generation} is now active.`);
+                return;
+              }
+              if (verb === "budget") {
+                const goal = controller.status(sessionID);
+                if (!goal) return reply("No active goal.");
+                const used = goal.tokensUsed ?? 0;
+                if (!arg) {
+                  reply(
+                    `Tokens: ${used}${goal.tokenBudget !== undefined ? ` / ${goal.tokenBudget}` : " (no budget set)"}`,
+                  );
+                  return;
+                }
+                // `/goal budget <n>` sets the ceiling; the controller enforces it.
+                const n = Number(arg);
+                if (!Number.isFinite(n) || n <= 0) return reply("Usage: /goal budget <positive number>");
+                controller.store.db
+                  .query("UPDATE goals SET token_budget = ? WHERE id = ?")
+                  .run(Math.floor(n), goal.id);
+                reply(`Budget set to ${Math.floor(n)} tokens (used ${used}).`);
                 return;
               }
 

@@ -6,8 +6,16 @@
   "displayName": "OpenCode-XGoal",
   "description": "OpenCode-XGoal: a session-native Goal Controller for OpenCode 2, reproducing Codex's Goal behavioral contract.",
   "main": "index.js",
+  "exports": {
+    ".": {
+      "import": "./index.js"
+    },
+    "./tui": {
+      "import": "./tui.js"
+    }
+  },
   "scripts": {
-    "build": "bun build ./src/index.ts --outdir . --target node --format esm",
+    "build": "bun build ./src/index.ts --outdir . --target node --format esm && bun build ./src/tui.tsx --outdir . --target node --format esm",
     "typecheck": "tsc --noEmit",
     "test": "bun test"
   },
@@ -15,6 +23,8 @@
     "@opencode/plugin": "*"
   },
   "devDependencies": {
-    "@types/bun": "^1.4.3"
+    "@opentui/solid": "0.5.9",
+    "@types/bun": "^1.4.3",
+    "solid-js": "1.9.12"
   }
 }

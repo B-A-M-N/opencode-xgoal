@@ -1207,6 +1207,120 @@ class GoalVerifier {
   }
 }
 
+// src/rpc.ts
+var RPC_ID = "local.opencode-xgoal";
+var str = { type: "string" };
+var num = { type: "number" };
+function wire(controller, goal) {
+  if (!goal)
+    return null;
+  return {
+    id: goal.id,
+    generation: goal.generation,
+    objective: goal.objective,
+    status: goal.status,
+    reason: goal.reason,
+    rounds: goal.rounds,
+    noProgressRounds: goal.noProgressRounds,
+    tokensUsed: goal.tokensUsed,
+    tokenBudget: goal.tokenBudget,
+    criteria: controller.store.listCriteria(goal.id)
+  };
+}
+var goalOrNull = {
+  anyOf: [{ type: "object" }, { type: "null" }]
+};
+var goalRpcDefinition = {
+  id: RPC_ID,
+  methods: {
+    "goal.status": {
+      input: { type: "object", properties: { sessionID: str }, required: ["sessionID"] },
+      output: { type: "object", properties: { goal: goalOrNull } }
+    },
+    "goal.history": {
+      input: { type: "object", properties: { sessionID: str }, required: ["sessionID"] },
+      output: {
+        type: "object",
+        properties: { goals: { type: "array", items: { type: "object" } } }
+      }
+    },
+    "goal.replace": {
+      input: {
+        type: "object",
+        properties: {
+          sessionID: str,
+          objective: str,
+          expectedGeneration: num
+        },
+        required: ["sessionID", "objective", "expectedGeneration"]
+      },
+      output: { type: "object", properties: { goal: goalOrNull, error: str } }
+    },
+    "goal.pause": {
+      input: { type: "object", properties: { sessionID: str }, required: ["sessionID"] },
+      output: { type: "object", properties: { goal: goalOrNull } }
+    },
+    "goal.resume": {
+      input: { type: "object", properties: { sessionID: str }, required: ["sessionID"] },
+      output: { type: "object", properties: { goal: goalOrNull } }
+    }
+  },
+  events: {
+    "goal.changed": {
+      schema: {
+        type: "object",
+        properties: { sessionID: str, status: str, generation: num }
+      }
+    }
+  }
+};
+function goalRpcHandlers(controller) {
+  return {
+    "goal.status": async (input) => {
+      if (!input?.sessionID)
+        return { goal: null };
+      return { goal: wire(controller, controller.status(input.sessionID)) };
+    },
+    "goal.history": async (input) => {
+      if (!input?.sessionID)
+        return { goals: [] };
+      return {
+        goals: controller.history(input.sessionID).map((g) => wire(controller, g)).filter(Boolean)
+      };
+    },
+    "goal.replace": async (input) => {
+      const { sessionID, objective, expectedGeneration } = input ?? {};
+      if (!sessionID || !objective || typeof expectedGeneration !== "number") {
+        return { goal: null, error: "sessionID, objective and expectedGeneration are required" };
+      }
+      try {
+        const goal = controller.replace(sessionID, objective, expectedGeneration);
+        return { goal: wire(controller, goal) };
+      } catch (error) {
+        return { goal: null, error: String(error) };
+      }
+    },
+    "goal.pause": async (input) => {
+      if (!input?.sessionID)
+        return { goal: null };
+      try {
+        return { goal: wire(controller, controller.pause(input.sessionID)) };
+      } catch (error) {
+        return { goal: null, error: String(error) };
+      }
+    },
+    "goal.resume": async (input) => {
+      if (!input?.sessionID)
+        return { goal: null };
+      try {
+        return { goal: wire(controller, controller.resume(input.sessionID)) };
+      } catch (error) {
+        return { goal: null, error: String(error) };
+      }
+    }
+  };
+}
+
 // src/index.ts
 var LOG = process.env.XGOAL_HARNESS_LOG ?? "";
 function record(entry) {
@@ -1231,9 +1345,9 @@ function sessionIDOf(event) {
 function obj(properties, required = []) {
   return { type: "object", properties, required, additionalProperties: false };
 }
-var str = { type: "string" };
+var str2 = { type: "string" };
 var strArray = { type: "array", items: { type: "string" } };
-var num = { type: "number" };
+var num2 = { type: "number" };
 var src_default = {
   id: "opencode-xgoal",
   async setup(ctx) {
@@ -1331,10 +1445,10 @@ var src_default = {
           name: "goal_checkpoint",
           description: "Record progress toward the current goal without changing its status. Use for completed work, or for investigation that materially narrows the problem.",
           input: obj({
-            summary: str,
+            summary: str2,
             evidence_refs: strArray,
-            goal_id: str,
-            generation: num
+            goal_id: str2,
+            generation: num2
           }, ["summary"]),
           async execute(input, toolCtx) {
             if (!controller)
@@ -1356,7 +1470,7 @@ var src_default = {
         editor.add({
           name: "goal_propose_complete",
           description: "Propose that the goal's original objective has been fully achieved. This moves the goal to verification; it does not complete it. The controller decides completion.",
-          input: obj({ summary: str, evidence_refs: strArray, goal_id: str, generation: num }, [
+          input: obj({ summary: str2, evidence_refs: strArray, goal_id: str2, generation: num2 }, [
             "summary"
           ]),
           async execute(input, toolCtx) {
@@ -1412,11 +1526,11 @@ ${result.unmet.map((u) => `- ${u}`).join(`
           name: "goal_report_blocked",
           description: "Report that the goal cannot proceed. Only use this for a genuine external dependency: missing credentials, permissions, or required information. A workflow preference, an optional decision, or a choice between reasonable next steps is NOT a blocker — continue working instead.",
           input: obj({
-            reason: str,
+            reason: str2,
             evidence_refs: strArray,
             external_dependency: { type: "boolean" },
-            goal_id: str,
-            generation: num
+            goal_id: str2,
+            generation: num2
           }, ["reason"]),
           async execute(input, toolCtx) {
             if (!controller)
@@ -1446,6 +1560,16 @@ ${result.unmet.map((u) => `- ${u}`).join(`
       record({ event: "tools.registered", ok: true });
     } catch (error) {
       record({ event: "tools.registered", ok: false, error: String(error) });
+    }
+    try {
+      if (controller && ctx.rpc?.register) {
+        await ctx.rpc.register(goalRpcDefinition, goalRpcHandlers(controller));
+        record({ event: "rpc.registered", ok: true });
+      } else {
+        record({ event: "rpc.registered", ok: false, reason: "rpc domain unavailable" });
+      }
+    } catch (error) {
+      record({ event: "rpc.registered", ok: false, error: String(error) });
     }
     try {
       await ctx.command.transform((editor) => {
@@ -1490,6 +1614,22 @@ ${result.unmet.map((u) => `- ${u}`).join(`
                   return reply("Usage: /goal replace <objective>");
                 const goal = controller.replace(sessionID, arg);
                 reply(`Replaced. Generation ${goal.generation} is now active.`);
+                return;
+              }
+              if (verb === "budget") {
+                const goal = controller.status(sessionID);
+                if (!goal)
+                  return reply("No active goal.");
+                const used = goal.tokensUsed ?? 0;
+                if (!arg) {
+                  reply(`Tokens: ${used}${goal.tokenBudget !== undefined ? ` / ${goal.tokenBudget}` : " (no budget set)"}`);
+                  return;
+                }
+                const n = Number(arg);
+                if (!Number.isFinite(n) || n <= 0)
+                  return reply("Usage: /goal budget <positive number>");
+                controller.store.db.query("UPDATE goals SET token_budget = ? WHERE id = ?").run(Math.floor(n), goal.id);
+                reply(`Budget set to ${Math.floor(n)} tokens (used ${used}).`);
                 return;
               }
               const objective = raw;
