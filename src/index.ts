@@ -13,6 +13,8 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { GoalController } from "./controller/controller.ts";
+import { GoalDriver } from "./controller/driver.ts";
+import { RoundObserver, SessionTransport } from "./controller/transport.ts";
 
 const LOG = process.env.XGOAL_HARNESS_LOG ?? "";
 
@@ -33,6 +35,20 @@ function dbPath(): string {
   if (process.env.XGOAL_DB) return process.env.XGOAL_DB;
   const dataHome = process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share");
   return join(dataHome, "opencode-xgoal", "goals.db");
+}
+
+/**
+ * Extract the session id from an event.
+ *
+ * Session lifecycle events carry it at `data.sessionID`; some others use
+ * `properties`. Checked in order rather than assumed, because guessing wrong
+ * silently skips every drive.
+ */
+function sessionIDOf(event: unknown): string | undefined {
+  const e = event as
+    | { data?: { sessionID?: string }; properties?: { sessionID?: string }; sessionID?: string }
+    | undefined;
+  return e?.data?.sessionID ?? e?.properties?.sessionID ?? e?.sessionID;
 }
 
 /** JSON Schema object input, as required by the V2 tool API. */
@@ -65,6 +81,47 @@ export default {
       record({ event: "controller.failed", error: startupError });
     }
 
+    // ------------------------------------------------- continuation driver
+    const observer = new RoundObserver();
+    let driver: GoalDriver | undefined;
+    let sweep: ReturnType<typeof setInterval> | undefined;
+
+    if (controller) {
+      const transport = new SessionTransport({
+        observer,
+        send: async ({ sessionID, inboxID, text, metadata }) => {
+          // Native session inbox with a caller-supplied id. The id is what makes
+          // a retry idempotent: the session can deduplicate a re-sent message.
+          await ctx.session.synthetic({
+            sessionID,
+            id: inboxID,
+            text,
+            metadata,
+            delivery: "queue",
+          });
+        },
+      });
+      driver = new GoalDriver(controller.store, transport);
+
+      // Startup recovery sweep: adopt or clean up whatever was in flight when
+      // the previous process died. Driven by the ledger, not by events.
+      void driver
+        .reconcile()
+        .then((outcomes) => record({ event: "driver.reconciled", count: outcomes.length }))
+        .catch((error) => record({ event: "driver.reconcile.error", error: String(error) }));
+
+      // Periodic sweep. A missed event must not strand a goal, so recovery does
+      // not depend on the stream being healthy.
+      const sweepMs = Number(process.env.XGOAL_SWEEP_MS ?? "20000");
+      sweep = setInterval(() => {
+        void driver
+          ?.reconcile()
+          .catch((error) => record({ event: "driver.sweep.error", error: String(error) }));
+      }, sweepMs);
+      // Do not hold the process open just for the sweep.
+      (sweep as unknown as { unref?: () => void })?.unref?.();
+    }
+
     record({
       event: "setup.begin",
       pluginId: "opencode-xgoal",
@@ -77,7 +134,7 @@ export default {
     try {
       await ctx.tool.transform((editor: any) => {
         editor.add({
-          id: "goal_get",
+          name: "goal_get",
           description:
             "Report the current goal for this session, including status, generation, round counts and unmet criteria.",
           input: obj({}),
@@ -108,7 +165,7 @@ export default {
         });
 
         editor.add({
-          id: "goal_checkpoint",
+          name: "goal_checkpoint",
           description:
             "Record progress toward the current goal without changing its status. Use for completed work, or for investigation that materially narrows the problem.",
           input: obj(
@@ -137,7 +194,7 @@ export default {
         });
 
         editor.add({
-          id: "goal_propose_complete",
+          name: "goal_propose_complete",
           description:
             "Propose that the goal's original objective has been fully achieved. This moves the goal to verification; it does not complete it. The controller decides completion.",
           input: obj({ summary: str, evidence_refs: strArray, goal_id: str, generation: num }, [
@@ -161,7 +218,7 @@ export default {
         });
 
         editor.add({
-          id: "goal_report_blocked",
+          name: "goal_report_blocked",
           description:
             "Report that the goal cannot proceed. Only use this for a genuine external dependency: missing credentials, permissions, or required information. A workflow preference, an optional decision, or a choice between reasonable next steps is NOT a blocker — continue working instead.",
           input: obj(
@@ -348,13 +405,37 @@ export default {
     }
 
     // ------------------------------------------------------ event stream
+    // Events are wake-up signals only. The ledger is authoritative, so a missed
+    // event degrades to "the next sweep catches it" rather than a stuck goal.
     const eventsSeen = new Set<string>();
+    const IDLE_SIGNALS = new Set([
+      "session.execution.succeeded",
+      "session.execution.failed",
+      "session.inbox.delivered",
+    ]);
+    let lastDrive = 0;
     void (async () => {
       try {
         for await (const event of ctx.event.subscribe({ signal: abort.signal })) {
           const type = String((event as { type?: unknown })?.type ?? "unknown");
           eventsSeen.add(type);
+          observer.observe(event);
           record({ event: "event", type, total: eventsSeen.size });
+
+          if (!driver || !IDLE_SIGNALS.has(type)) continue;
+          // Debounce: a burst of signals should produce one drive, not several.
+          const now = Date.now();
+          if (now - lastDrive < 500) continue;
+          lastDrive = now;
+          // The session id lives at data.sessionID on these events.
+          const sessionID = sessionIDOf(event);
+          if (!sessionID) continue;
+          try {
+            const outcome = await driver.drive(sessionID);
+            record({ event: "driver.drive", sessionID, outcome: outcome.action });
+          } catch (error) {
+            record({ event: "driver.drive.error", sessionID, error: String(error) });
+          }
         }
       } catch (error) {
         record({ event: "event.stream.error", error: String(error) });
@@ -365,6 +446,7 @@ export default {
 
     return async () => {
       abort.abort();
+      if (sweep) clearInterval(sweep);
       try {
         controller?.close();
       } catch {

@@ -162,6 +162,39 @@ CREATE TABLE IF NOT EXISTS goal_evidence (
   at_ms       INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS goal_evidence_goal ON goal_evidence (goal_id);
+
+-- Continuation ledger. One row per continuation attempt.
+--
+-- inbox_id is the OpenCode message ID we reserve BEFORE submitting, and it is
+-- UNIQUE. That uniqueness is the idempotency guarantee: a retry after a timeout
+-- reuses the same id, so the session can deduplicate it and we can never admit
+-- the same continuation twice.
+--
+-- status tracks the attempt's real lifecycle, not our hopes:
+--   prepared  reserved, not yet submitted
+--   admitted  the session accepted the message (NOT proof it ran)
+--   running   execution observed to have started
+--   settled   a round outcome was evaluated
+--   unknown   submission outcome ambiguous (timeout / lost response)
+--   failed    submission definitively rejected
+CREATE TABLE IF NOT EXISTS goal_rounds (
+  id             TEXT PRIMARY KEY,
+  goal_id        TEXT NOT NULL,
+  generation     INTEGER NOT NULL,
+  inbox_id       TEXT NOT NULL UNIQUE,
+  status         TEXT NOT NULL,
+  classification TEXT,
+  attempts       INTEGER NOT NULL DEFAULT 1,
+  detail         TEXT,
+  prepared_at_ms INTEGER NOT NULL,
+  admitted_at_ms INTEGER,
+  settled_at_ms  INTEGER
+);
+CREATE INDEX IF NOT EXISTS goal_rounds_goal ON goal_rounds (goal_id, prepared_at_ms);
+-- At most one in-flight round per goal.
+CREATE UNIQUE INDEX IF NOT EXISTS goal_rounds_one_outstanding
+  ON goal_rounds (goal_id)
+  WHERE status IN ('prepared', 'admitted', 'running', 'unknown');
 `;
 function toGoal(row) {
   return {
@@ -426,6 +459,131 @@ class GoalStore {
       return repaired;
     });
   }
+  prepareRound(input) {
+    return this.tx(() => {
+      const goal = this.byID(input.goalID);
+      if (!goal)
+        throw new GoalConflictError(`unknown goal ${input.goalID}`);
+      if (goal.generation !== input.generation) {
+        throw new GoalConflictError(`stale generation: ${input.goalID} is generation ${goal.generation}, round claimed ${input.generation}`);
+      }
+      if (isTerminal(goal.status)) {
+        throw new GoalConflictError(`goal ${input.goalID} is terminal (${goal.status})`);
+      }
+      const existing = this.outstandingRound(input.goalID);
+      if (existing) {
+        throw new GoalConflictError(`goal ${input.goalID} already has an outstanding round (${existing.id}, ${existing.status})`);
+      }
+      const id = newID("round");
+      const now = Date.now();
+      this.db.query(`INSERT INTO goal_rounds (id, goal_id, generation, inbox_id, status, attempts, prepared_at_ms)
+           VALUES (?, ?, ?, ?, 'prepared', 1, ?)`).run(id, input.goalID, input.generation, input.inboxID, now);
+      this.appendEvent(input.goalID, input.generation, "round-prepared", {
+        actor: "controller",
+        detail: input.inboxID
+      });
+      return this.roundByID(id);
+    });
+  }
+  roundByID(id) {
+    const r = this.db.query(`SELECT * FROM goal_rounds WHERE id = ?`).get(id);
+    return r ? toRound(r) : undefined;
+  }
+  roundByInboxID(inboxID) {
+    const r = this.db.query(`SELECT * FROM goal_rounds WHERE inbox_id = ?`).get(inboxID);
+    return r ? toRound(r) : undefined;
+  }
+  outstandingRound(goalID) {
+    const r = this.db.query(`SELECT * FROM goal_rounds
+          WHERE goal_id = ? AND status IN ('prepared','admitted','running','unknown')
+          LIMIT 1`).get(goalID);
+    return r ? toRound(r) : undefined;
+  }
+  outstandingRounds() {
+    return this.db.query(`SELECT * FROM goal_rounds
+          WHERE status IN ('prepared','admitted','running','unknown')
+          ORDER BY prepared_at_ms ASC`).all().map(toRound);
+  }
+  roundsFor(goalID) {
+    return this.db.query(`SELECT * FROM goal_rounds WHERE goal_id = ? ORDER BY prepared_at_ms ASC`).all(goalID).map(toRound);
+  }
+  markRoundAdmitted(roundID) {
+    return this.tx(() => {
+      const round = this.roundByID(roundID);
+      if (!round)
+        throw new GoalConflictError(`unknown round ${roundID}`);
+      this.db.query(`UPDATE goal_rounds SET status='admitted', admitted_at_ms=? WHERE id=? AND status='prepared'`).run(Date.now(), roundID);
+      this.appendEvent(round.goalID, round.generation, "round-admitted", {
+        actor: "controller",
+        detail: round.inboxID
+      });
+      return this.roundByID(roundID);
+    });
+  }
+  markRoundRunning(roundID) {
+    return this.tx(() => {
+      const round = this.roundByID(roundID);
+      if (!round)
+        throw new GoalConflictError(`unknown round ${roundID}`);
+      this.db.query(`UPDATE goal_rounds SET status='running' WHERE id=? AND status IN ('prepared','admitted','unknown')`).run(roundID);
+      this.appendEvent(round.goalID, round.generation, "round-running", { actor: "controller" });
+      return this.roundByID(roundID);
+    });
+  }
+  markRoundUnknown(roundID, detail) {
+    return this.tx(() => {
+      const round = this.roundByID(roundID);
+      if (!round)
+        throw new GoalConflictError(`unknown round ${roundID}`);
+      this.db.query(`UPDATE goal_rounds SET status='unknown', attempts=attempts+1, detail=? WHERE id=?`).run(detail, roundID);
+      this.appendEvent(round.goalID, round.generation, "round-unknown", {
+        actor: "controller",
+        detail
+      });
+      return this.roundByID(roundID);
+    });
+  }
+  markRoundFailed(roundID, detail) {
+    return this.tx(() => {
+      const round = this.roundByID(roundID);
+      if (!round)
+        throw new GoalConflictError(`unknown round ${roundID}`);
+      this.db.query(`UPDATE goal_rounds SET status='failed', detail=?, settled_at_ms=? WHERE id=?`).run(detail, Date.now(), roundID);
+      this.appendEvent(round.goalID, round.generation, "round-failed", {
+        actor: "controller",
+        detail
+      });
+      return this.roundByID(roundID);
+    });
+  }
+  settleRound(input) {
+    return this.tx(() => {
+      const round = this.roundByID(input.roundID);
+      if (!round)
+        throw new GoalConflictError(`unknown round ${input.roundID}`);
+      this.db.query(`UPDATE goal_rounds SET status='settled', classification=?, detail=?, settled_at_ms=? WHERE id=?`).run(input.classification, input.detail ?? null, Date.now(), input.roundID);
+      this.appendEvent(round.goalID, round.generation, "round-settled", {
+        actor: "controller",
+        detail: `${input.classification}${input.detail ? `: ${input.detail}` : ""}`
+      });
+      return this.roundByID(input.roundID);
+    });
+  }
+}
+function toRound(r) {
+  return {
+    id: r.id,
+    goalID: r.goal_id,
+    generation: r.generation,
+    inboxID: r.inbox_id,
+    status: r.status,
+    classification: r.classification ?? undefined,
+    attempts: r.attempts,
+    detail: r.detail ?? undefined,
+    preparedAtMs: r.prepared_at_ms,
+    admittedAtMs: r.admitted_at_ms ?? undefined,
+    settledAtMs: r.settled_at_ms ?? undefined
+  };
 }
 
 // src/controller/controller.ts
@@ -639,6 +797,276 @@ class GoalController {
   }
 }
 
+// src/controller/driver.ts
+var seq = 0;
+function newInboxID() {
+  seq += 1;
+  const rand = Math.random().toString(36).slice(2, 10);
+  return `msg_xgoal_${Date.now().toString(36)}${seq.toString(36)}${rand}`;
+}
+var DEFAULT_CONTINUATION = (goal) => [
+  "Continue working toward the active goal.",
+  "",
+  `Objective: ${goal.objective}`,
+  "",
+  "Inspect the current state before acting. Take the next useful action.",
+  "A workflow preference, an optional decision, or a choice between reasonable",
+  "next steps is not a blocker — choose and continue. If the objective is",
+  "genuinely satisfied, propose completion with evidence."
+].join(`
+`);
+
+class GoalDriver {
+  store;
+  transport;
+  maxNoProgressRounds;
+  maxRoundAttempts;
+  render;
+  constructor(store, transport, options = {}) {
+    this.store = store;
+    this.transport = transport;
+    this.maxNoProgressRounds = options.maxNoProgressRounds ?? 3;
+    this.maxRoundAttempts = options.maxRoundAttempts ?? 5;
+    this.render = options.renderContinuation ?? DEFAULT_CONTINUATION;
+  }
+  async drive(sessionID) {
+    const decision = this.reserve(sessionID);
+    if (decision.action !== "dispatch")
+      return decision.outcome;
+    return this.dispatch(decision.round, sessionID);
+  }
+  reserve(sessionID) {
+    const goal = this.store.current(sessionID);
+    if (!goal)
+      return { action: "done", outcome: { action: "idle", reason: "no goal" } };
+    if (goal.status !== "active") {
+      return {
+        action: "done",
+        outcome: { action: "idle", reason: `goal status is ${goal.status}` }
+      };
+    }
+    const outstanding = this.store.outstandingRound(goal.id);
+    if (outstanding) {
+      return {
+        action: "done",
+        outcome: { action: "reconcile", roundID: outstanding.id, status: outstanding.status }
+      };
+    }
+    if (goal.tokenBudget !== undefined && (goal.tokensUsed ?? 0) >= goal.tokenBudget) {
+      const limited = this.store.transition({
+        goalID: goal.id,
+        generation: goal.generation,
+        to: "budgetLimited",
+        actor: "controller",
+        reason: `token budget reached (${goal.tokensUsed}/${goal.tokenBudget})`
+      });
+      return { action: "done", outcome: { action: "limited", status: limited.status } };
+    }
+    const inboxID = newInboxID();
+    const round = this.store.prepareRound({
+      goalID: goal.id,
+      generation: goal.generation,
+      inboxID
+    });
+    return { action: "dispatch", round };
+  }
+  async dispatch(round, sessionID) {
+    const goal = this.store.byID(round.goalID);
+    if (!goal || goal.generation !== round.generation || isTerminal(goal.status)) {
+      const detail = goal ? `goal moved to generation ${goal.generation} / ${goal.status}` : "goal no longer exists";
+      this.store.markRoundFailed(round.id, `abandoned before admission: ${detail}`);
+      return { action: "abandoned", roundID: round.id, detail };
+    }
+    try {
+      const result = await this.transport.submit({
+        sessionID,
+        inboxID: round.inboxID,
+        text: this.render(goal),
+        metadata: { goalID: goal.id, generation: goal.generation, roundID: round.id }
+      });
+      if (result.ok) {
+        this.store.markRoundAdmitted(round.id);
+        return { action: "admitted", roundID: round.id, inboxID: round.inboxID };
+      }
+      if (result.retryable) {
+        this.store.markRoundUnknown(round.id, result.error);
+        return {
+          action: "unknown",
+          roundID: round.id,
+          inboxID: round.inboxID,
+          detail: result.error
+        };
+      }
+      this.store.markRoundFailed(round.id, result.error);
+      return {
+        action: "failed",
+        roundID: round.id,
+        inboxID: round.inboxID,
+        detail: result.error
+      };
+    } catch (error) {
+      const detail = String(error);
+      this.store.markRoundUnknown(round.id, detail);
+      return { action: "unknown", roundID: round.id, inboxID: round.inboxID, detail };
+    }
+  }
+  async reconcile() {
+    const out = [];
+    for (const round of this.store.outstandingRounds()) {
+      out.push(await this.reconcileRound(round));
+    }
+    return out;
+  }
+  async reconcileRound(round) {
+    const goal = this.store.byID(round.goalID);
+    if (!goal) {
+      this.store.markRoundFailed(round.id, "goal vanished");
+      return { action: "failed", roundID: round.id, inboxID: round.inboxID, detail: "goal vanished" };
+    }
+    if (goal.generation !== round.generation || isTerminal(goal.status)) {
+      const detail = `superseded (generation ${goal.generation}, status ${goal.status})`;
+      this.store.markRoundFailed(round.id, detail);
+      return { action: "failed", roundID: round.id, inboxID: round.inboxID, detail };
+    }
+    if (round.attempts > this.maxRoundAttempts) {
+      const detail = `exceeded ${this.maxRoundAttempts} submission attempts`;
+      this.store.markRoundFailed(round.id, detail);
+      return { action: "failed", roundID: round.id, inboxID: round.inboxID, detail };
+    }
+    const probe = await this.transport.probe({ sessionID: goal.sessionID, round });
+    switch (probe) {
+      case "running":
+        this.store.markRoundRunning(round.id);
+        return { action: "reconcile", roundID: round.id, status: "running" };
+      case "settled":
+        return { action: "reconcile", roundID: round.id, status: "settled" };
+      case "notDelivered": {
+        try {
+          this.store.markRoundUnknown(round.id, "not delivered; retrying with original id");
+        } catch {}
+        const retry = this.store.roundByID(round.id);
+        return this.dispatch(retry, goal.sessionID);
+      }
+      case "unknown":
+      default:
+        return { action: "reconcile", roundID: round.id, status: round.status };
+    }
+  }
+  settleRound(input) {
+    const round = this.store.roundByID(input.roundID);
+    if (!round)
+      throw new GoalConflictError(`unknown round ${input.roundID}`);
+    this.store.settleRound({
+      roundID: input.roundID,
+      classification: input.classification,
+      detail: input.detail
+    });
+    return this.store.recordRound({
+      goalID: round.goalID,
+      generation: round.generation,
+      classification: input.classification,
+      detail: input.detail,
+      tokensUsed: input.tokensUsed
+    });
+  }
+  get stallThreshold() {
+    return this.maxNoProgressRounds;
+  }
+}
+
+// src/controller/transport.ts
+class RoundObserver {
+  seen = new Map;
+  slot(inboxID) {
+    let s = this.seen.get(inboxID);
+    if (!s) {
+      s = { enqueued: false, delivered: false, running: false, finished: false };
+      this.seen.set(inboxID, s);
+    }
+    return s;
+  }
+  observe(event) {
+    const e = event;
+    const type = e?.type;
+    if (!type)
+      return;
+    const d = e?.data ?? {};
+    const p = e?.properties ?? {};
+    const pick = (k) => d[k] ?? p[k];
+    const id = pick("messageID") ?? pick("messageId") ?? pick("message")?.id ?? pick("info")?.id;
+    if (!id || !id.startsWith("msg_xgoal_"))
+      return;
+    const s = this.slot(id);
+    switch (type) {
+      case "session.inbox.enqueued":
+        s.enqueued = true;
+        break;
+      case "session.inbox.delivered":
+        s.enqueued = true;
+        s.delivered = true;
+        break;
+      case "session.execution.started":
+        s.delivered = true;
+        s.running = true;
+        break;
+      case "session.execution.succeeded":
+      case "session.execution.failed":
+        s.finished = true;
+        s.running = false;
+        break;
+      default:
+        break;
+    }
+  }
+  probe(inboxID) {
+    const s = this.seen.get(inboxID);
+    if (!s)
+      return "unknown";
+    if (s.finished)
+      return "settled";
+    if (s.running)
+      return "running";
+    if (s.enqueued || s.delivered)
+      return "running";
+    return "unknown";
+  }
+  forget(inboxID) {
+    this.seen.delete(inboxID);
+  }
+}
+function classify(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  const status = error;
+  const code = status?.status ?? status?.statusCode;
+  if (typeof code === "number" && code >= 400 && code < 500 && code !== 408 && code !== 429) {
+    return { ok: false, retryable: false, error: message };
+  }
+  if (typeof code === "number" && code === 404) {
+    return { ok: false, retryable: false, error: message };
+  }
+  return { ok: false, retryable: true, error: message };
+}
+
+class SessionTransport {
+  observer;
+  send;
+  constructor(options) {
+    this.observer = options.observer;
+    this.send = options.send;
+  }
+  async submit(input) {
+    try {
+      await this.send(input);
+      return { ok: true };
+    } catch (error) {
+      return classify(error);
+    }
+  }
+  async probe(input) {
+    return this.observer.probe(input.round.inboxID);
+  }
+}
+
 // src/index.ts
 var LOG = process.env.XGOAL_HARNESS_LOG ?? "";
 function record(entry) {
@@ -655,6 +1083,10 @@ function dbPath() {
     return process.env.XGOAL_DB;
   const dataHome = process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share");
   return join(dataHome, "opencode-xgoal", "goals.db");
+}
+function sessionIDOf(event) {
+  const e = event;
+  return e?.data?.sessionID ?? e?.properties?.sessionID ?? e?.sessionID;
 }
 function obj(properties, required = []) {
   return { type: "object", properties, required, additionalProperties: false };
@@ -677,6 +1109,30 @@ var src_default = {
       startupError = String(error);
       record({ event: "controller.failed", error: startupError });
     }
+    const observer = new RoundObserver;
+    let driver;
+    let sweep;
+    if (controller) {
+      const transport = new SessionTransport({
+        observer,
+        send: async ({ sessionID, inboxID, text, metadata }) => {
+          await ctx.session.synthetic({
+            sessionID,
+            id: inboxID,
+            text,
+            metadata,
+            delivery: "queue"
+          });
+        }
+      });
+      driver = new GoalDriver(controller.store, transport);
+      driver.reconcile().then((outcomes) => record({ event: "driver.reconciled", count: outcomes.length })).catch((error) => record({ event: "driver.reconcile.error", error: String(error) }));
+      const sweepMs = Number(process.env.XGOAL_SWEEP_MS ?? "20000");
+      sweep = setInterval(() => {
+        driver?.reconcile().catch((error) => record({ event: "driver.sweep.error", error: String(error) }));
+      }, sweepMs);
+      sweep?.unref?.();
+    }
     record({
       event: "setup.begin",
       pluginId: "opencode-xgoal",
@@ -687,7 +1143,7 @@ var src_default = {
     try {
       await ctx.tool.transform((editor) => {
         editor.add({
-          id: "goal_get",
+          name: "goal_get",
           description: "Report the current goal for this session, including status, generation, round counts and unmet criteria.",
           input: obj({}),
           async execute(_input, toolCtx) {
@@ -714,7 +1170,7 @@ var src_default = {
           }
         });
         editor.add({
-          id: "goal_checkpoint",
+          name: "goal_checkpoint",
           description: "Record progress toward the current goal without changing its status. Use for completed work, or for investigation that materially narrows the problem.",
           input: obj({
             summary: str,
@@ -740,7 +1196,7 @@ var src_default = {
           }
         });
         editor.add({
-          id: "goal_propose_complete",
+          name: "goal_propose_complete",
           description: "Propose that the goal's original objective has been fully achieved. This moves the goal to verification; it does not complete it. The controller decides completion.",
           input: obj({ summary: str, evidence_refs: strArray, goal_id: str, generation: num }, [
             "summary"
@@ -763,7 +1219,7 @@ var src_default = {
           }
         });
         editor.add({
-          id: "goal_report_blocked",
+          name: "goal_report_blocked",
           description: "Report that the goal cannot proceed. Only use this for a genuine external dependency: missing credentials, permissions, or required information. A workflow preference, an optional decision, or a choice between reasonable next steps is NOT a blocker — continue working instead.",
           input: obj({
             reason: str,
@@ -929,12 +1385,34 @@ ${unmet.join(`
       record({ event: "tool.hook.execute.after", ok: false, error: String(error) });
     }
     const eventsSeen = new Set;
+    const IDLE_SIGNALS = new Set([
+      "session.execution.succeeded",
+      "session.execution.failed",
+      "session.inbox.delivered"
+    ]);
+    let lastDrive = 0;
     (async () => {
       try {
         for await (const event of ctx.event.subscribe({ signal: abort.signal })) {
           const type = String(event?.type ?? "unknown");
           eventsSeen.add(type);
+          observer.observe(event);
           record({ event: "event", type, total: eventsSeen.size });
+          if (!driver || !IDLE_SIGNALS.has(type))
+            continue;
+          const now = Date.now();
+          if (now - lastDrive < 500)
+            continue;
+          lastDrive = now;
+          const sessionID = sessionIDOf(event);
+          if (!sessionID)
+            continue;
+          try {
+            const outcome = await driver.drive(sessionID);
+            record({ event: "driver.drive", sessionID, outcome: outcome.action });
+          } catch (error) {
+            record({ event: "driver.drive.error", sessionID, error: String(error) });
+          }
         }
       } catch (error) {
         record({ event: "event.stream.error", error: String(error) });
@@ -943,6 +1421,8 @@ ${unmet.join(`
     record({ event: "setup.complete" });
     return async () => {
       abort.abort();
+      if (sweep)
+        clearInterval(sweep);
       try {
         controller?.close();
       } catch {}

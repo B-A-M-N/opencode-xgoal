@@ -113,6 +113,39 @@ CREATE TABLE IF NOT EXISTS goal_evidence (
   at_ms       INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS goal_evidence_goal ON goal_evidence (goal_id);
+
+-- Continuation ledger. One row per continuation attempt.
+--
+-- inbox_id is the OpenCode message ID we reserve BEFORE submitting, and it is
+-- UNIQUE. That uniqueness is the idempotency guarantee: a retry after a timeout
+-- reuses the same id, so the session can deduplicate it and we can never admit
+-- the same continuation twice.
+--
+-- status tracks the attempt's real lifecycle, not our hopes:
+--   prepared  reserved, not yet submitted
+--   admitted  the session accepted the message (NOT proof it ran)
+--   running   execution observed to have started
+--   settled   a round outcome was evaluated
+--   unknown   submission outcome ambiguous (timeout / lost response)
+--   failed    submission definitively rejected
+CREATE TABLE IF NOT EXISTS goal_rounds (
+  id             TEXT PRIMARY KEY,
+  goal_id        TEXT NOT NULL,
+  generation     INTEGER NOT NULL,
+  inbox_id       TEXT NOT NULL UNIQUE,
+  status         TEXT NOT NULL,
+  classification TEXT,
+  attempts       INTEGER NOT NULL DEFAULT 1,
+  detail         TEXT,
+  prepared_at_ms INTEGER NOT NULL,
+  admitted_at_ms INTEGER,
+  settled_at_ms  INTEGER
+);
+CREATE INDEX IF NOT EXISTS goal_rounds_goal ON goal_rounds (goal_id, prepared_at_ms);
+-- At most one in-flight round per goal.
+CREATE UNIQUE INDEX IF NOT EXISTS goal_rounds_one_outstanding
+  ON goal_rounds (goal_id)
+  WHERE status IN ('prepared', 'admitted', 'running', 'unknown');
 `;
 
 interface GoalRow {
@@ -621,4 +654,230 @@ export class GoalStore {
       return repaired;
     });
   }
+
+  // ------------------------------------------------------ continuation ledger
+
+  /**
+   * Reserve a continuation attempt. Runs in a transaction, and the partial
+   * unique index guarantees at most one outstanding round per goal, so two
+   * concurrent triggers cannot both reserve.
+   *
+   * The caller supplies `inboxID`; it must persist it BEFORE submitting so that
+   * a retry after a timeout reuses the same OpenCode message ID.
+   */
+  prepareRound(input: {
+    goalID: string;
+    generation: number;
+    inboxID: string;
+  }): GoalRound {
+    return this.tx(() => {
+      const goal = this.byID(input.goalID);
+      if (!goal) throw new GoalConflictError(`unknown goal ${input.goalID}`);
+      if (goal.generation !== input.generation) {
+        throw new GoalConflictError(
+          `stale generation: ${input.goalID} is generation ${goal.generation}, round claimed ${input.generation}`,
+        );
+      }
+      if (isTerminal(goal.status)) {
+        throw new GoalConflictError(`goal ${input.goalID} is terminal (${goal.status})`);
+      }
+      const existing = this.outstandingRound(input.goalID);
+      if (existing) {
+        throw new GoalConflictError(
+          `goal ${input.goalID} already has an outstanding round (${existing.id}, ${existing.status})`,
+        );
+      }
+      const id = newID("round");
+      const now = Date.now();
+      this.db
+        .query(
+          `INSERT INTO goal_rounds (id, goal_id, generation, inbox_id, status, attempts, prepared_at_ms)
+           VALUES (?, ?, ?, ?, 'prepared', 1, ?)`,
+        )
+        .run(id, input.goalID, input.generation, input.inboxID, now);
+      this.appendEvent(input.goalID, input.generation, "round-prepared", {
+        actor: "controller",
+        detail: input.inboxID,
+      });
+      return this.roundByID(id)!;
+    });
+  }
+
+  roundByID(id: string): GoalRound | undefined {
+    const r = this.db.query<RoundRow, [string]>(`SELECT * FROM goal_rounds WHERE id = ?`).get(id);
+    return r ? toRound(r) : undefined;
+  }
+
+  roundByInboxID(inboxID: string): GoalRound | undefined {
+    const r = this.db
+      .query<RoundRow, [string]>(`SELECT * FROM goal_rounds WHERE inbox_id = ?`)
+      .get(inboxID);
+    return r ? toRound(r) : undefined;
+  }
+
+  /** The single in-flight round for a goal, if any. */
+  outstandingRound(goalID: string): GoalRound | undefined {
+    const r = this.db
+      .query<RoundRow, [string]>(
+        `SELECT * FROM goal_rounds
+          WHERE goal_id = ? AND status IN ('prepared','admitted','running','unknown')
+          LIMIT 1`,
+      )
+      .get(goalID);
+    return r ? toRound(r) : undefined;
+  }
+
+  /** Every round that needs reconciliation, across all goals. */
+  outstandingRounds(): GoalRound[] {
+    return this.db
+      .query<RoundRow, []>(
+        `SELECT * FROM goal_rounds
+          WHERE status IN ('prepared','admitted','running','unknown')
+          ORDER BY prepared_at_ms ASC`,
+      )
+      .all()
+      .map(toRound);
+  }
+
+  roundsFor(goalID: string): GoalRound[] {
+    return this.db
+      .query<RoundRow, [string]>(
+        `SELECT * FROM goal_rounds WHERE goal_id = ? ORDER BY prepared_at_ms ASC`,
+      )
+      .all(goalID)
+      .map(toRound);
+  }
+
+  /** Record that the session accepted the message. NOT proof it ran. */
+  markRoundAdmitted(roundID: string): GoalRound {
+    return this.tx(() => {
+      const round = this.roundByID(roundID);
+      if (!round) throw new GoalConflictError(`unknown round ${roundID}`);
+      this.db
+        .query(
+          `UPDATE goal_rounds SET status='admitted', admitted_at_ms=? WHERE id=? AND status='prepared'`,
+        )
+        .run(Date.now(), roundID);
+      this.appendEvent(round.goalID, round.generation, "round-admitted", {
+        actor: "controller",
+        detail: round.inboxID,
+      });
+      return this.roundByID(roundID)!;
+    });
+  }
+
+  markRoundRunning(roundID: string): GoalRound {
+    return this.tx(() => {
+      const round = this.roundByID(roundID);
+      if (!round) throw new GoalConflictError(`unknown round ${roundID}`);
+      this.db
+        .query(`UPDATE goal_rounds SET status='running' WHERE id=? AND status IN ('prepared','admitted','unknown')`)
+        .run(roundID);
+      this.appendEvent(round.goalID, round.generation, "round-running", { actor: "controller" });
+      return this.roundByID(roundID)!;
+    });
+  }
+
+  /**
+   * Submission outcome ambiguous. The round stays outstanding so the reconciler
+   * retries it, and the inbox ID is preserved so the retry is idempotent.
+   */
+  markRoundUnknown(roundID: string, detail: string): GoalRound {
+    return this.tx(() => {
+      const round = this.roundByID(roundID);
+      if (!round) throw new GoalConflictError(`unknown round ${roundID}`);
+      this.db
+        .query(
+          `UPDATE goal_rounds SET status='unknown', attempts=attempts+1, detail=? WHERE id=?`,
+        )
+        .run(detail, roundID);
+      this.appendEvent(round.goalID, round.generation, "round-unknown", {
+        actor: "controller",
+        detail,
+      });
+      return this.roundByID(roundID)!;
+    });
+  }
+
+  /** Submission definitively rejected. This is an admission failure, not a model failure. */
+  markRoundFailed(roundID: string, detail: string): GoalRound {
+    return this.tx(() => {
+      const round = this.roundByID(roundID);
+      if (!round) throw new GoalConflictError(`unknown round ${roundID}`);
+      this.db
+        .query(`UPDATE goal_rounds SET status='failed', detail=?, settled_at_ms=? WHERE id=?`)
+        .run(detail, Date.now(), roundID);
+      this.appendEvent(round.goalID, round.generation, "round-failed", {
+        actor: "controller",
+        detail,
+      });
+      return this.roundByID(roundID)!;
+    });
+  }
+
+  /** Evaluate a settled round. Clears it from the outstanding set. */
+  settleRound(input: {
+    roundID: string;
+    classification: "progress" | "verifiedWait" | "noProgress" | "blocked" | "complete";
+    detail?: string;
+  }): GoalRound {
+    return this.tx(() => {
+      const round = this.roundByID(input.roundID);
+      if (!round) throw new GoalConflictError(`unknown round ${input.roundID}`);
+      this.db
+        .query(
+          `UPDATE goal_rounds SET status='settled', classification=?, detail=?, settled_at_ms=? WHERE id=?`,
+        )
+        .run(input.classification, input.detail ?? null, Date.now(), input.roundID);
+      this.appendEvent(round.goalID, round.generation, "round-settled", {
+        actor: "controller",
+        detail: `${input.classification}${input.detail ? `: ${input.detail}` : ""}`,
+      });
+      return this.roundByID(input.roundID)!;
+    });
+  }
+}
+
+export interface GoalRound {
+  id: string;
+  goalID: string;
+  generation: number;
+  inboxID: string;
+  status: "prepared" | "admitted" | "running" | "settled" | "unknown" | "failed";
+  classification?: "progress" | "verifiedWait" | "noProgress" | "blocked" | "complete";
+  attempts: number;
+  detail?: string;
+  preparedAtMs: number;
+  admittedAtMs?: number;
+  settledAtMs?: number;
+}
+
+interface RoundRow {
+  id: string;
+  goal_id: string;
+  generation: number;
+  inbox_id: string;
+  status: string;
+  classification: string | null;
+  attempts: number;
+  detail: string | null;
+  prepared_at_ms: number;
+  admitted_at_ms: number | null;
+  settled_at_ms: number | null;
+}
+
+function toRound(r: RoundRow): GoalRound {
+  return {
+    id: r.id,
+    goalID: r.goal_id,
+    generation: r.generation,
+    inboxID: r.inbox_id,
+    status: r.status as GoalRound["status"],
+    classification: (r.classification ?? undefined) as GoalRound["classification"],
+    attempts: r.attempts,
+    detail: r.detail ?? undefined,
+    preparedAtMs: r.prepared_at_ms,
+    admittedAtMs: r.admitted_at_ms ?? undefined,
+    settledAtMs: r.settled_at_ms ?? undefined,
+  };
 }

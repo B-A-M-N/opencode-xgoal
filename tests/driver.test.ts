@@ -1,0 +1,385 @@
+/**
+ * Phase 03 — native continuation.
+ *
+ * Fault injection at each stage: before admission, after admission, during
+ * execution, and after completion. The gate is that recovery must never
+ * duplicate a continuation prompt.
+ */
+import { describe, expect, test, beforeEach, afterEach } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { GoalStore } from "../src/controller/store.ts";
+import {
+  GoalDriver,
+  newInboxID,
+  type ContinuationTransport,
+  type ProbeResult,
+  type SubmitResult,
+} from "../src/controller/driver.ts";
+
+let dir: string;
+let dbPath: string;
+let store: GoalStore;
+
+beforeEach(() => {
+  dir = mkdtempSync(join(tmpdir(), "xgoal-drv-"));
+  dbPath = join(dir, "goals.db");
+  store = new GoalStore(dbPath);
+});
+
+afterEach(() => {
+  try {
+    store.close();
+  } catch {
+    /* closed by test */
+  }
+  rmSync(dir, { recursive: true, force: true });
+});
+
+/** A transport whose behaviour each test can steer, recording every call. */
+class FakeTransport implements ContinuationTransport {
+  submitted: { sessionID: string; inboxID: string; text: string }[] = [];
+  probed: string[] = [];
+  submitResult: SubmitResult = { ok: true };
+  probeResult: ProbeResult = "unknown";
+  /** Throw instead of returning, to simulate a transport-level explosion. */
+  throwOnSubmit = false;
+  /** Runs inside submit, before returning — lets a test inspect DB state. */
+  onSubmit?: (inboxID: string) => void;
+
+  async submit(input: {
+    sessionID: string;
+    inboxID: string;
+    text: string;
+    metadata: Record<string, unknown>;
+  }): Promise<SubmitResult> {
+    this.submitted.push(input);
+    this.onSubmit?.(input.inboxID);
+    if (this.throwOnSubmit) throw new Error("transport exploded");
+    return this.submitResult;
+  }
+
+  async probe(input: { sessionID: string; round: { id: string } }): Promise<ProbeResult> {
+    this.probed.push(input.round.id);
+    return this.probeResult;
+  }
+}
+
+function setup() {
+  const transport = new FakeTransport();
+  const driver = new GoalDriver(store, transport);
+  const goal = store.create({ sessionID: "ses_a", objective: "build the replacement" });
+  return { transport, driver, goal };
+}
+
+describe("reserve before submit", () => {
+  test("the attempt is persisted before the transport is called", () => {
+    const { transport, driver, goal } = setup();
+
+    let roundAtSubmitTime: string | undefined;
+    transport.onSubmit = (inboxID) => {
+      // At the moment of submission the round must already exist, marked
+      // prepared, carrying this exact inbox id.
+      const round = store.roundByInboxID(inboxID);
+      roundAtSubmitTime = round?.status;
+    };
+
+    return driver.drive("ses_a").then(() => {
+      expect(roundAtSubmitTime).toBe("prepared");
+      expect(store.roundsFor(goal.id)).toHaveLength(1);
+    });
+  });
+
+  test("a crash between reserve and submit is recoverable, not lost", async () => {
+    const { transport, driver, goal } = setup();
+
+    // Simulate the process dying after reserving but before submitting.
+    const reserved = store.prepareRound({
+      goalID: goal.id,
+      generation: goal.generation,
+      inboxID: newInboxID(),
+    });
+    expect(reserved.status).toBe("prepared");
+    expect(transport.submitted).toHaveLength(0);
+
+    // The reconciler finds it and dispatches it, reusing the reserved id.
+    transport.probeResult = "notDelivered";
+    await driver.reconcile();
+
+    expect(transport.submitted).toHaveLength(1);
+    expect(transport.submitted[0].inboxID).toBe(reserved.inboxID);
+  });
+});
+
+describe("idempotency", () => {
+  test("a timeout marks the round unknown and retries with the SAME id", async () => {
+    const { transport, driver } = setup();
+
+    transport.submitResult = { ok: false, retryable: true, error: "ETIMEDOUT" };
+    const first = await driver.drive("ses_a");
+    expect(first.action).toBe("unknown");
+
+    const inboxID = transport.submitted[0].inboxID;
+    const round = store.roundByInboxID(inboxID)!;
+    expect(round.status).toBe("unknown");
+    expect(round.attempts).toBe(2);
+
+    // Recovery re-submits. Critically: same id, no new attempt minted.
+    transport.probeResult = "notDelivered";
+    transport.submitResult = { ok: true };
+    await driver.reconcile();
+
+    expect(transport.submitted).toHaveLength(2);
+    expect(transport.submitted[1].inboxID).toBe(inboxID);
+    // Still exactly one round row: a retry is not a second attempt.
+    expect(store.roundsFor(round.goalID)).toHaveLength(1);
+  });
+
+  test("a transport exception is ambiguous, not a failure", async () => {
+    const { transport, driver } = setup();
+    transport.throwOnSubmit = true;
+    const out = await driver.drive("ses_a");
+    expect(out.action).toBe("unknown");
+    expect(store.roundsFor(store.current("ses_a")!.id)[0].status).toBe("unknown");
+  });
+
+  test("a definitive rejection is recorded as an admission failure", async () => {
+    const { transport, driver, goal } = setup();
+    transport.submitResult = { ok: false, retryable: false, error: "400 bad request" };
+    const out = await driver.drive("ses_a");
+    expect(out.action).toBe("failed");
+    const round = store.roundsFor(goal.id)[0];
+    expect(round.status).toBe("failed");
+    // Crucially: this must NOT be counted as a model no-progress round.
+    expect(store.current("ses_a")!.noProgressRounds).toBe(0);
+    expect(store.current("ses_a")!.rounds).toBe(0);
+  });
+});
+
+describe("admission is not execution", () => {
+  test("admission leaves the round outstanding until an outcome is observed", async () => {
+    const { transport, driver, goal } = setup();
+    const out = await driver.drive("ses_a");
+    expect(out.action).toBe("admitted");
+
+    const round = store.roundsFor(goal.id)[0];
+    expect(round.status).toBe("admitted");
+    // Still outstanding: the goal has not advanced just because the message was
+    // accepted.
+    expect(store.outstandingRound(goal.id)?.id).toBe(round.id);
+    expect(store.current("ses_a")!.rounds).toBe(0);
+  });
+
+  test("a second drive while a round is outstanding does not submit again", async () => {
+    const { transport, driver } = setup();
+    await driver.drive("ses_a");
+    expect(transport.submitted).toHaveLength(1);
+
+    const second = await driver.drive("ses_a");
+    expect(second.action).toBe("reconcile");
+    // The gate: no duplicate continuation prompt.
+    expect(transport.submitted).toHaveLength(1);
+  });
+
+  test("reconcile does not re-submit a round that is running or settled", async () => {
+    const { transport, driver } = setup();
+    await driver.drive("ses_a");
+
+    transport.probeResult = "running";
+    await driver.reconcile();
+    expect(transport.submitted).toHaveLength(1);
+
+    transport.probeResult = "settled";
+    await driver.reconcile();
+    expect(transport.submitted).toHaveLength(1);
+  });
+
+  test("an unknown probe leaves the round outstanding without re-submitting", async () => {
+    const { transport, driver, goal } = setup();
+    await driver.drive("ses_a");
+    transport.probeResult = "unknown";
+    await driver.reconcile();
+    expect(transport.submitted).toHaveLength(1);
+    expect(store.outstandingRound(goal.id)).toBeDefined();
+  });
+});
+
+describe("concurrency", () => {
+  test("two concurrent drives admit exactly one continuation", async () => {
+    const { transport, driver } = setup();
+    const [a, b] = await Promise.all([driver.drive("ses_a"), driver.drive("ses_a")]);
+    const actions = [a.action, b.action].sort();
+    expect(actions).toContain("admitted");
+    expect(transport.submitted).toHaveLength(1);
+    expect(store.roundsFor(store.current("ses_a")!.id)).toHaveLength(1);
+  });
+
+  test("a second reservation on a goal with an outstanding round is refused", () => {
+    const { goal } = setup();
+    store.prepareRound({ goalID: goal.id, generation: 1, inboxID: newInboxID() });
+    expect(() =>
+      store.prepareRound({ goalID: goal.id, generation: 1, inboxID: newInboxID() }),
+    ).toThrow();
+  });
+
+  test("inbox ids are unique across many mints", () => {
+    const ids = new Set<string>();
+    for (let i = 0; i < 2000; i++) ids.add(newInboxID());
+    expect(ids.size).toBe(2000);
+  });
+});
+
+describe("fencing and recovery", () => {
+  test("a round for a superseded goal is failed, never re-submitted", async () => {
+    const { transport, driver, goal } = setup();
+    // Reserve, then supersede before dispatch.
+    store.prepareRound({ goalID: goal.id, generation: 1, inboxID: newInboxID() });
+    store.replace({ sessionID: "ses_a", expectedGeneration: 1, objective: "new objective" });
+
+    const outcomes = await driver.reconcile();
+    expect(outcomes[0].action).toBe("failed");
+    expect(transport.submitted).toHaveLength(0);
+  });
+
+  test("a stale round is cleaned up by reconcile and never blocks the new goal", async () => {
+    const { transport, driver, goal } = setup();
+    const stale = store.prepareRound({
+      goalID: goal.id,
+      generation: 1,
+      inboxID: newInboxID(),
+    });
+    const replacement = store.replace({
+      sessionID: "ses_a",
+      expectedGeneration: 1,
+      objective: "newer objective",
+    });
+
+    // drive() targets the current goal, so it must not touch the dead one.
+    const out = await driver.drive("ses_a");
+    expect(out.action).toBe("admitted");
+    expect(transport.submitted).toHaveLength(1);
+    // The submission is for the replacement, never the superseded objective.
+    expect(transport.submitted[0].text).toContain("newer objective");
+    expect(transport.submitted[0].text).not.toContain("build the replacement");
+
+    // The stale round is still outstanding until reconciled, then failed with a
+    // reason. It must never be re-submitted.
+    transport.probeResult = "notDelivered";
+    const outcomes = await driver.reconcile();
+    const staleOutcome = outcomes.find((o) => "roundID" in o && o.roundID === stale.id);
+    expect(staleOutcome?.action).toBe("failed");
+    expect(store.roundByID(stale.id)!.status).toBe("failed");
+    expect(store.roundByID(stale.id)!.detail).toContain("superseded");
+
+    // The real invariant: nothing submitted ever carried the superseded
+    // objective. (The replacement's own undelivered round is legitimately
+    // retried, so a bare submission count would be the wrong assertion.)
+    expect(transport.submitted.length).toBeGreaterThanOrEqual(1);
+    for (const s of transport.submitted) {
+      expect(s.text).toContain("newer objective");
+      expect(s.text).not.toContain("build the replacement");
+    }
+    expect(store.current("ses_a")?.id).toBe(replacement.id);
+  });
+
+  test("a round is failed after too many submission attempts", async () => {
+    const { transport, driver, goal } = setup();
+    const round = store.prepareRound({
+      goalID: goal.id,
+      generation: 1,
+      inboxID: newInboxID(),
+    });
+    // Push attempts past the cap.
+    for (let i = 0; i < 6; i++) store.markRoundUnknown(round.id, "timeout");
+
+    transport.probeResult = "notDelivered";
+    const outcomes = await driver.reconcile();
+    expect(outcomes[0].action).toBe("failed");
+    expect(transport.submitted).toHaveLength(0);
+  });
+
+  test("recovery after restart does not duplicate continuations", async () => {
+    const { transport, driver, goal } = setup();
+    // A round was admitted, then the process died.
+    const round = store.prepareRound({
+      goalID: goal.id,
+      generation: 1,
+      inboxID: newInboxID(),
+    });
+    store.markRoundAdmitted(round.id);
+    store.close();
+
+    // New process.
+    store = new GoalStore(dbPath);
+    const transport2 = new FakeTransport();
+    transport2.probeResult = "settled";
+    const driver2 = new GoalDriver(store, transport2);
+    await driver2.reconcile();
+
+    // The admitted round is adopted, not re-sent.
+    expect(transport2.submitted).toHaveLength(0);
+    expect(store.roundByInboxID(round.inboxID)?.status).toBe("admitted");
+  });
+});
+
+describe("settling", () => {
+  test("settling a round records the classification on both round and goal", async () => {
+    const { transport, driver, goal } = setup();
+    await driver.drive("ses_a");
+    const round = store.roundsFor(goal.id)[0];
+
+    const g = driver.settleRound({
+      roundID: round.id,
+      classification: "progress",
+      detail: "implemented phase 03",
+      tokensUsed: 250,
+    });
+
+    expect(store.roundByID(round.id)!.status).toBe("settled");
+    expect(store.roundByID(round.id)!.classification).toBe("progress");
+    expect(g?.rounds).toBe(1);
+    expect(g?.tokensUsed).toBe(250);
+    // Settling clears it from the outstanding set, allowing the next round.
+    expect(store.outstandingRound(goal.id)).toBeUndefined();
+    void transport;
+  });
+
+  test("a settled round allows a subsequent continuation", async () => {
+    const { transport, driver, goal } = setup();
+    await driver.drive("ses_a");
+    const first = store.roundsFor(goal.id)[0];
+    driver.settleRound({ roundID: first.id, classification: "progress" });
+
+    const second = await driver.drive("ses_a");
+    expect(second.action).toBe("admitted");
+    expect(transport.submitted).toHaveLength(2);
+    // A fresh round gets a fresh id — that is a genuine second continuation.
+    expect(transport.submitted[0].inboxID).not.toBe(transport.submitted[1].inboxID);
+  });
+});
+
+describe("resource limits", () => {
+  test("the driver limits rather than dispatching when the budget is spent", async () => {
+    const { transport, driver, goal } = setup();
+    store.db.query("UPDATE goals SET token_budget = 100, tokens_used = 100 WHERE id = ?").run(goal.id);
+
+    const out = await driver.drive("ses_a");
+    expect(out.action).toBe("limited");
+    expect(store.current("ses_a")?.status).toBe("budgetLimited");
+    expect(transport.submitted).toHaveLength(0);
+  });
+
+  test("a non-active goal is not driven", async () => {
+    const { transport, driver } = setup();
+    store.transition({
+      goalID: store.current("ses_a")!.id,
+      generation: 1,
+      to: "paused",
+      actor: "user",
+    });
+    const out = await driver.drive("ses_a");
+    expect(out.action).toBe("idle");
+    expect(transport.submitted).toHaveLength(0);
+  });
+});
