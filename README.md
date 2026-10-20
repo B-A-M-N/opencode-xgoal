@@ -212,7 +212,8 @@ bound, currently valid evidence.
 wrote controller rows directly and then prompted the model itself, which proved
 only that the model could do the task. The new one proves the plugin drives it:
 
-1. start an isolated server, workspace and database under the repo;
+1. start an isolated server, workspace and database in a temporary directory
+   (`${TMPDIR:-/tmp}`), outside the checkout;
 2. create a session and run one trivial warm-up turn (the only prompt);
 3. create the goal through the public `goal.create` RPC and **send no further
    prompt**;

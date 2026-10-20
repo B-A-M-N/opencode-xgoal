@@ -11,8 +11,8 @@
 # the session API and the plugin's server RPC. The harness never writes a goal
 # row directly and never prompts the model after creating the goal.
 #
-# It uses an isolated server, workspace and database, so it cannot disturb the
-# user's real sessions.
+# It uses an isolated server, workspace and database in a temporary directory,
+# so it cannot disturb the user's real sessions.
 #
 # Usage:
 #   bash scripts/parity.sh
