@@ -368,6 +368,16 @@ export class GoalStore {
     return row ? toGoal(row) : undefined;
   }
 
+  /** The newest goal in the session, including a completed one. */
+  latest(sessionID: string): Goal | undefined {
+    const row = this.db
+      .query<GoalRow, [string]>(
+        `SELECT * FROM goals WHERE session_id = ? ORDER BY generation DESC LIMIT 1`,
+      )
+      .get(sessionID);
+    return row ? toGoal(row) : undefined;
+  }
+
   byID(id: string): Goal | undefined {
     const row = this.db.query<GoalRow, [string]>(`SELECT * FROM goals WHERE id = ?`).get(id);
     return row ? toGoal(row) : undefined;
@@ -902,6 +912,11 @@ export class GoalStore {
             proof.detail,
             now,
           );
+        // Keep the criterion's own readout consistent with the proof that was
+        // just recorded. A complete goal with `met: false` criteria is a lie.
+        this.db
+          .query(`UPDATE goal_criteria SET met = ? WHERE id = ? AND goal_id = ?`)
+          .run(proof.verdict === "pass" ? 1 : 0, proof.criterionID, goalID);
       }
       this.db
         .query(

@@ -73,6 +73,20 @@ describe("goal.status", () => {
     expect(res.goal?.criteria.some((c: any) => c.text === "it works")).toBe(true);
   });
 
+  test("reports the latest terminal goal, not 'no goal'", async () => {
+    const start = controller.startOrDescribe("ses_a", "finished work");
+    if (!("created" in start)) throw new Error("expected a new goal");
+    controller.store.transition({
+      goalID: start.created.id,
+      generation: start.created.generation,
+      to: "superseded",
+      actor: "user",
+    });
+    const res = await handlers["goal.status"]({ sessionID: "ses_a" });
+    expect(res.goal?.status).toBe("superseded");
+    expect(res.goal?.objective).toBe("finished work");
+  });
+
   test("a malformed call does not throw", async () => {
     const res = await handlers["goal.status"]({} as never);
     expect(res.goal).toBeNull();

@@ -349,6 +349,10 @@ class GoalStore {
     const row = this.db.query(`SELECT * FROM goals WHERE session_id = ? AND status NOT IN ('complete','superseded') LIMIT 1`).get(sessionID);
     return row ? toGoal(row) : undefined;
   }
+  latest(sessionID) {
+    const row = this.db.query(`SELECT * FROM goals WHERE session_id = ? ORDER BY generation DESC LIMIT 1`).get(sessionID);
+    return row ? toGoal(row) : undefined;
+  }
   byID(id) {
     const row = this.db.query(`SELECT * FROM goals WHERE id = ?`).get(id);
     return row ? toGoal(row) : undefined;
@@ -592,6 +596,7 @@ class GoalStore {
         this.db.query(`INSERT INTO goal_criterion_proofs
                (id, goal_id, generation, criterion_id, evidence_ids, validator_id, verdict, detail, created_at_ms)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(newID("proof"), goalID, goal.generation, proof.criterionID, JSON.stringify(proof.evidenceIDs), proof.validatorID, proof.verdict, proof.detail, now);
+        this.db.query(`UPDATE goal_criteria SET met = ? WHERE id = ? AND goal_id = ?`).run(proof.verdict === "pass" ? 1 : 0, proof.criterionID, goalID);
       }
       this.db.query(`UPDATE goals
               SET verification_revision = verification_revision + 1,
@@ -1096,6 +1101,9 @@ class GoalController {
   status(sessionID) {
     return this.store.current(sessionID);
   }
+  latest(sessionID) {
+    return this.store.latest(sessionID);
+  }
   recordUsage(sessionID, totalTokens) {
     return this.store.recordSessionUsage(sessionID, totalTokens).goal;
   }
@@ -1104,7 +1112,7 @@ class GoalController {
     return this.store.setTokenBudget(goal.id, budget);
   }
   health(sessionID) {
-    const goal = this.store.current(sessionID);
+    const goal = this.store.latest(sessionID);
     if (!goal)
       return { ok: true, goal: null };
     const criteria = this.store.listCriteria(goal.id);
@@ -1194,6 +1202,13 @@ class GoalController {
       return 0;
     return this.store.bindEvidence(criterionID, [...chosen]);
   }
+  resolveCriterion(goalID, identifier) {
+    const criteria = this.store.listCriteria(goalID);
+    if (criteria.some((criterion) => criterion.id === identifier))
+      return identifier;
+    const byText = criteria.filter((criterion) => criterion.text === identifier);
+    return byText.length === 1 ? byText[0].id : undefined;
+  }
   checkpoint(sessionID, input) {
     const target = this.resolveTarget(sessionID, input);
     if (!target.ok)
@@ -1230,7 +1245,9 @@ class GoalController {
       this.store.addEvidence({ goalID: goal.id, kind: "ref", ref, detail: input.summary });
     }
     for (const binding of input.criteria ?? []) {
-      this.bindCriterionEvidence(goal.id, binding.criterionID, binding.evidenceRefs);
+      const criterionID = this.resolveCriterion(goal.id, binding.criterionID);
+      if (criterionID)
+        this.bindCriterionEvidence(goal.id, criterionID, binding.evidenceRefs);
     }
     const updated = this.store.transition({
       goalID: goal.id,
@@ -2143,7 +2160,7 @@ function goalRpcHandlers(controller, coordinator) {
     "goal.status": async (input) => {
       if (!input?.sessionID)
         return { goal: null };
-      return { goal: wire(controller, controller.status(input.sessionID)) };
+      return { goal: wire(controller, controller.latest(input.sessionID)) };
     },
     "goal.history": async (input) => {
       if (!input?.sessionID)

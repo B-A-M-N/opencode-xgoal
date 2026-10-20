@@ -152,6 +152,11 @@ export class GoalController {
     return this.store.current(sessionID);
   }
 
+  /** The latest goal, including a completed one. For status readouts. */
+  latest(sessionID: string): Goal | undefined {
+    return this.store.latest(sessionID);
+  }
+
   /**
    * Record session-level token usage against the active goal.
    *
@@ -176,7 +181,7 @@ export class GoalController {
    * or unmet criteria with no evidence.
    */
   health(sessionID: string): Record<string, unknown> {
-    const goal = this.store.current(sessionID);
+    const goal = this.store.latest(sessionID);
     if (!goal) return { ok: true, goal: null };
     const criteria = this.store.listCriteria(goal.id);
     const evidence = this.store.listEvidence(goal.id);
@@ -284,6 +289,14 @@ export class GoalController {
     return this.store.bindEvidence(criterionID, [...chosen]);
   }
 
+  /** Resolve a criterion by ID or by a unique exact text. */
+  private resolveCriterion(goalID: string, identifier: string): string | undefined {
+    const criteria = this.store.listCriteria(goalID);
+    if (criteria.some((criterion) => criterion.id === identifier)) return identifier;
+    const byText = criteria.filter((criterion) => criterion.text === identifier);
+    return byText.length === 1 ? byText[0].id : undefined;
+  }
+
   /**
    * `goal_checkpoint` — an evidence annotation, not a progress round.
    *
@@ -361,7 +374,11 @@ export class GoalController {
       this.store.addEvidence({ goalID: goal.id, kind: "ref", ref, detail: input.summary });
     }
     for (const binding of input.criteria ?? []) {
-      this.bindCriterionEvidence(goal.id, binding.criterionID, binding.evidenceRefs);
+      // The model may pass either the criterion ID (preferred) or its exact
+      // text. Text is accepted only when it identifies one criterion, so an
+      // ambiguous label cannot bind evidence to the wrong requirement.
+      const criterionID = this.resolveCriterion(goal.id, binding.criterionID);
+      if (criterionID) this.bindCriterionEvidence(goal.id, criterionID, binding.evidenceRefs);
     }
     const updated = this.store.transition({
       goalID: goal.id,

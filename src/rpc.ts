@@ -140,7 +140,7 @@ export function goalRpcHandlers(
   return {
     "goal.status": async (input: { sessionID?: string }) => {
       if (!input?.sessionID) return { goal: null };
-      return { goal: wire(controller, controller.status(input.sessionID)) };
+      return { goal: wire(controller, controller.latest(input.sessionID)) };
     },
 
     "goal.history": async (input: { sessionID?: string }) => {

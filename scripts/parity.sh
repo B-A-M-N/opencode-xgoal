@@ -1,194 +1,359 @@
 #!/usr/bin/env bash
-# Codex /goal  vs  OpenCode-XGoal — behavioural parity harness
+# OpenCode-XGoal — live activation acceptance harness.
 #
-# Runs identical, machine-checkable multi-requirement tasks through both
-# controllers and measures the thing that actually matters to the user:
+# The gate this proves:
 #
-#   1. requirement completion rate — how many of the task's explicit
-#      requirements were actually satisfied (not claimed)
-#   2. premature-stop rate — runs that stopped while requirements remained
-#   3. turns — model invocations per run
+#   A user sets a goal once. The plugin then drives the session through as many
+#   native turns as the objective needs, and the controller verifies completion
+#   against observed evidence. No further human prompt is sent.
 #
-# Success is judged ONLY by reading the resulting files. Nothing either model
-# says is treated as evidence.
+# Everything here goes through the public surfaces a user or the TUI uses:
+# the session API and the plugin's server RPC. The harness never writes a goal
+# row directly and never prompts the model after creating the goal.
 #
-# Usage: bash scripts/parity.sh [runs_per_task]
+# It uses an isolated server, workspace and database, so it cannot disturb the
+# user's real sessions.
+#
+# Usage:
+#   bash scripts/parity.sh
+#
+# Env:
+#   OPENCODE_BIN          opencode 2 executable (default: /home/bamn/.opencode/bin/opencode2)
+#   XGOAL_TEST_CONFIG     isolated XDG_CONFIG_HOME containing the model config
+#   XGOAL_ACCEPT_PORT     server port (default: 43299)
+#   XGOAL_ACCEPT_TIMEOUT  seconds per goal (default: 420)
+#   XGOAL_ACCEPT_KEEP=1   keep the workspace and logs after the run
 set -uo pipefail
 
-RUNS="${1:-1}"
 export PATH="/home/bamn/.bun/bin:$PATH"
-S=/home/bamn/.hermes/cache/scratch
-TC="$S/xgoal-testcfg"
-CODEX=/home/bamn/.local/bin/codex
-OC=/home/bamn/.opencode/bin/opencode2
-OUT="$S/parity-results"
-rm -rf "$OUT" && mkdir -p "$OUT"
 
-# --------------------------------------------------------------------------
-# Tasks. Each is a prompt plus a machine-checkable requirement list.
-# Deliberately multi-requirement: partial completion is the failure mode.
-# --------------------------------------------------------------------------
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+OC="${OPENCODE_BIN:-/home/bamn/.opencode/bin/opencode2}"
+TC="${XGOAL_TEST_CONFIG:-/home/bamn/.hermes/cache/scratch/xgoal-testcfg}"
+PORT="${XGOAL_ACCEPT_PORT:-43299}"
+HOST="127.0.0.1"
+TIMEOUT="${XGOAL_ACCEPT_TIMEOUT:-420}"
+KEEP="${XGOAL_ACCEPT_KEEP:-0}"
 
-task_prompt() {
-  case "$1" in
-    t1) cat <<'P'
-Complete ALL of the following, then stop:
-1. Create a file called a.txt containing exactly: alpha
-2. Create a file called b.txt containing exactly: bravo
-3. Create a file called c.txt containing exactly: charlie
-P
-      ;;
-    t2) cat <<'P'
-Complete ALL of the following, then stop:
-1. Create src/ containing a file mod.js that exports a function named add
-2. Create src/mod.test.js that imports add and calls it
-3. Create README.md containing the word Installation
-4. Create a file .gitignore containing node_modules
-P
-      ;;
-    t3) cat <<'P'
-Complete ALL of the following, then stop:
-1. Create data/ and inside it three files: one.txt, two.txt, three.txt
-2. Each must contain its own number as a word (one, two, three)
-3. Create a summary.txt listing all three filenames
-P
-      ;;
-  esac
+DIR="$(mktemp -d "${TMPDIR:-/tmp}/xgoal-accept.XXXXXX")" || exit 1
+WS="$DIR/work"
+DB="$DIR/goals.db"
+LOG="$DIR/harness.log"
+SERVER_OUT="$DIR/server.out"
+mkdir -p "$WS"
+
+PASS=0
+FAIL=0
+SERVER_PID=""
+
+# Kill the server and everything it spawned. A model turn can outlive the
+# server's own SIGTERM, and an orphaned turn will keep writing into the
+# workspace (or, worse, the repository) after the harness believes it is done.
+kill_tree() {
+  local signal="$1" pid="$2" child
+  for child in $(pgrep -P "$pid" 2>/dev/null); do
+    kill_tree "$signal" "$child"
+  done
+  kill "-$signal" "$pid" 2>/dev/null || true
 }
 
-# Count satisfied requirements by inspecting the filesystem. Echoes "met/total".
-task_score() {
-  local t="$1" w="$2" met=0 total=0
-  chk() { total=$((total+1)); if eval "$1"; then met=$((met+1)); fi; }
-  case "$t" in
-    t1)
-      chk "[ \"\$(tr -d '[:space:]' < '$w/a.txt' 2>/dev/null)\" = alpha ]"
-      chk "[ \"\$(tr -d '[:space:]' < '$w/b.txt' 2>/dev/null)\" = bravo ]"
-      chk "[ \"\$(tr -d '[:space:]' < '$w/c.txt' 2>/dev/null)\" = charlie ]"
-      ;;
-    t2)
-      chk "[ -f '$w/src/mod.js' ] && grep -q 'add' '$w/src/mod.js'"
-      chk "[ -f '$w/src/mod.test.js' ] && grep -q 'add' '$w/src/mod.test.js'"
-      chk "[ -f '$w/README.md' ] && grep -qi 'installation' '$w/README.md'"
-      chk "[ -f '$w/.gitignore' ] && grep -q 'node_modules' '$w/.gitignore'"
-      ;;
-    t3)
-      chk "[ -f '$w/data/one.txt' ] && grep -qi 'one' '$w/data/one.txt'"
-      chk "[ -f '$w/data/two.txt' ] && grep -qi 'two' '$w/data/two.txt'"
-      chk "[ -f '$w/data/three.txt' ] && grep -qi 'three' '$w/data/three.txt'"
-      chk "[ -f '$w/summary.txt' ] && grep -q 'one.txt' '$w/summary.txt' && grep -q 'three.txt' '$w/summary.txt'"
-      ;;
-  esac
-  echo "$met/$total"
+cleanup() {
+  if [ -n "$SERVER_PID" ]; then
+    kill_tree TERM "$SERVER_PID"
+    for _ in $(seq 1 20); do
+      kill -0 "$SERVER_PID" 2>/dev/null || break
+      sleep 0.25
+    done
+    kill_tree KILL "$SERVER_PID"
+    wait "$SERVER_PID" 2>/dev/null || true
+  fi
+  if [ "$KEEP" = "1" ]; then
+    echo "kept: $DIR"
+  else
+    rm -rf "$DIR"
+  fi
+}
+trap cleanup EXIT
+
+report() {
+  local name="$1" status="$2" detail="${3:-}"
+  if [ "$status" = "PASS" ]; then
+    PASS=$((PASS + 1))
+    echo "  PASS  $name"
+  else
+    FAIL=$((FAIL + 1))
+    echo "  FAIL  $name${detail:+ — $detail}"
+  fi
 }
 
-# Count model turns from the Codex transcript (each "codex" block = one turn).
-codex_turns() {
-  local n
-  n=$(grep -c '^codex$' "$1" 2>/dev/null | head -1)
-  echo "${n:-0}"
-}
-# OpenCode-XGoal turns: driver admissions + the initial prompt.
-oc_turns() {
-  local n
-  n=$(grep -ac 'driver.drive.*admitted' "$1" 2>/dev/null | head -1)
-  echo $(( ${n:-0} + 1 ))
-}
-
-run_codex() {
-  local t="$1" w="$2" log="$3"
-  rm -rf "$w" && mkdir -p "$w"
-  ( cd "$w" && timeout 300 "$CODEX" exec --skip-git-repo-check -C "$w" \
-      -c 'sandbox_mode="workspace-write"' \
-      -c 'approval_policy="never"' \
-      "$(task_prompt "$t")" ) > "$log" 2>&1 || true
+# Parse a JSON field from stdin. The RPC envelope is {"output": {...}}.
+json() {
+  python3 -c '
+import json, sys
+path = sys.argv[1].split(".")
+try:
+    value = json.load(sys.stdin)
+except Exception:
+    print("")
+    raise SystemExit(0)
+for key in path:
+    if isinstance(value, dict):
+        value = value.get(key)
+    else:
+        value = None
+        break
+print("" if value is None else value)
+' "$1"
 }
 
-run_xgoal() {
-  local t="$1" w="$2" log="$3" db="$4"
-  rm -rf "$w" && mkdir -p "$w"
-  rm -f "$db" "$db-wal" "$db-shm" "$log"
+rpc() {
+  local method="$1" body="$2"
+  curl -s -m 30 -u "opencode:$PW" -X POST \
+    "http://$HOST:$PORT/api/rpc/local.opencode-xgoal/$method" \
+    -H 'content-type: application/json' \
+    -d "{\"input\":$body}"
+}
 
-  # Establish a session, then place the task under an active goal with the
-  # task's requirements as criteria — otherwise this measures a bare
-  # single-turn completion, not goal-driven behaviour.
-  ( cd "$w" && XDG_CONFIG_HOME="$TC" XGOAL_HARNESS_LOG="$log" XGOAL_DB="$db" \
-      timeout 120 "$OC" run --standalone --auto "reply with exactly: ready" ) \
-      > "$w/.oc-init" 2>&1 || true
+session_get() {
+  curl -s -m 30 -u "opencode:$PW" "http://$HOST:$PORT/api/session/$1"
+}
 
-  local sid goal
-  sid=$(grep -aoE '"sessionID":"ses_[A-Za-z0-9]+"' "$log" 2>/dev/null | head -1 | sed 's/.*:"//;s/"//')
-  if [ -n "$sid" ]; then
-    goal=$(cd /home/bamn/opencode-xgoal && bun -e "
-import { GoalController } from './src/controller/controller.ts';
-const c = new GoalController({ dbPath: '$db' });
-const r = c.startOrDescribe('$sid', 'satisfy every numbered requirement in the task');
-const g = ('created' in r) ? r.created : r.existing;
-const reqs = { t1: ['a.txt contains alpha','b.txt contains bravo','c.txt contains charlie'],
-               t2: ['src/mod.js exports add','src/mod.test.js imports add','README.md mentions Installation','.gitignore contains node_modules'],
-               t3: ['data/one.txt','data/two.txt','data/three.txt','summary.txt lists the files'] }['$t'] || [];
-for (const x of reqs) c.store.addCriterion(g.id, x);
-console.log(g.id);
-c.close();
-" 2>/dev/null)
+# Create a session and run one trivial turn so the plugin loads for it.
+# This is the only human-equivalent prompt; everything after `goal.create`
+# is driven by the plugin.
+open_session() {
+  local title="$1"
+  local sid
+  sid=$(curl -s -m 30 -u "opencode:$PW" -X POST "http://$HOST:$PORT/api/session" \
+    -H 'content-type: application/json' \
+    -d "{\"title\":\"$title\"}" | json data.id)
+  if [ -z "$sid" ]; then
+    echo ""
+    return
+  fi
+  curl -s -m 30 -u "opencode:$PW" -X POST \
+    "http://$HOST:$PORT/api/session/$sid/synthetic" \
+    -H 'content-type: application/json' \
+    -d "{\"id\":\"msg_warmup_${sid}\",\"text\":\"Reply with exactly: ready. Do not use any tools.\",\"delivery\":\"queue\"}" >/dev/null
+  # Wait until the plugin has registered its RPC for this session.
+  local i
+  for i in $(seq 1 90); do
+    if rpc goal.status "{\"sessionID\":\"$sid\"}" | grep -q '"output"'; then
+      echo "$sid"
+      return
+    fi
+    sleep 1
+  done
+  echo ""
+}
+
+goal_field() {
+  # goal_field <sessionID> <field>
+  rpc goal.status "{\"sessionID\":\"$1\"}" | json "output.goal.$2"
+}
+
+wait_complete() {
+  local sid="$1" label="$2"
+  local started now status
+  started=$(date +%s)
+  while :; do
+    status=$(goal_field "$sid" status)
+    if [ "$status" = "complete" ]; then
+      return 0
+    fi
+    # A superseded/cancelled goal can never complete; fail fast.
+    case "$status" in
+      superseded|stalled|blocked|budgetLimited|usageLimited)
+        echo "  ($label stopped in status: $status)"
+        return 1
+        ;;
+    esac
+    now=$(date +%s)
+    if [ $((now - started)) -ge "$TIMEOUT" ]; then
+      echo "  ($label timed out in status: ${status:-<none>})"
+      return 1
+    fi
+    sleep 2
+  done
+}
+
+# ---------------------------------------------------------------------------
+echo "OpenCode-XGoal acceptance harness"
+echo "workspace: $WS"
+echo ""
+
+echo "Building the plugin..."
+( cd "$ROOT" && bun run build >/dev/null 2>&1 ) || {
+  echo "build failed"
+  exit 1
+}
+
+echo "Starting an isolated OpenCode 2 server..."
+# `exec` matters: without it, $! is the wrapping subshell, and killing it leaves
+# the real server (and any model turn) running as an orphan.
+(
+  cd "$WS" || exit 1
+  exec env XDG_CONFIG_HOME="$TC" \
+    XGOAL_DB="$DB" \
+    XGOAL_WORKSPACE="$WS" \
+    XGOAL_HARNESS_LOG="$LOG" \
+    XGOAL_SWEEP_MS=5000 \
+    "$OC" serve --hostname "$HOST" --port "$PORT" --log-level warn >"$SERVER_OUT" 2>&1
+) &
+SERVER_PID=$!
+
+PW=""
+for _ in $(seq 1 120); do
+  PW=$(grep -m1 '^server password ' "$SERVER_OUT" 2>/dev/null | awk '{print $3}')
+  [ -n "$PW" ] && break
+  sleep 0.5
+done
+if [ -z "$PW" ]; then
+  echo "server did not start; see $SERVER_OUT"
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "Scenario 1: /goal <objective> is driven to verified completion"
+SID=$(open_session "acceptance-1")
+if [ -z "$SID" ]; then
+  report "session established" FAIL "could not create a session or load the plugin"
+else
+  report "session established" PASS
+
+  RESP=$(rpc goal.create "{\"sessionID\":\"$SID\",\"objective\":\"Create a file called a.txt containing exactly: alpha. Create a file called b.txt containing exactly: bravo. When both files exist with exactly that content, propose completion.\"}")
+  GEN=$(echo "$RESP" | json output.goal.generation)
+  STATUS=$(echo "$RESP" | json output.goal.status)
+  ACTION=$(echo "$RESP" | json output.drive.action)
+
+  if [ "$STATUS" = "active" ] && [ "$GEN" = "1" ]; then
+    report "goal created with derived criteria" PASS
+  else
+    report "goal created with derived criteria" FAIL "status=$STATUS generation=$GEN response=$RESP"
+  fi
+  if [ "$ACTION" = "admitted" ]; then
+    report "creation scheduled native execution" PASS
+  else
+    report "creation scheduled native execution" FAIL "drive=$ACTION"
   fi
 
-  ( cd "$w" && XDG_CONFIG_HOME="$TC" XGOAL_HARNESS_LOG="$log" XGOAL_DB="$db" \
-      timeout 300 "$OC" run --standalone --auto --session "$sid" "$(task_prompt "$t")" ) \
-      > "$w/.oc-out" 2>&1 || true
-}
+  # No prompt is sent from here on. The plugin owns the loop.
+  if wait_complete "$SID" "goal 1"; then
+    report "goal 1 reached verified completion" PASS
+  else
+    report "goal 1 reached verified completion" FAIL "status=$(goal_field "$SID" status)"
+  fi
 
-echo "================================================================"
-echo " Codex /goal  vs  OpenCode-XGoal — parity harness (${RUNS} run/task)"
-echo "================================================================"
+  A_OK=0; B_OK=0
+  [ "$(cat "$WS/a.txt" 2>/dev/null)" = "alpha" ] && A_OK=1
+  [ "$(cat "$WS/b.txt" 2>/dev/null)" = "bravo" ] && B_OK=1
+  if [ "$A_OK" = "1" ] && [ "$B_OK" = "1" ]; then
+    report "artifacts match the objective" PASS
+  else
+    report "artifacts match the objective" FAIL "a.txt='$(cat "$WS/a.txt" 2>/dev/null)' b.txt='$(cat "$WS/b.txt" 2>/dev/null)'"
+  fi
+
+  MET=$(rpc goal.status "{\"sessionID\":\"$SID\"}" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+g=(d.get("output") or {}).get("goal") or {}
+cs=g.get("criteria") or []
+print("yes" if cs and all(c.get("met") for c in cs) else "no")
+')
+  if [ "$MET" = "yes" ]; then
+    report "criteria readout agrees with the proof" PASS
+  else
+    report "criteria readout agrees with the proof" FAIL "not every criterion is marked met"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 echo ""
+echo "Scenario 2: a completed goal can be followed immediately by another"
+SID2=$(open_session "acceptance-2")
+if [ -z "$SID2" ]; then
+  report "second session established" FAIL "could not create a session or load the plugin"
+else
+  report "second session established" PASS
 
-TOTAL_C=0; TOTAL_C_MET=0; TOTAL_C_REQ=0; C_PREMATURE=0; C_TURNS=0; C_RUNS=0
-TOTAL_X=0; TOTAL_X_MET=0; TOTAL_X_REQ=0; X_PREMATURE=0; X_TURNS=0; X_RUNS=0
+  # First goal for this session.
+  rpc goal.create "{\"sessionID\":\"$SID2\",\"objective\":\"Create a file called one.txt containing exactly: one. When it exists, propose completion.\"}" >/dev/null
+  if wait_complete "$SID2" "goal 2a"; then
+    report "preceding goal completed" PASS
+  else
+    report "preceding goal completed" FAIL "status=$(goal_field "$SID2" status)"
+  fi
 
-for t in t1 t2 t3; do
-  for i in $(seq 1 "$RUNS"); do
-    echo "--- $t run $i ---"
+  # Immediately create a new goal in the same session. It must get the next
+  # generation (not reuse generation 1) and must actually be driven.
+  RESP2=$(rpc goal.create "{\"sessionID\":\"$SID2\",\"objective\":\"Create a file called two.txt containing exactly: two. When it exists, propose completion.\"}")
+  GEN2=$(echo "$RESP2" | json output.goal.generation)
+  ACTION2=$(echo "$RESP2" | json output.drive.action)
+  if [ "$GEN2" = "2" ]; then
+    report "post-completion goal gets the next generation" PASS
+  else
+    report "post-completion goal gets the next generation" FAIL "generation=$GEN2"
+  fi
+  if [ "$ACTION2" = "admitted" ]; then
+    report "post-completion goal is driven immediately" PASS
+  else
+    report "post-completion goal is driven immediately" FAIL "drive=$ACTION2"
+  fi
+  if wait_complete "$SID2" "goal 2b"; then
+    report "second goal reached verified completion" PASS
+  else
+    report "second goal reached verified completion" FAIL "status=$(goal_field "$SID2" status)"
+  fi
+  if [ "$(cat "$WS/two.txt" 2>/dev/null)" = "two" ]; then
+    report "second goal's artifact is correct" PASS
+  else
+    report "second goal's artifact is correct" FAIL "two.txt='$(cat "$WS/two.txt" 2>/dev/null)'"
+  fi
+fi
 
-    # Codex /goal
-    CW="$OUT/$t-codex-$i"; CLOG="$OUT/$t-codex-$i.log"
-    run_codex "$t" "$CW" "$CLOG"
-    CS=$(task_score "$t" "$CW")
-    CMET=${CS%%/*}; CREQ=${CS##*/}
-    CT=$(codex_turns "$CLOG")
-    TOTAL_C=$((TOTAL_C+1)); TOTAL_C_MET=$((TOTAL_C_MET+CMET)); TOTAL_C_REQ=$((TOTAL_C_REQ+CREQ))
-    C_TURNS=$((C_TURNS+CT)); C_RUNS=$((C_RUNS+1))
-    [ "$CMET" -lt "$CREQ" ] && C_PREMATURE=$((C_PREMATURE+1))
-    echo "  codex   : $CS requirements, $CT turns"
-
-    # OpenCode-XGoal
-    XW="$OUT/$t-xgoal-$i"; XLOG="$OUT/$t-xgoal-$i.harness.log"; XDB="$OUT/$t-xgoal-$i.db"
-    run_xgoal "$t" "$XW" "$XLOG" "$XDB"
-    XS=$(task_score "$t" "$XW")
-    XMET=${XS%%/*}; XREQ=${XS##*/}
-    XT=$(oc_turns "$XLOG")
-    TOTAL_X=$((TOTAL_X+1)); TOTAL_X_MET=$((TOTAL_X_MET+XMET)); TOTAL_X_REQ=$((TOTAL_X_REQ+XREQ))
-    X_TURNS=$((X_TURNS+XT)); X_RUNS=$((X_RUNS+1))
-    [ "$XMET" -lt "$XREQ" ] && X_PREMATURE=$((X_PREMATURE+1))
-    echo "  xgoal   : $XS requirements, $XT turns"
-    echo ""
-  done
-done
-
-pct() { [ "$2" -eq 0 ] && echo "n/a" || awk -v a="$1" -v b="$2" 'BEGIN{printf "%.1f%%", 100*a/b}'; }
-
-echo "================================================================"
-echo " RESULTS"
-echo "================================================================"
-printf "%-28s %14s %14s\n" "" "Codex /goal" "OpenCode-XGoal"
-printf "%-28s %14s %14s\n" "requirement completion" \
-  "$(pct $TOTAL_C_MET $TOTAL_C_REQ) ($TOTAL_C_MET/$TOTAL_C_REQ)" \
-  "$(pct $TOTAL_X_MET $TOTAL_X_REQ) ($TOTAL_X_MET/$TOTAL_X_REQ)"
-printf "%-28s %14s %14s\n" "premature stops" \
-  "$(pct $C_PREMATURE $C_RUNS) ($C_PREMATURE/$C_RUNS)" \
-  "$(pct $X_PREMATURE $X_RUNS) ($X_PREMATURE/$X_RUNS)"
-printf "%-28s %14s %14s\n" "mean turns/run" \
-  "$(awk -v t="$C_TURNS" -v r="$C_RUNS" 'BEGIN{printf "%.1f", r?t/r:0}')" \
-  "$(awk -v t="$X_TURNS" -v r="$X_RUNS" 'BEGIN{printf "%.1f", r?t/r:0}')"
+# ---------------------------------------------------------------------------
 echo ""
-echo "Raw artifacts: $OUT"
+echo "Scenario 3: replacement is generation-checked and drives the new goal"
+SID3=$(open_session "acceptance-3")
+if [ -z "$SID3" ]; then
+  report "replacement session established" FAIL "could not create a session or load the plugin"
+else
+  report "replacement session established" PASS
+
+  rpc goal.create "{\"sessionID\":\"$SID3\",\"objective\":\"Create a file called old.txt containing exactly: old. When it exists, propose completion.\"}" >/dev/null
+  # Replace while generation 1 is active. The stale confirmation (still naming
+  # generation 1) must be refused after the replacement.
+  RESP=$(rpc goal.replace "{\"sessionID\":\"$SID3\",\"objective\":\"Create a file called new.txt containing exactly: new. When it exists, propose completion.\",\"expectedGeneration\":1}")
+  GEN3=$(echo "$RESP" | json output.goal.generation)
+  ACTION3=$(echo "$RESP" | json output.drive.action)
+  STALE=$(rpc goal.replace "{\"sessionID\":\"$SID3\",\"objective\":\"Create a file called stale.txt containing exactly: stale.\",\"expectedGeneration\":1}" | json output.error)
+
+  if [ "$GEN3" = "2" ] && [ "$ACTION3" = "admitted" ]; then
+    report "replacement creates and drives generation 2" PASS
+  else
+    report "replacement creates and drives generation 2" FAIL "generation=$GEN3 drive=$ACTION3"
+  fi
+  if [ -n "$STALE" ]; then
+    report "a stale replacement is refused" PASS
+  else
+    report "a stale replacement is refused" FAIL "stale replacement was accepted"
+  fi
+  if wait_complete "$SID3" "goal 3"; then
+    report "replacement goal reached verified completion" PASS
+  else
+    report "replacement goal reached verified completion" FAIL "status=$(goal_field "$SID3" status)"
+  fi
+  if [ "$(cat "$WS/new.txt" 2>/dev/null)" = "new" ]; then
+    report "replacement goal's artifact is correct" PASS
+  else
+    report "replacement goal's artifact is correct" FAIL "new.txt='$(cat "$WS/new.txt" 2>/dev/null)'"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "============================================"
+echo " Results: $PASS passed, $FAIL failed"
+echo "============================================"
+[ "$FAIL" -eq 0 ]

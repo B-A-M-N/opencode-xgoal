@@ -10,6 +10,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GoalController } from "../src/controller/controller.ts";
+import type { Goal } from "../src/controller/state.ts";
 
 let dir: string;
 let controller: GoalController;
@@ -33,6 +34,13 @@ function ref(sessionID = "ses_a"): { goalID: string; generation: number } {
   const goal = controller.status(sessionID);
   if (!goal) throw new Error(`no current goal for ${sessionID}`);
   return { goalID: goal.id, generation: goal.generation };
+}
+
+/** Create a goal that must not already exist. */
+function start(objective: string, sessionID = "ses_a"): Goal {
+  const out = controller.startOrDescribe(sessionID, objective);
+  if (!("created" in out)) throw new Error(`a goal already exists for ${sessionID}`);
+  return out.created;
 }
 
 describe("model cannot commit its own completion", () => {
@@ -290,5 +298,61 @@ describe("startup reconciliation", () => {
       reopened.close();
     }
     controller = new GoalController({ dbPath: join(dir, "goals.db") });
+  });
+});
+
+describe("completion binding and post-completion lifecycle", () => {
+  test("a proposal may bind evidence using the criterion's exact text", () => {
+    const goal = start("make the suite pass");
+    const criterion = controller.store.listCriteria(goal.id)[0];
+    controller.store.addEvidence({
+      goalID: goal.id,
+      kind: "test",
+      ref: "bun test",
+      exitCode: 0,
+    });
+
+    // Models often echo the criterion text instead of its opaque ID. Accept it
+    // when it is unambiguous, otherwise the binding silently does nothing and
+    // an objective-level criterion can never be proven.
+    const out = controller.proposeComplete("ses_a", {
+      ...ref(),
+      summary: "done",
+      criteria: [{ criterionID: criterion.text, evidenceRefs: ["bun test"] }],
+    });
+
+    expect(out.rejected).toBeUndefined();
+    expect(out.goal?.status).toBe("verifying");
+    const bound = controller.store
+      .listEvidence(goal.id)
+      .filter((e) => e.criterionID === criterion.id);
+    expect(bound.map((e) => e.ref)).toContain("bun test");
+  });
+
+  test("a new goal after a completed one gets the next generation", () => {
+    const first = start("one");
+    controller.store.transition({
+      goalID: first.id,
+      generation: first.generation,
+      to: "superseded",
+      actor: "user",
+    });
+
+    const second = start("two");
+    expect(second.generation).toBe(2);
+    expect(controller.latest("ses_a")?.id).toBe(second.id);
+    expect(controller.status("ses_a")?.status).toBe("active");
+  });
+
+  test("latest reports a terminal goal while status reports none", () => {
+    const goal = start("one");
+    controller.store.transition({
+      goalID: goal.id,
+      generation: goal.generation,
+      to: "superseded",
+      actor: "user",
+    });
+    expect(controller.latest("ses_a")?.status).toBe("superseded");
+    expect(controller.status("ses_a")).toBeUndefined();
   });
 });

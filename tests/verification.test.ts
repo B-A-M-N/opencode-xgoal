@@ -128,6 +128,8 @@ describe("completion requires objective-level evidence", () => {
     const result = await verifier.verify(goal.id);
     expect(result.verdict).toBe("complete");
     expect(result.unmet).toHaveLength(0);
+    // The criterion readout must agree with the proof that was just recorded.
+    expect(store.listCriteria(goal.id)[0].met).toBe(true);
   });
 
   // Audit defect 4: an unrelated successful command must not satisfy a

@@ -1,3 +1,6 @@
 node_modules/
 *.log
 .DS_Store
+.xgoal-accept.*/
+.tmp-accept*/
+.opencode/
