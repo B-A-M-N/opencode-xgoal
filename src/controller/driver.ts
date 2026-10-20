@@ -70,13 +70,24 @@ export interface DriverOptions {
     goal: Goal;
     round: GoalRound;
     evidenceCount: number;
+    /** Evidence captured during this round specifically. */
+    evidenceDelta: number;
   }) => { classification: "progress" | "verifiedWait" | "noProgress" | "blocked"; detail?: string };
 }
 
-const DEFAULT_CLASSIFY = (): { classification: "progress"; detail?: string } => ({
-  classification: "progress",
-  detail: "no classifier connected",
-});
+const DEFAULT_CLASSIFY = ({
+  evidenceDelta,
+}: {
+  evidenceDelta: number;
+}): { classification: "progress" | "noProgress"; detail?: string } => {
+  // A turn that produced no new machine-verifiable evidence is not progress,
+  // even if the model wrote a paragraph. This is what makes the stall policy
+  // meaningful instead of letting an active model reset the counter forever.
+  if (evidenceDelta > 0) {
+    return { classification: "progress", detail: `${evidenceDelta} new evidence item(s)` };
+  }
+  return { classification: "noProgress", detail: "no new evidence captured this round" };
+};
 
 export type DriveOutcome =
   | { action: "idle"; reason: string }
@@ -181,6 +192,16 @@ export class GoalDriver {
       };
     }
 
+    // A terminal delivery failure stops automatic dispatch until recovery.
+    // Without this, a later execution event would mint a fresh continuation and
+    // circumvent the retry limit.
+    if (goal.deliveryFailed) {
+      return {
+        action: "done",
+        outcome: { action: "idle", reason: "delivery failed; awaiting recovery" },
+      };
+    }
+
     // Resource limit: the controller decides, not the model.
     if (goal.tokenBudget !== undefined && (goal.tokensUsed ?? 0) >= goal.tokenBudget) {
       const limited = this.store.transition({
@@ -222,7 +243,12 @@ export class GoalDriver {
         // Always the reserved id. Never a fresh one.
         inboxID: round.inboxID,
         text: this.render(goal),
-        metadata: { goalID: goal.id, generation: goal.generation, roundID: round.id },
+        metadata: {
+          goalID: goal.id,
+          generation: goal.generation,
+          roundID: round.id,
+          inboxID: round.inboxID,
+        },
       });
 
       if (result.ok) {
@@ -266,6 +292,14 @@ export class GoalDriver {
     for (const round of this.store.outstandingRounds()) {
       out.push(await this.reconcileRound(round));
     }
+    // Startup recovery: a goal whose continuation terminally failed and which
+    // now has no outstanding round is allowed to dispatch again. This is the
+    // "recovery" path that clears the delivery block.
+    for (const goal of this.store.activeGoals()) {
+      if (goal.deliveryFailed && !this.store.outstandingRound(goal.id)) {
+        this.store.clearDeliveryFailure(goal.id);
+      }
+    }
     return out;
   }
 
@@ -300,7 +334,8 @@ export class GoalDriver {
         // The round has actually finished. Settle it exactly once, classify it,
         // and then continue the loop if the goal still has work.
         const evidenceCount = this.store.listEvidence(goal.id).length;
-        const verdict = this.classify({ goal, round, evidenceCount });
+        const evidenceDelta = Math.max(0, evidenceCount - round.evidenceBaseline);
+        const verdict = this.classify({ goal, round, evidenceCount, evidenceDelta });
         const settledGoal = this.settleRound({
           roundID: round.id,
           classification: verdict.classification,

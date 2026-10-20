@@ -202,12 +202,29 @@ describe("admission is not execution", () => {
     // The finished round is settled and counted exactly once.
     const original = store.roundsFor(goal.id)[0];
     expect(original.status).toBe("settled");
-    expect(original.classification).toBe("progress");
+    // No evidence was captured in this round, so it is not progress. A turn
+    // that only emitted text must not reset the stall counter.
+    expect(original.classification).toBe("noProgress");
 
     // The same round is never re-submitted; the next continuation carries a
     // different inbox ID.
     expect(transport.submitted).toHaveLength(2);
     expect(transport.submitted[1].inboxID).not.toBe(transport.submitted[0].inboxID);
+  });
+
+  test("a settled round with new evidence is progress", async () => {
+    const { transport, driver, goal } = setup();
+    await driver.drive("ses_a");
+    // Evidence captured during this round, after it was prepared.
+    store.addEvidence({ goalID: goal.id, kind: "test", ref: "bun test", detail: "exit 0", exitCode: 0 });
+
+    transport.probeResult = "settled";
+    await driver.reconcile();
+
+    const round = store.roundsFor(goal.id)[0];
+    expect(round.status).toBe("settled");
+    expect(round.classification).toBe("progress");
+    expect(store.current("ses_a")!.noProgressRounds).toBe(0);
   });
 
   test("an unknown probe leaves the round outstanding without re-submitting", async () => {

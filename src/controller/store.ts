@@ -25,6 +25,7 @@ import {
   isNonTerminal,
   isTerminal,
 } from "./state.ts";
+import type { CriterionInput, CriterionSpec } from "./criteria.ts";
 
 export interface GoalEvent {
   seq: number;
@@ -70,6 +71,15 @@ CREATE TABLE IF NOT EXISTS goals (
   updated_at_ms            INTEGER NOT NULL,
   completed_at_ms          INTEGER,
   superseded_by            TEXT,
+  -- Verification is only valid for the goal and evidence snapshot it actually
+  -- checked. A stale verifier must not be able to complete a goal whose
+  -- evidence changed underneath it.
+  verification_revision    INTEGER NOT NULL DEFAULT 0,
+  verification_snapshot    TEXT,
+  -- Set when a continuation submission terminally failed. While set, the
+  -- driver refuses to dispatch until recovery clears it, so a terminal
+  -- delivery failure cannot be circumvented by minting a fresh continuation.
+  delivery_failed          INTEGER NOT NULL DEFAULT 0,
   UNIQUE (session_id, generation)
 );
 
@@ -97,6 +107,14 @@ CREATE TABLE IF NOT EXISTS goal_criteria (
   goal_id     TEXT NOT NULL,
   generation  INTEGER NOT NULL,
   text        TEXT NOT NULL,
+  -- Optional machine-checkable spec (JSON). A criterion with a spec is
+  -- verified independently of any evidence the model claims; a criterion
+  -- without one still requires explicitly bound evidence.
+  spec        TEXT,
+  -- Who established the criterion: derived from the objective, an explicit
+  -- user requirement, or a model refinement. Never removed to pass
+  -- verification.
+  source      TEXT NOT NULL DEFAULT 'derived',
   met         INTEGER NOT NULL DEFAULT 0,
   created_at_ms INTEGER NOT NULL
 );
@@ -110,9 +128,69 @@ CREATE TABLE IF NOT EXISTS goal_evidence (
   kind        TEXT NOT NULL,
   ref         TEXT NOT NULL,
   detail      TEXT,
+  -- Persisted so validation can be real rather than trusting the capture:
+  -- command/test/runtime must record the observed exit status, and file
+  -- evidence records a content hash so staleness is detectable. The workspace
+  -- is the session workspace the path resolved against at capture time, so a
+  -- relative path can never be re-checked against the plugin's own cwd.
+  exit_code   INTEGER,
+  hash        TEXT,
+  workspace   TEXT,
   at_ms       INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS goal_evidence_goal ON goal_evidence (goal_id);
+CREATE INDEX IF NOT EXISTS goal_evidence_criterion ON goal_evidence (criterion_id);
+
+-- Per-criterion verification proofs. One row per criterion per verification
+-- attempt, so an accepted proof can never be silently reused for a different
+-- evidence snapshot.
+CREATE TABLE IF NOT EXISTS goal_criterion_proofs (
+  id            TEXT PRIMARY KEY,
+  goal_id       TEXT NOT NULL,
+  generation    INTEGER NOT NULL,
+  criterion_id  TEXT NOT NULL,
+  evidence_ids  TEXT NOT NULL,
+  validator_id  TEXT NOT NULL,
+  verdict       TEXT NOT NULL,
+  detail        TEXT,
+  created_at_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS goal_proofs_goal ON goal_criterion_proofs (goal_id);
+
+-- Durable association between an assistant message and the goal generation
+-- that produced it. This is what lets a tool call be fenced to the generation
+-- it actually belongs to, instead of being resolved from whatever goal is
+-- current when the callback arrives.
+CREATE TABLE IF NOT EXISTS goal_message_generations (
+  session_id TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  at_ms      INTEGER NOT NULL,
+  PRIMARY KEY (session_id, message_id)
+);
+
+-- Blocker claims, one per reporting round. A model can call the blocker tool
+-- many times in one turn; only distinct rounds count as confirmations, so
+-- repetition inside a single execution cannot manufacture a blocker.
+CREATE TABLE IF NOT EXISTS goal_blocker_claims (
+  id           TEXT PRIMARY KEY,
+  goal_id      TEXT NOT NULL,
+  generation   INTEGER NOT NULL,
+  round_number INTEGER NOT NULL,
+  reason       TEXT NOT NULL,
+  at_ms        INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS goal_blocker_goal ON goal_blocker_claims (goal_id);
+
+-- Last observed session-level token total. Usage events report a session
+-- running total, not a per-goal delta, so we persist the total and charge the
+-- difference to whatever goal is active. Without this the goal's budget is
+-- never driven by real usage.
+CREATE TABLE IF NOT EXISTS session_usage (
+  session_id  TEXT PRIMARY KEY,
+  total_tokens INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL
+);
 
 -- Continuation ledger. One row per continuation attempt.
 --
@@ -137,6 +215,10 @@ CREATE TABLE IF NOT EXISTS goal_rounds (
   classification TEXT,
   attempts       INTEGER NOT NULL DEFAULT 1,
   detail         TEXT,
+  -- Number of evidence rows for the goal when this round was prepared. The
+  -- delta at settlement is what distinguishes a round that produced verified
+  -- work from one that merely emitted text: a no-evidence round is not progress.
+  evidence_baseline INTEGER NOT NULL DEFAULT 0,
   prepared_at_ms INTEGER NOT NULL,
   admitted_at_ms INTEGER,
   settled_at_ms  INTEGER
@@ -165,6 +247,9 @@ interface GoalRow {
   updated_at_ms: number;
   completed_at_ms: number | null;
   superseded_by: string | null;
+  verification_revision: number;
+  verification_snapshot: string | null;
+  delivery_failed: number;
 }
 
 function toGoal(row: GoalRow): Goal {
@@ -185,7 +270,15 @@ function toGoal(row: GoalRow): Goal {
     updatedAtMs: row.updated_at_ms,
     completedAtMs: row.completed_at_ms ?? undefined,
     supersededBy: row.superseded_by ?? undefined,
+    verificationRevision: row.verification_revision,
+    verificationSnapshot: row.verification_snapshot ?? undefined,
+    deliveryFailed: row.delivery_failed === 1,
   };
+}
+
+/** Normalize a blocker reason so trivial rewording still counts as the same blocker. */
+function normalizeBlockerReason(reason: string): string {
+  return reason.trim().toLowerCase().replace(/\s+/g, " ").replace(/[.!]+$/g, "");
 }
 
 let counter = 0;
@@ -280,12 +373,32 @@ export class GoalStore {
     return row ? toGoal(row) : undefined;
   }
 
+  /** Look up a specific generation of a session's goal history. */
+  byGeneration(sessionID: string, generation: number): Goal | undefined {
+    const row = this.db
+      .query<GoalRow, [string, number]>(
+        `SELECT * FROM goals WHERE session_id = ? AND generation = ?`,
+      )
+      .get(sessionID, generation);
+    return row ? toGoal(row) : undefined;
+  }
+
   history(sessionID: string): Goal[] {
     return this.db
       .query<GoalRow, [string]>(
         `SELECT * FROM goals WHERE session_id = ? ORDER BY generation DESC`,
       )
       .all(sessionID)
+      .map(toGoal);
+  }
+
+  /** Every non-terminal goal, across all sessions. Used by startup recovery. */
+  activeGoals(): Goal[] {
+    return this.db
+      .query<GoalRow, []>(
+        `SELECT * FROM goals WHERE status NOT IN ('complete','superseded') ORDER BY created_at_ms ASC`,
+      )
+      .all()
       .map(toGoal);
   }
 
@@ -330,6 +443,7 @@ export class GoalStore {
     objective: string;
     tokenBudget?: number;
     actor?: Actor;
+    criteria?: CriterionInput[];
   }): Goal {
     if (!input.objective || !input.objective.trim()) {
       throw new TransitionRejectedError("objective must not be empty");
@@ -367,6 +481,9 @@ export class GoalStore {
         actor: input.actor ?? "user",
         detail: input.objective.trim().slice(0, 200),
       });
+      for (const criterion of input.criteria ?? []) {
+        this.insertCriterion(id, generation, criterion, now);
+      }
       return this.byID(id)!;
     });
   }
@@ -384,6 +501,7 @@ export class GoalStore {
     tokenBudget?: number;
     actor?: Actor;
     reason?: string;
+    criteria?: CriterionInput[];
   }): Goal {
     if (!input.objective || !input.objective.trim()) {
       throw new TransitionRejectedError("objective must not be empty");
@@ -438,6 +556,10 @@ export class GoalStore {
         actor: input.actor ?? "user",
         detail: `replaces ${existing.id} (generation ${existing.generation})`,
       });
+
+      for (const criterion of input.criteria ?? []) {
+        this.insertCriterion(newIDValue, nextGeneration, criterion, now);
+      }
 
       return this.byID(newIDValue)!;
     });
@@ -577,20 +699,48 @@ export class GoalStore {
     });
   }
 
-  addCriterion(goalID: string, text: string): void {
+  /** Insert a criterion row. Must run inside a transaction. */
+  private insertCriterion(
+    goalID: string,
+    generation: number,
+    input: CriterionInput,
+    atMs: number,
+  ): string {
+    const id = newID("crit");
+    this.db
+      .query(
+        `INSERT INTO goal_criteria (id, goal_id, generation, text, spec, source, met, created_at_ms)
+         VALUES (?, ?, ?, ?, ?, ?, 0, ?)`,
+      )
+      .run(
+        id,
+        goalID,
+        generation,
+        input.text.trim(),
+        input.spec ? JSON.stringify(input.spec) : null,
+        input.source ?? "user",
+        atMs,
+      );
+    return id;
+  }
+
+  /** Add an acceptance criterion. Returns its id so evidence can be bound. */
+  addCriterion(
+    goalID: string,
+    text: string,
+    spec?: CriterionSpec,
+    source: "user" | "model" = "user",
+  ): string {
     const goal = this.byID(goalID);
     if (!goal) throw new GoalConflictError(`unknown goal ${goalID}`);
     if (!isNonTerminal(goal.status)) {
       throw new TransitionRejectedError(`cannot add criteria to terminal goal ${goalID}`);
     }
+    let id = "";
     this.tx(() => {
-      this.db
-        .query(
-          `INSERT INTO goal_criteria (id, goal_id, generation, text, met, created_at_ms)
-           VALUES (?, ?, ?, ?, 0, ?)`,
-        )
-        .run(newID("crit"), goalID, goal.generation, text, Date.now());
+      id = this.insertCriterion(goalID, goal.generation, { text, spec, source }, Date.now());
     });
+    return id;
   }
 
   addEvidence(input: {
@@ -599,14 +749,20 @@ export class GoalStore {
     kind: string;
     ref: string;
     detail?: string;
+    /** Observed exit status, for command/test/runtime evidence. */
+    exitCode?: number;
+    /** Content hash, for file evidence. */
+    hash?: string;
+    /** Workspace the path resolved against at capture time. */
+    workspace?: string;
   }): void {
     const goal = this.byID(input.goalID);
     if (!goal) throw new GoalConflictError(`unknown goal ${input.goalID}`);
     this.tx(() => {
       this.db
         .query(
-          `INSERT INTO goal_evidence (id, goal_id, generation, criterion_id, kind, ref, detail, at_ms)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO goal_evidence (id, goal_id, generation, criterion_id, kind, ref, detail, exit_code, hash, workspace, at_ms)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           newID("ev"),
@@ -616,33 +772,306 @@ export class GoalStore {
           input.kind,
           input.ref,
           input.detail ?? null,
+          input.exitCode ?? null,
+          input.hash ?? null,
+          input.workspace ?? null,
           Date.now(),
         );
     });
   }
 
-  listCriteria(goalID: string): { id: string; text: string; met: boolean }[] {
-    return this.db
-      .query<{ id: string; text: string; met: number }, [string]>(
-        `SELECT id, text, met FROM goal_criteria WHERE goal_id = ? ORDER BY created_at_ms ASC`,
-      )
-      .all(goalID)
-      .map((r) => ({ id: r.id, text: r.text, met: r.met === 1 }));
-  }
-
-  listEvidence(goalID: string): { id: string; criterionID?: string; kind: string; ref: string }[] {
+  listCriteria(goalID: string): {
+    id: string;
+    text: string;
+    met: boolean;
+    spec?: CriterionSpec;
+    source: string;
+  }[] {
     return this.db
       .query<
-        { id: string; criterion_id: string | null; kind: string; ref: string },
+        { id: string; text: string; met: number; spec: string | null; source: string },
         [string]
-      >(`SELECT id, criterion_id, kind, ref FROM goal_evidence WHERE goal_id = ? ORDER BY at_ms ASC`)
+      >(
+        `SELECT id, text, met, spec, source FROM goal_criteria WHERE goal_id = ? ORDER BY created_at_ms ASC`,
+      )
+      .all(goalID)
+      .map((r) => ({
+        id: r.id,
+        text: r.text,
+        met: r.met === 1,
+        spec: r.spec ? (JSON.parse(r.spec) as CriterionSpec) : undefined,
+        source: r.source,
+      }));
+  }
+
+  listEvidence(goalID: string): {
+    id: string;
+    criterionID?: string;
+    kind: string;
+    ref: string;
+    exitCode?: number;
+    hash?: string;
+    workspace?: string;
+  }[] {
+    return this.db
+      .query<
+        {
+          id: string;
+          criterion_id: string | null;
+          kind: string;
+          ref: string;
+          exit_code: number | null;
+          hash: string | null;
+          workspace: string | null;
+        },
+        [string]
+      >(
+        `SELECT id, criterion_id, kind, ref, exit_code, hash, workspace
+           FROM goal_evidence WHERE goal_id = ? ORDER BY at_ms ASC`,
+      )
       .all(goalID)
       .map((r) => ({
         id: r.id,
         criterionID: r.criterion_id ?? undefined,
         kind: r.kind,
         ref: r.ref,
+        exitCode: r.exit_code ?? undefined,
+        hash: r.hash ?? undefined,
+        workspace: r.workspace ?? undefined,
       }));
+  }
+
+  /**
+   * Bind specific captured evidence to a criterion. The evidence must already
+   * exist for this goal; binding is explicit so unrelated evidence cannot be
+   * counted against a criterion.
+   */
+  bindEvidence(criterionID: string, evidenceIDs: string[]): number {
+    return this.tx(() => {
+      const criterion = this.db
+        .query<{ id: string; goal_id: string }, [string]>(
+          `SELECT id, goal_id FROM goal_criteria WHERE id = ?`,
+        )
+        .get(criterionID);
+      if (!criterion) throw new GoalConflictError(`unknown criterion ${criterionID}`);
+      let bound = 0;
+      for (const evidenceID of evidenceIDs) {
+        const updated = this.db
+          .query(
+            `UPDATE goal_evidence SET criterion_id = ?
+              WHERE id = ? AND goal_id = ?`,
+          )
+          .run(criterionID, evidenceID, criterion.goal_id);
+        bound += updated.changes;
+      }
+      return bound;
+    });
+  }
+
+  /** Persist the proofs a verification attempt produced, atomically. */
+  recordProofs(
+    goalID: string,
+    proofs: {
+      criterionID: string;
+      evidenceIDs: string[];
+      validatorID: string;
+      verdict: "pass" | "fail" | "unknown";
+      detail: string;
+    }[],
+    snapshot: string,
+  ): void {
+    this.tx(() => {
+      const goal = this.byID(goalID);
+      if (!goal) throw new GoalConflictError(`unknown goal ${goalID}`);
+      const now = Date.now();
+      for (const proof of proofs) {
+        this.db
+          .query(
+            `INSERT INTO goal_criterion_proofs
+               (id, goal_id, generation, criterion_id, evidence_ids, validator_id, verdict, detail, created_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            newID("proof"),
+            goalID,
+            goal.generation,
+            proof.criterionID,
+            JSON.stringify(proof.evidenceIDs),
+            proof.validatorID,
+            proof.verdict,
+            proof.detail,
+            now,
+          );
+      }
+      this.db
+        .query(
+          `UPDATE goals
+              SET verification_revision = verification_revision + 1,
+                  verification_snapshot = ?,
+                  updated_at_ms = ?,
+                  version = version + 1
+            WHERE id = ? AND version = ?`,
+        )
+        .run(snapshot, now, goalID, goal.version);
+    });
+  }
+
+  listProofs(goalID: string): {
+    id: string;
+    criterionID: string;
+    evidenceIDs: string[];
+    validatorID: string;
+    verdict: string;
+    detail?: string;
+  }[] {
+    return this.db
+      .query<
+        {
+          id: string;
+          criterion_id: string;
+          evidence_ids: string;
+          validator_id: string;
+          verdict: string;
+          detail: string | null;
+        },
+        [string]
+      >(
+        `SELECT id, criterion_id, evidence_ids, validator_id, verdict, detail
+           FROM goal_criterion_proofs WHERE goal_id = ? ORDER BY created_at_ms ASC`,
+      )
+      .all(goalID)
+      .map((r) => ({
+        id: r.id,
+        criterionID: r.criterion_id,
+        evidenceIDs: JSON.parse(r.evidence_ids) as string[],
+        validatorID: r.validator_id,
+        verdict: r.verdict,
+        detail: r.detail ?? undefined,
+      }));
+  }
+
+  // ------------------------------------------------- message -> generation
+
+  /**
+   * Remember which goal generation an assistant message belongs to. Called from
+   * the tool hook using the message's own timestamp, so a message produced by a
+   * superseded goal is never re-attributed to its replacement.
+   */
+  rememberMessageGeneration(sessionID: string, messageID: string, generation: number, atMs: number): void {
+    this.tx(() => {
+      this.db
+        .query(
+          `INSERT INTO goal_message_generations (session_id, message_id, generation, at_ms)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(session_id, message_id) DO NOTHING`,
+        )
+        .run(sessionID, messageID, generation, atMs);
+    });
+  }
+
+  resolveMessageGeneration(sessionID: string, messageID: string): number | undefined {
+    const row = this.db
+      .query<{ generation: number }, [string, string]>(
+        `SELECT generation FROM goal_message_generations WHERE session_id = ? AND message_id = ?`,
+      )
+      .get(sessionID, messageID);
+    return row?.generation;
+  }
+
+  /**
+   * Record a blocker claim for the reporting round and return how many distinct
+   * rounds have reported an equivalent blocker.
+   *
+   * The round number is derived from the goal's settled-round counter, so two
+   * calls in the same turn map to the same round and count once. Only a later,
+   * independently evaluated round can raise the confirmation count.
+   */
+  recordBlockerClaim(input: {
+    goalID: string;
+    generation: number;
+    roundNumber: number;
+    reason: string;
+  }): number {
+    return this.tx(() => {
+      const normalized = normalizeBlockerReason(input.reason);
+      this.db
+        .query(
+          `INSERT INTO goal_blocker_claims (id, goal_id, generation, round_number, reason, at_ms)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(newID("blk"), input.goalID, input.generation, input.roundNumber, normalized, Date.now());
+      const row = this.db
+        .query<{ n: number }, [string, number, string]>(
+          `SELECT COUNT(DISTINCT round_number) AS n
+             FROM goal_blocker_claims
+            WHERE goal_id = ? AND generation = ? AND reason = ?`,
+        )
+        .get(input.goalID, input.generation, normalized)!;
+      return row.n;
+    });
+  }
+
+  /** Number of distinct rounds that reported the same blocker. */
+  blockerConfirmations(goalID: string, generation: number, reason: string): number {
+    const row = this.db
+      .query<{ n: number }, [string, number, string]>(
+        `SELECT COUNT(DISTINCT round_number) AS n
+           FROM goal_blocker_claims
+          WHERE goal_id = ? AND generation = ? AND reason = ?`,
+      )
+      .get(goalID, generation, normalizeBlockerReason(reason))!;
+    return row.n;
+  }
+
+  /**
+   * Charge session usage to the current goal.
+   *
+   * `totalTokens` is the session's running total from `session.usage.updated`.
+   * The delta against the previously observed total is added to the active
+   * goal. Replaying the same event is therefore a no-op, not double billing.
+   */
+  recordSessionUsage(sessionID: string, totalTokens: number): {
+    goal?: Goal;
+    delta: number;
+  } {
+    return this.tx(() => {
+      const previous = this.db
+        .query<{ total_tokens: number }, [string]>(
+          `SELECT total_tokens FROM session_usage WHERE session_id = ?`,
+        )
+        .get(sessionID)?.total_tokens ?? 0;
+      const delta = Math.max(0, Math.floor(totalTokens) - previous);
+      this.db
+        .query(
+          `INSERT INTO session_usage (session_id, total_tokens, updated_at_ms)
+           VALUES (?, ?, ?)
+           ON CONFLICT(session_id) DO UPDATE SET
+             total_tokens = excluded.total_tokens,
+             updated_at_ms = excluded.updated_at_ms`,
+        )
+        .run(sessionID, Math.floor(totalTokens), Date.now());
+
+      const current = this.current(sessionID);
+      if (!delta || !current || !isNonTerminal(current.status)) {
+        return { goal: current, delta };
+      }
+      this.db
+        .query(`UPDATE goals SET tokens_used = COALESCE(tokens_used, 0) + ?, updated_at_ms = ? WHERE id = ?`)
+        .run(delta, Date.now(), current.id);
+      return { goal: this.byID(current.id), delta };
+    });
+  }
+
+  /** Set or clear a goal's token ceiling. */
+  setTokenBudget(goalID: string, budget: number | undefined): Goal {
+    return this.tx(() => {
+      this.db
+        .query(`UPDATE goals SET token_budget = ?, updated_at_ms = ? WHERE id = ?`)
+        .run(budget === undefined ? null : Math.floor(budget), Date.now(), goalID);
+      const goal = this.byID(goalID);
+      if (!goal) throw new GoalConflictError(`unknown goal ${goalID}`);
+      return goal;
+    });
   }
 
   /**
@@ -709,12 +1138,20 @@ export class GoalStore {
       }
       const id = newID("round");
       const now = Date.now();
+      // Snapshot how much evidence already exists, so settlement can tell
+      // whether this round produced any verified work at all.
+      const baseline = this.db
+        .query<{ n: number }, [string]>(
+          `SELECT COUNT(*) AS n FROM goal_evidence WHERE goal_id = ?`,
+        )
+        .get(input.goalID)!.n;
       this.db
         .query(
-          `INSERT INTO goal_rounds (id, goal_id, generation, inbox_id, status, attempts, prepared_at_ms)
-           VALUES (?, ?, ?, ?, 'prepared', 1, ?)`,
+          `INSERT INTO goal_rounds
+             (id, goal_id, generation, inbox_id, status, attempts, evidence_baseline, prepared_at_ms)
+           VALUES (?, ?, ?, ?, 'prepared', 1, ?, ?)`,
         )
-        .run(id, input.goalID, input.generation, input.inboxID, now);
+        .run(id, input.goalID, input.generation, input.inboxID, baseline, now);
       this.appendEvent(input.goalID, input.generation, "round-prepared", {
         actor: "controller",
         detail: input.inboxID,
@@ -773,11 +1210,19 @@ export class GoalStore {
     return this.tx(() => {
       const round = this.roundByID(roundID);
       if (!round) throw new GoalConflictError(`unknown round ${roundID}`);
-      this.db
+      // A retry that succeeds may follow an `unknown` submission, so both
+      // `prepared` and `unknown` are valid predecessors of `admitted`.
+      const updated = this.db
         .query(
-          `UPDATE goal_rounds SET status='admitted', admitted_at_ms=? WHERE id=? AND status='prepared'`,
+          `UPDATE goal_rounds SET status='admitted', admitted_at_ms=?
+            WHERE id=? AND status IN ('prepared','unknown')`,
         )
         .run(Date.now(), roundID);
+      if (updated.changes !== 1) {
+        throw new GoalConflictError(
+          `cannot admit round ${roundID}: expected prepared/unknown, found ${round.status}`,
+        );
+      }
       this.appendEvent(round.goalID, round.generation, "round-admitted", {
         actor: "controller",
         detail: round.inboxID,
@@ -819,7 +1264,12 @@ export class GoalStore {
     });
   }
 
-  /** Submission definitively rejected. This is an admission failure, not a model failure. */
+  /**
+   * Submission definitively rejected. This is an admission failure, not a model
+   * failure, so it must not be counted as a round — but it must also stop
+   * automatic dispatch until recovery, or a later event would mint a fresh
+   * continuation and circumvent the retry limit.
+   */
   markRoundFailed(roundID: string, detail: string): GoalRound {
     return this.tx(() => {
       const round = this.roundByID(roundID);
@@ -827,11 +1277,40 @@ export class GoalStore {
       this.db
         .query(`UPDATE goal_rounds SET status='failed', detail=?, settled_at_ms=? WHERE id=?`)
         .run(detail, Date.now(), roundID);
+      const goal = this.byID(round.goalID);
+      if (goal) {
+        this.db
+          .query(
+            `UPDATE goals SET delivery_failed=1, updated_at_ms=?, version=version+1
+              WHERE id=? AND version=?`,
+          )
+          .run(Date.now(), goal.id, goal.version);
+      }
       this.appendEvent(round.goalID, round.generation, "round-failed", {
         actor: "controller",
         detail,
       });
       return this.roundByID(roundID)!;
+    });
+  }
+
+  /** Clear a terminal delivery failure, so automatic dispatch may resume. */
+  clearDeliveryFailure(goalID: string): Goal | undefined {
+    return this.tx(() => {
+      const goal = this.byID(goalID);
+      if (!goal) return undefined;
+      if (!goal.deliveryFailed) return goal;
+      this.db
+        .query(
+          `UPDATE goals SET delivery_failed=0, updated_at_ms=?, version=version+1
+            WHERE id=? AND version=?`,
+        )
+        .run(Date.now(), goal.id, goal.version);
+      this.appendEvent(goal.id, goal.generation, "delivery-recovered", {
+        actor: "controller",
+        detail: "terminal delivery failure cleared",
+      });
+      return this.byID(goal.id)!;
     });
   }
 
@@ -890,6 +1369,81 @@ export class GoalStore {
       return { round: this.roundByID(input.roundID)!, goal };
     });
   }
+
+  /**
+   * Atomically settle any in-flight round and move a verified goal to
+   * `complete`, guarded by generation and the verification snapshot.
+   *
+   * Split across transactions, a crash between settling the round and the
+   * status change leaves a settled round against a still-verifying goal, and a
+   * stale verifier could complete a goal whose evidence changed. One writer is
+   * what makes both impossible.
+   */
+  completeGoal(input: {
+    goalID: string;
+    generation: number;
+    reason: string;
+    snapshot?: string;
+    settleClassification: "complete";
+  }): Goal {
+    return this.tx(() => {
+      const goal = this.byID(input.goalID);
+      if (!goal) throw new GoalConflictError(`unknown goal ${input.goalID}`);
+      if (goal.generation !== input.generation) {
+        throw new GoalConflictError(
+          `stale generation: ${input.goalID} is generation ${goal.generation}, completion claimed ${input.generation}`,
+        );
+      }
+      if (goal.status !== "verifying") {
+        throw new TransitionRejectedError(
+          `cannot complete goal ${input.goalID} from status ${goal.status}; verification is required first`,
+        );
+      }
+      if (input.snapshot !== undefined && goal.verificationSnapshot !== input.snapshot) {
+        throw new GoalConflictError(
+          `verification snapshot mismatch: the verifier checked ${goal.verificationSnapshot ?? "none"}, ` +
+            `this completion claims ${input.snapshot}`,
+        );
+      }
+      const outstanding = this.outstandingRound(input.goalID);
+      if (outstanding) {
+        this.settleRound({
+          roundID: outstanding.id,
+          classification: input.settleClassification,
+          detail: input.reason,
+        });
+        this.recordRound({
+          goalID: input.goalID,
+          generation: input.generation,
+          classification: input.settleClassification,
+          detail: input.reason,
+        });
+      }
+      return this.transition({
+        goalID: input.goalID,
+        generation: input.generation,
+        to: "complete",
+        actor: "controller",
+        reason: input.reason,
+      });
+    });
+  }
+
+  /**
+   * The generation of the goal that was current at a point in time. Used to
+   * fence a model tool call to the generation that actually produced the
+   * assistant message carrying it, rather than to whatever is current now.
+   */
+  generationAt(sessionID: string, atMs: number): number | undefined {
+    const row = this.db
+      .query<{ generation: number }, [string, number]>(
+        `SELECT generation FROM goals
+          WHERE session_id = ? AND created_at_ms <= ?
+          ORDER BY created_at_ms DESC LIMIT 1`,
+      )
+      .get(sessionID, atMs);
+    return row?.generation;
+  }
 }
 
 export interface GoalRound {
@@ -900,6 +1454,8 @@ export interface GoalRound {
   status: "prepared" | "admitted" | "running" | "settled" | "unknown" | "failed";
   classification?: "progress" | "verifiedWait" | "noProgress" | "blocked" | "complete";
   attempts: number;
+  /** Evidence count for the goal when the round was prepared. */
+  evidenceBaseline: number;
   detail?: string;
   preparedAtMs: number;
   admittedAtMs?: number;
@@ -915,6 +1471,7 @@ interface RoundRow {
   classification: string | null;
   attempts: number;
   detail: string | null;
+  evidence_baseline: number;
   prepared_at_ms: number;
   admitted_at_ms: number | null;
   settled_at_ms: number | null;
@@ -929,6 +1486,7 @@ function toRound(r: RoundRow): GoalRound {
     status: r.status as GoalRound["status"],
     classification: (r.classification ?? undefined) as GoalRound["classification"],
     attempts: r.attempts,
+    evidenceBaseline: r.evidence_baseline,
     detail: r.detail ?? undefined,
     preparedAtMs: r.prepared_at_ms,
     admittedAtMs: r.admitted_at_ms ?? undefined,

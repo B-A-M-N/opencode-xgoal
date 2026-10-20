@@ -117,45 +117,216 @@ var SuspenseContext = createContext();
 
 // node_modules/@opencode/plugin/dist/tui/solid.js
 var PluginContext = createContext();
+// src/rpc.ts
+var RPC_ID = "local.opencode-xgoal";
+var str = { type: "string" };
+var num = { type: "number" };
+var goalOrNull = {
+  anyOf: [{ type: "object" }, { type: "null" }]
+};
+var goalRpcDefinition = {
+  id: RPC_ID,
+  methods: {
+    "goal.status": {
+      input: { type: "object", properties: { sessionID: str }, required: ["sessionID"] },
+      output: { type: "object", properties: { goal: goalOrNull } }
+    },
+    "goal.history": {
+      input: { type: "object", properties: { sessionID: str }, required: ["sessionID"] },
+      output: {
+        type: "object",
+        properties: { goals: { type: "array", items: { type: "object" } } }
+      }
+    },
+    "goal.create": {
+      input: {
+        type: "object",
+        properties: { sessionID: str, objective: str },
+        required: ["sessionID", "objective"]
+      },
+      output: { type: "object", properties: { goal: goalOrNull, error: str, drive: { type: "object" } } }
+    },
+    "goal.replace": {
+      input: {
+        type: "object",
+        properties: {
+          sessionID: str,
+          objective: str,
+          expectedGeneration: num
+        },
+        required: ["sessionID", "objective", "expectedGeneration"]
+      },
+      output: { type: "object", properties: { goal: goalOrNull, error: str } }
+    },
+    "goal.pause": {
+      input: { type: "object", properties: { sessionID: str }, required: ["sessionID"] },
+      output: { type: "object", properties: { goal: goalOrNull } }
+    },
+    "goal.resume": {
+      input: { type: "object", properties: { sessionID: str }, required: ["sessionID"] },
+      output: { type: "object", properties: { goal: goalOrNull, error: str } }
+    },
+    "goal.health": {
+      input: { type: "object", properties: { sessionID: str }, required: ["sessionID"] },
+      output: { type: "object", properties: { health: { type: "object" } } }
+    },
+    "goal.budget": {
+      input: {
+        type: "object",
+        properties: { sessionID: str, budget: num },
+        required: ["sessionID"]
+      },
+      output: { type: "object", properties: { goal: goalOrNull, error: str } }
+    }
+  },
+  events: {
+    "goal.changed": {
+      schema: {
+        type: "object",
+        properties: { sessionID: str, status: str, generation: num }
+      }
+    }
+  }
+};
+
 // src/tui.tsx
+function describeDrive(outcome) {
+  if (!outcome)
+    return "the server did not report a dispatch";
+  switch (outcome.action) {
+    case "admitted":
+      return "execution scheduled";
+    case "reconcile":
+      return `an outstanding round is still ${outcome.status}`;
+    case "unknown":
+      return "dispatch outcome unknown; the recovery sweep will reconcile it";
+    case "failed":
+      return `dispatch failed: ${outcome.detail}`;
+    case "abandoned":
+      return `dispatch abandoned: ${outcome.detail}`;
+    case "limited":
+      return `not dispatched: goal is ${outcome.status}`;
+    case "idle":
+      return `not dispatched: ${outcome.reason}`;
+    default:
+      return `dispatch: ${String(outcome.action)}`;
+  }
+}
 var tui_default = exports_plugin.define({
   id: "opencode-xgoal-tui",
   async setup(context) {
-    const notify = (message, variant = "info") => {
+    const rpc = context.client.rpc(goalRpcDefinition);
+    const currentSessionID = () => {
+      const route = context.ui.router.current();
+      return route.type === "session" ? route.sessionID : undefined;
+    };
+    const notify = (message, variant = "info", sessionID) => {
       try {
-        context?.toast?.show?.({ variant, title: "OpenCode-XGoal", message });
+        context.ui.toast.show({ title: "OpenCode-XGoal", message, variant, sessionID });
       } catch {}
     };
-    const rpc = context?.rpc;
-    const callStatus = async (sessionID) => await rpc?.call?.("goal.status", { sessionID });
-    const handleGoalCommand = async (sessionID, args) => {
-      const text = String(args ?? "").trim();
-      if (!text || text === "status") {
-        const res = await callStatus(sessionID);
-        const goal = res?.goal;
-        notify(goal ? `[${goal.status}] generation ${goal.generation}: ${goal.objective}` : "No active goal. Use /goal <objective>.");
-        return;
-      }
-      if (text === "pause" || text === "resume") {
-        await rpc?.call?.(text === "pause" ? "goal.pause" : "goal.resume", { sessionID });
-        notify(text === "pause" ? "Goal paused." : "Goal resumed.");
-        return;
-      }
-      if (text.startsWith("replace ")) {
-        const objective = text.slice("replace ".length).trim();
-        if (!objective) {
-          notify("Usage: /goal replace <objective>", "error");
+    const statusText = (goal) => {
+      if (!goal)
+        return "No active goal. Use /goal <objective>.";
+      const budget = goal.tokenBudget === null ? `${goal.tokensUsed ?? 0} tokens` : `${goal.tokensUsed ?? 0}/${goal.tokenBudget} tokens`;
+      return [
+        `[${goal.status}] generation ${goal.generation}: ${goal.objective}`,
+        `rounds ${goal.rounds}, no-progress ${goal.noProgressRounds}, ${budget}`
+      ].join(`
+`);
+    };
+    const replaceGoal = async (sessionID, objective, expectedGeneration) => {
+      let expected = expectedGeneration;
+      if (expected === undefined) {
+        const current = (await rpc["goal.status"]({ sessionID })).goal;
+        if (!current) {
+          await createGoal(sessionID, objective);
           return;
         }
-        await replaceGoal(sessionID, objective);
+        expected = current.generation;
+      }
+      const res = await rpc["goal.replace"]({ sessionID, objective, expectedGeneration: expected });
+      if (res.error) {
+        notify(`Could not set the goal: ${res.error}`, "error", sessionID);
         return;
       }
-      const existing = (await callStatus(sessionID))?.goal;
+      notify(`Goal set (generation ${res.goal?.generation ?? "?"}). ${describeDrive(res.drive)}.`, "success", sessionID);
+    };
+    const createGoal = async (sessionID, objective) => {
+      const res = await rpc["goal.create"]({ sessionID, objective });
+      if (res.error) {
+        notify(`Could not create the goal: ${res.error}`, "error", sessionID);
+        return;
+      }
+      notify(`Goal created (generation ${res.goal?.generation ?? "?"}). ${describeDrive(res.drive)}.`, "success", sessionID);
+    };
+    const runGoal = async (raw) => {
+      const sessionID = currentSessionID();
+      if (!sessionID) {
+        notify("Open a session before using /goal.", "warning");
+        return;
+      }
+      const text = String(raw ?? "").trim();
+      const [verb, ...rest] = text.split(/\s+/);
+      const arg = rest.join(" ").trim();
+      if (!text || verb === "status") {
+        const res = await rpc["goal.status"]({ sessionID });
+        notify(statusText(res.goal), "info", sessionID);
+        return;
+      }
+      if (verb === "pause" || verb === "resume") {
+        const res = verb === "pause" ? await rpc["goal.pause"]({ sessionID }) : await rpc["goal.resume"]({ sessionID });
+        if (res.error) {
+          notify(`Could not ${verb} the goal: ${res.error}`, "error", sessionID);
+          return;
+        }
+        const suffix = verb === "resume" ? ` ${describeDrive(res.drive)}.` : "";
+        notify(verb === "pause" ? "Goal paused." : `Goal resumed: ${res.goal?.status ?? "active"}.${suffix}`, "success", sessionID);
+        return;
+      }
+      if (verb === "replace") {
+        if (!arg) {
+          notify("Usage: /goal replace <objective>", "error", sessionID);
+          return;
+        }
+        await replaceGoal(sessionID, arg);
+        return;
+      }
+      if (verb === "budget") {
+        const current = (await rpc["goal.status"]({ sessionID })).goal;
+        if (!current) {
+          notify("No active goal.", "warning", sessionID);
+          return;
+        }
+        if (!arg) {
+          notify(current.tokenBudget === null ? `Tokens: ${current.tokensUsed ?? 0} (no budget set)` : `Tokens: ${current.tokensUsed ?? 0} / ${current.tokenBudget}`, "info", sessionID);
+          return;
+        }
+        if (/^(off|none|clear)$/i.test(arg)) {
+          const res2 = await rpc["goal.budget"]({ sessionID });
+          notify(res2.error ? `Could not clear the budget: ${res2.error}` : "Token budget cleared.", res2.error ? "error" : "success", sessionID);
+          return;
+        }
+        const n = Number(arg);
+        if (!Number.isFinite(n) || n <= 0) {
+          notify("Usage: /goal budget <positive number> | off", "error", sessionID);
+          return;
+        }
+        const res = await rpc["goal.budget"]({ sessionID, budget: Math.floor(n) });
+        notify(res.error ? `Could not set the budget: ${res.error}` : `Token budget set to ${Math.floor(n)}.`, res.error ? "error" : "success", sessionID);
+        return;
+      }
+      if (verb === "health") {
+        const res = await rpc["goal.health"]({ sessionID });
+        notify(JSON.stringify(res.health, null, 2), res.health?.ok === false ? "warning" : "info", sessionID);
+        return;
+      }
+      const existing = (await rpc["goal.status"]({ sessionID })).goal;
       if (!existing) {
-        await replaceGoal(sessionID, text);
+        await createGoal(sessionID, text);
         return;
       }
-      const confirmed = await context.dialog.confirm({
+      const confirmed = await context.ui.dialog.confirm({
         title: "Replace goal?",
         message: [
           `An existing goal is active (generation ${existing.generation}):`,
@@ -164,48 +335,34 @@ var tui_default = exports_plugin.define({
           "Set a new goal?"
         ].join(`
 `),
-        label: "Replace"
+        label: { confirm: "Replace", cancel: "Keep" }
       });
       if (confirmed !== true) {
-        notify("Kept the current goal.");
+        notify("Kept the current goal.", "info", sessionID);
         return;
       }
       await replaceGoal(sessionID, text, existing.generation);
     };
-    const replaceGoal = async (sessionID, objective, expectedGeneration) => {
-      let expected = expectedGeneration;
-      if (expected === undefined) {
-        const current = (await callStatus(sessionID))?.goal;
-        expected = current?.generation ?? 1;
-      }
-      const res = await rpc?.call?.("goal.replace", {
-        sessionID,
-        objective,
-        expectedGeneration: expected
-      });
-      if (res?.error) {
-        notify(`Could not set the goal: ${res.error}`, "error");
-        return;
-      }
-      notify(`Goal set (generation ${res?.goal?.generation ?? "?"}).`);
-    };
-    try {
-      const command = context?.command;
-      if (command?.register) {
-        command.register({
-          name: "goal",
-          title: "Set or replace the session goal",
-          description: "OpenCode-XGoal: set, replace, pause, resume or inspect the goal",
-          slash: { name: "goal" },
+    context.keymap.layer(() => ({
+      priority: 100,
+      commands: [
+        {
+          id: "opencode-xgoal.goal",
+          title: "Goal",
+          description: "Set, replace, pause, resume, budget or inspect the session goal",
+          group: "OpenCode-XGoal",
+          slash: { name: "goal", arguments: true },
           palette: true,
           run: async (input) => {
-            if (!input?.sessionID)
-              return;
-            await handleGoalCommand(input.sessionID, input.arguments ?? "");
+            try {
+              await runGoal(String(input ?? ""));
+            } catch (error) {
+              notify(`Goal command failed: ${String(error)}`, "error", currentSessionID());
+            }
           }
-        });
-      }
-    } catch {}
+        }
+      ]
+    }));
     return async () => {};
   }
 });

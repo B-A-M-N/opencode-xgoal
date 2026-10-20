@@ -10,6 +10,7 @@
  * (`PortableValueSchema = StandardSchemaV1 | JsonSchema.JsonSchema`).
  */
 import type { GoalController } from "./controller/controller.ts";
+import type { GoalCoordinator } from "./controller/coordinator.ts";
 import type { Goal } from "./controller/state.ts";
 
 export const RPC_ID = "local.opencode-xgoal";
@@ -74,6 +75,14 @@ export const goalRpcDefinition = {
         properties: { goals: { type: "array", items: { type: "object" } } },
       },
     },
+    "goal.create": {
+      input: {
+        type: "object",
+        properties: { sessionID: str, objective: str },
+        required: ["sessionID", "objective"],
+      },
+      output: { type: "object", properties: { goal: goalOrNull, error: str, drive: { type: "object" } } },
+    },
     "goal.replace": {
       input: {
         type: "object",
@@ -92,7 +101,19 @@ export const goalRpcDefinition = {
     },
     "goal.resume": {
       input: { type: "object", properties: { sessionID: str }, required: ["sessionID"] },
-      output: { type: "object", properties: { goal: goalOrNull } },
+      output: { type: "object", properties: { goal: goalOrNull, error: str } },
+    },
+    "goal.health": {
+      input: { type: "object", properties: { sessionID: str }, required: ["sessionID"] },
+      output: { type: "object", properties: { health: { type: "object" } } },
+    },
+    "goal.budget": {
+      input: {
+        type: "object",
+        properties: { sessionID: str, budget: num },
+        required: ["sessionID"],
+      },
+      output: { type: "object", properties: { goal: goalOrNull, error: str } },
     },
   },
   events: {
@@ -112,7 +133,10 @@ export const goalRpcDefinition = {
  * input must produce an error result rather than an exception that kills the
  * port.
  */
-export function goalRpcHandlers(controller: GoalController) {
+export function goalRpcHandlers(
+  controller: GoalController,
+  coordinator?: GoalCoordinator,
+) {
   return {
     "goal.status": async (input: { sessionID?: string }) => {
       if (!input?.sessionID) return { goal: null };
@@ -129,6 +153,30 @@ export function goalRpcHandlers(controller: GoalController) {
       };
     },
 
+    "goal.create": async (input: { sessionID?: string; objective?: string }) => {
+      const { sessionID, objective } = input ?? {};
+      if (!sessionID || !objective) {
+        return { goal: null, error: "sessionID and objective are required" };
+      }
+      try {
+        if (coordinator) {
+          const result = await coordinator.start(sessionID, objective);
+          const goal = result.created ?? result.existing;
+          if (result.existing) {
+            return {
+              goal: wire(controller, result.existing),
+              error: `a goal is already active (generation ${result.existing.generation}); replace it explicitly`,
+            };
+          }
+          return { goal: wire(controller, goal), drive: result.drive ?? null };
+        }
+        const out = controller.startOrDescribe(sessionID, objective);
+        return { goal: wire(controller, "created" in out ? out.created : out.existing) };
+      } catch (error) {
+        return { goal: null, error: String(error) };
+      }
+    },
+
     "goal.replace": async (input: {
       sessionID?: string;
       objective?: string;
@@ -140,7 +188,12 @@ export function goalRpcHandlers(controller: GoalController) {
       }
       try {
         // The generation check is the whole point: a confirmation rendered
-        // against generation N must not replace generation N+1.
+        // against generation N must not replace generation N+1. The coordinator
+        // then schedules the new generation so it actually executes.
+        if (coordinator) {
+          const result = await coordinator.replace(sessionID, objective, expectedGeneration);
+          return { goal: wire(controller, result.goal), drive: result.drive ?? null };
+        }
         const goal = controller.replace(sessionID, objective, expectedGeneration);
         return { goal: wire(controller, goal) };
       } catch (error) {
@@ -160,7 +213,33 @@ export function goalRpcHandlers(controller: GoalController) {
     "goal.resume": async (input: { sessionID?: string }) => {
       if (!input?.sessionID) return { goal: null };
       try {
+        if (coordinator) {
+          const result = await coordinator.resume(input.sessionID);
+          return { goal: wire(controller, result.goal), drive: result.drive ?? null };
+        }
         return { goal: wire(controller, controller.resume(input.sessionID)) };
+      } catch (error) {
+        return { goal: null, error: String(error) };
+      }
+    },
+
+    "goal.health": async (input: { sessionID?: string }) => {
+      if (!input?.sessionID) return { health: { ok: false, error: "sessionID is required" } };
+      try {
+        return { health: controller.health(input.sessionID) };
+      } catch (error) {
+        return { health: { ok: false, error: String(error) } };
+      }
+    },
+
+    "goal.budget": async (input: { sessionID?: string; budget?: number }) => {
+      if (!input?.sessionID) return { goal: null, error: "sessionID is required" };
+      try {
+        const budget =
+          typeof input.budget === "number" && Number.isFinite(input.budget) && input.budget > 0
+            ? Math.floor(input.budget)
+            : undefined;
+        return { goal: wire(controller, controller.setBudget(input.sessionID, budget)) };
       } catch (error) {
         return { goal: null, error: String(error) };
       }

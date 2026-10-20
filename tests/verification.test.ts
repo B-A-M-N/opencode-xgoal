@@ -52,6 +52,13 @@ function validator(valid = true, reason = "ok"): EvidenceValidator {
   return { validate: async () => ({ valid, reason }) };
 }
 
+/** The current goal's fencing reference, as a model tool call must supply. */
+function ref(sessionID = "ses_a"): { goalID: string; generation: number } {
+  const goal = controller.status(sessionID);
+  if (!goal) throw new Error(`no current goal for ${sessionID}`);
+  return { goalID: goal.id, generation: goal.generation };
+}
+
 describe("completion requires objective-level evidence", () => {
   test("an objective with no criteria cannot be verified complete", async () => {
     const goal = store.create({ sessionID: "ses_a", objective: "fix everything" });
@@ -88,8 +95,14 @@ describe("completion requires objective-level evidence", () => {
 
   test("evidence that no longer validates blocks completion", async () => {
     const goal = store.create({ sessionID: "ses_a", objective: "x" });
-    store.addCriterion(goal.id, "the file exists");
-    store.addEvidence({ goalID: goal.id, kind: "file", ref: "src/thing.ts" });
+    const criterionID = store.addCriterion(goal.id, "the file exists");
+    // Only bound evidence is load-bearing; bind it so the stale check applies.
+    store.addEvidence({
+      goalID: goal.id,
+      criterionID,
+      kind: "file",
+      ref: "src/thing.ts",
+    });
 
     const stale = new GoalVerifier(store, validator(false, "file no longer present"));
     const result = await stale.verify(goal.id);
@@ -99,13 +112,44 @@ describe("completion requires objective-level evidence", () => {
 
   test("criteria covered by validating evidence verify complete", async () => {
     const goal = store.create({ sessionID: "ses_a", objective: "x" });
-    store.addCriterion(goal.id, "the regression is fixed");
-    store.addEvidence({ goalID: goal.id, kind: "test", ref: "bun test", detail: "exit 0" });
+    const criterionID = store.addCriterion(goal.id, "the regression is fixed");
+    // Evidence must be bound to the criterion it proves, and must record a
+    // successful exit status.
+    store.addEvidence({
+      goalID: goal.id,
+      criterionID,
+      kind: "test",
+      ref: "bun test",
+      detail: "exit 0",
+      exitCode: 0,
+    });
 
     const verifier = new GoalVerifier(store, validator());
     const result = await verifier.verify(goal.id);
     expect(result.verdict).toBe("complete");
     expect(result.unmet).toHaveLength(0);
+  });
+
+  // Audit defect 4: an unrelated successful command must not satisfy a
+  // criterion about something else.
+  test("an unrelated successful command cannot satisfy a criterion", async () => {
+    const goal = store.create({ sessionID: "ses_a", objective: "x" });
+    const criterionID = store.addCriterion(goal.id, "config.yaml contains retries: 3");
+    // A perfectly successful command that proves nothing about the criterion.
+    store.addEvidence({
+      goalID: goal.id,
+      kind: "command",
+      ref: "pwd",
+      detail: "exit 0",
+      exitCode: 0,
+    });
+
+    const verifier = new GoalVerifier(store, validator());
+    const result = await verifier.verify(goal.id);
+    expect(result.verdict).toBe("incomplete");
+    expect(result.unmet.some((u) => u.includes("criterion not evidenced"))).toBe(true);
+    // The criterion was never bound, so its id is unused.
+    expect(criterionID).toBeTruthy();
   });
 });
 
@@ -214,7 +258,7 @@ describe("progress classification", () => {
 describe("REGRESSION: the Phase 01 false blocker", () => {
   test("a milestone-plus-workflow-question keeps the goal active and working", () => {
     controller.startOrDescribe("ses_a", "produce a working replacement /goal plugin");
-    controller.checkpoint("ses_a", { summary: "phase 01 complete and committed" });
+    controller.checkpoint("ses_a", { ...ref(), summary: "phase 01 complete and committed" });
 
     // The exact text the legacy plugin scored as "goal unachievable".
     const text =
@@ -233,7 +277,7 @@ describe("REGRESSION: the Phase 01 false blocker", () => {
     expect(classification).not.toBe("blocked");
 
     // 3. A blocker report for it is refused outright.
-    const report = controller.reportBlocked("ses_a", { reason: text });
+    const report = controller.reportBlocked("ses_a", { ...ref(), reason: text });
     expect(report.accepted).toBe(false);
 
     // 4. The goal remains active and drivable.
@@ -246,7 +290,7 @@ describe("REGRESSION: the Phase 01 false blocker", () => {
 
   test("the objective is not limited to the completed milestone", () => {
     controller.startOrDescribe("ses_a", "produce a fully functional replacement /goal plugin");
-    controller.checkpoint("ses_a", { summary: "phase 01 done" });
+    controller.checkpoint("ses_a", { ...ref(), summary: "phase 01 done" });
     // Phase 01 finishing must not complete the objective.
     const goal = controller.status("ses_a")!;
     expect(goal.status).toBe("active");
@@ -257,7 +301,7 @@ describe("REGRESSION: the Phase 01 false blocker", () => {
 describe("completion cannot be self-declared", () => {
   test("propose then verify: only verified evidence completes the goal", async () => {
     const goal = store.create({ sessionID: "ses_a", objective: "x" });
-    store.addCriterion(goal.id, "the regression is fixed");
+    const criterionID = store.addCriterion(goal.id, "the regression is fixed");
     store.transition({ goalID: goal.id, generation: 1, to: "verifying", actor: "model" });
 
     const verifier = new GoalVerifier(store, validator());
@@ -274,8 +318,11 @@ describe("completion cannot be self-declared", () => {
     });
     expect(back.status).toBe("active");
 
-    // Evidence arrives, then verification passes.
+    // Evidence arrives and is explicitly bound to the criterion, then
+    // verification passes.
     store.addEvidence({ goalID: goal.id, kind: "test", ref: "bun test", detail: "exit 0" });
+    const evidence = store.listEvidence(goal.id).find((e) => e.ref === "bun test")!;
+    store.bindEvidence(criterionID, [evidence.id]);
     store.transition({ goalID: goal.id, generation: 1, to: "verifying", actor: "model" });
     const second = await verifier.verify(goal.id);
     expect(second.verdict).toBe("complete");

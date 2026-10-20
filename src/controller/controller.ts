@@ -11,6 +11,11 @@
  */
 import { GoalStore, GoalConflictError } from "./store.ts";
 import { type Actor, type Goal, type GoalStatus, isNonTerminal } from "./state.ts";
+import {
+  deriveCriteria as deriveCriterionInputs,
+  type CriterionInput,
+  type CriterionSpec,
+} from "./criteria.ts";
 
 export interface ControllerOptions {
   /** Path to the SQLite database. */
@@ -19,6 +24,16 @@ export interface ControllerOptions {
   maxNoProgressRounds?: number;
   /** Repeated blocker confirmations before a blocker is accepted as genuine. */
   minBlockerConfirmations?: number;
+  /**
+   * Derive preliminary acceptance criteria from a freshly stated objective.
+   *
+   * Ordinary `/goal <objective>` must not start with zero criteria, or
+   * verification can never pass. The default extractor parses concrete file
+   * requirements into independently checkable specs and falls back to an
+   * objective-level criterion. Criteria can be refined later, but the original
+   * objective stays immutable.
+   */
+  deriveCriteria?: (objective: string) => CriterionInput[];
 }
 
 export interface BlockedReport {
@@ -49,11 +64,13 @@ export class GoalController {
   readonly store: GoalStore;
   private readonly maxNoProgressRounds: number;
   private readonly minBlockerConfirmations: number;
+  private readonly deriveCriteria: (objective: string) => CriterionInput[];
 
   constructor(options: ControllerOptions) {
     this.store = new GoalStore(options.dbPath);
     this.maxNoProgressRounds = options.maxNoProgressRounds ?? 3;
     this.minBlockerConfirmations = options.minBlockerConfirmations ?? 2;
+    this.deriveCriteria = options.deriveCriteria ?? deriveCriterionInputs;
   }
 
   close(): void {
@@ -65,26 +82,44 @@ export class GoalController {
     return this.store.reconcileAfterRestart();
   }
 
+  /**
+   * Establish the acceptance criteria for a goal.
+   *
+   * Criteria are created inside the goal's creation transaction so a goal can
+   * never exist with no criteria — which would make verification unsatisfiable.
+   */
+  private criteriaFor(objective: string): CriterionInput[] {
+    return this.deriveCriteria(objective);
+  }
+
   // ------------------------------------------------------- user commands
 
   /** `/goal <objective>` — start, or report that a replacement is required. */
   startOrDescribe(sessionID: string, objective: string): { created: Goal } | { existing: Goal } {
     const existing = this.store.current(sessionID);
     if (existing) return { existing };
-    return { created: this.store.create({ sessionID, objective, actor: "user" }) };
+    const goal = this.store.create({
+      sessionID,
+      objective,
+      actor: "user",
+      criteria: this.criteriaFor(objective),
+    });
+    return { created: goal };
   }
 
   /** `/goal replace <objective>` — explicit replacement, generation-fenced. */
   replace(sessionID: string, objective: string, expectedGeneration?: number): Goal {
     const existing = this.store.current(sessionID);
+    const criteria = this.criteriaFor(objective);
     if (!existing) {
-      return this.store.create({ sessionID, objective, actor: "user" });
+      return this.store.create({ sessionID, objective, actor: "user", criteria });
     }
     return this.store.replace({
       sessionID,
       expectedGeneration: expectedGeneration ?? existing.generation,
       objective,
       actor: "user",
+      criteria,
     });
   }
 
@@ -100,17 +135,105 @@ export class GoalController {
 
   resume(sessionID: string): Goal {
     const goal = this.requireCurrent(sessionID);
-    return this.store.transition({
+    const resumed = this.store.transition({
       goalID: goal.id,
       generation: goal.generation,
       to: "active",
       actor: "user",
       reason: "resumed by user",
     });
+    // An explicit user resume is the decision that clears a terminal delivery
+    // failure, so automatic dispatch may resume.
+    if (resumed.deliveryFailed) this.store.clearDeliveryFailure(resumed.id);
+    return this.store.byID(resumed.id) ?? resumed;
   }
 
   status(sessionID: string): Goal | undefined {
     return this.store.current(sessionID);
+  }
+
+  /**
+   * Record session-level token usage against the active goal.
+   *
+   * The driver enforces the ceiling at reserve time, so accounting only has to
+   * be durable and monotonic; it never grants permission to continue.
+   */
+  recordUsage(sessionID: string, totalTokens: number): Goal | undefined {
+    return this.store.recordSessionUsage(sessionID, totalTokens).goal;
+  }
+
+  /** `/goal budget <n>` — set the ceiling through the store, not raw SQL. */
+  setBudget(sessionID: string, budget: number | undefined): Goal {
+    const goal = this.requireCurrent(sessionID);
+    return this.store.setTokenBudget(goal.id, budget);
+  }
+
+  /**
+   * Structured health for the TUI and for operators.
+   *
+   * The acceptance gate is "set a goal and watch it finish". When it does not,
+   * this is what says why: an undriven goal, a stuck round, a delivery failure,
+   * or unmet criteria with no evidence.
+   */
+  health(sessionID: string): Record<string, unknown> {
+    const goal = this.store.current(sessionID);
+    if (!goal) return { ok: true, goal: null };
+    const criteria = this.store.listCriteria(goal.id);
+    const evidence = this.store.listEvidence(goal.id);
+    const round = this.store.outstandingRound(goal.id);
+    const rounds = this.store.roundsFor(goal.id);
+    const last = rounds[rounds.length - 1];
+    const stuckMs = round ? Date.now() - round.preparedAtMs : 0;
+    const problems: string[] = [];
+    if (goal.status === "active" && !round) {
+      problems.push("active goal has no outstanding round: nothing is driving it");
+    }
+    if (goal.deliveryFailed) {
+      problems.push("continuation delivery failed; automatic dispatch is halted");
+    }
+    if (round && round.attempts > 3) {
+      problems.push(`round ${round.id} has ${round.attempts} submission attempts`);
+    }
+    if (round && stuckMs > 5 * 60_000) {
+      problems.push(`round ${round.id} has been outstanding for ${Math.round(stuckMs / 1000)}s`);
+    }
+    if (goal.status === "verifying") {
+      const unmet = criteria.filter((criterion) => !criterion.met);
+      if (unmet.length) problems.push(`${unmet.length} unmet criterion/criteria during verification`);
+    }
+    return {
+      ok: problems.length === 0,
+      goal: {
+        id: goal.id,
+        generation: goal.generation,
+        status: goal.status,
+        objective: goal.objective,
+      },
+      drive: {
+        outstandingRound: round
+          ? { id: round.id, status: round.status, attempts: round.attempts, ageMs: stuckMs }
+          : null,
+        lastRound: last ? { id: last.id, status: last.status, classification: last.classification ?? null } : null,
+        deliveryFailed: goal.deliveryFailed,
+        rounds: goal.rounds,
+        noProgressRounds: goal.noProgressRounds,
+      },
+      usage: {
+        tokensUsed: goal.tokensUsed ?? 0,
+        tokenBudget: goal.tokenBudget ?? null,
+      },
+      verification: {
+        criteria: criteria.map((criterion) => ({
+          id: criterion.id,
+          text: criterion.text,
+          met: criterion.met,
+          source: criterion.source,
+        })),
+        evidenceCount: evidence.length,
+        verificationRevision: goal.verificationRevision,
+      },
+      problems,
+    };
   }
 
   history(sessionID: string): Goal[] {
@@ -123,24 +246,96 @@ export class GoalController {
     return this.store.current(sessionID);
   }
 
-  /** `goal_checkpoint` — record progress without changing status. */
+  /**
+   * Bind captured evidence to a criterion by evidence ID or by reference
+   * (command string or file path). Binding is explicit, so unrelated evidence
+   * cannot be counted against a criterion.
+   *
+   * A model sees relative paths in its own tool calls, while captured file
+   * evidence stores the resolved absolute path. Accepting a unique basename or
+   * path suffix avoids forcing the model to discover the workspace root, while
+   * refusing an ambiguous match prevents accidental cross-binding.
+   */
+  bindCriterionEvidence(goalID: string, criterionID: string, refs: string[]): number {
+    const evidence = this.store.listEvidence(goalID);
+    const chosen = new Set<string>();
+    for (const ref of refs) {
+      const byID = evidence.find((e) => e.id === ref);
+      if (byID) {
+        chosen.add(byID.id);
+        continue;
+      }
+      const exact = evidence.filter((e) => e.ref === ref);
+      if (exact.length > 0) {
+        for (const e of exact) chosen.add(e.id);
+        continue;
+      }
+      const candidate =
+        ref.includes("/") || ref.includes("\\")
+          ? evidence.filter((e) => e.ref.endsWith(ref) || e.ref.endsWith(`/${ref}`))
+          : evidence.filter((e) => e.kind === "file" && e.ref.split("/").pop() === ref);
+      // Only bind when every candidate points at the same reference; two
+      // different files with the same basename are ambiguous.
+      if (candidate.length > 0 && new Set(candidate.map((e) => e.ref)).size === 1) {
+        for (const e of candidate) chosen.add(e.id);
+      }
+    }
+    if (chosen.size === 0) return 0;
+    return this.store.bindEvidence(criterionID, [...chosen]);
+  }
+
+  /**
+   * `goal_checkpoint` — an evidence annotation, not a progress round.
+   *
+   * A checkpoint used to record a synthetic "progress" round, so a model could
+   * call it repeatedly to reset no-progress accounting without doing anything.
+   * It now only attaches evidence; the round counter advances once, when the
+   * real execution settles.
+   */
   checkpoint(
     sessionID: string,
-    input: { summary: string; evidenceRefs?: string[] } & GoalRef,
+    input: { summary: string; evidenceRefs?: string[]; criterionID?: string } & GoalRef,
   ): { recorded: boolean; goal?: Goal; rejected?: string } {
     const target = this.resolveTarget(sessionID, input);
     if (!target.ok) return { recorded: false, rejected: target.rejected };
     const goal = target.goal;
     for (const ref of input.evidenceRefs ?? []) {
-      this.store.addEvidence({ goalID: goal.id, kind: "ref", ref, detail: input.summary });
+      this.store.addEvidence({
+        goalID: goal.id,
+        criterionID: input.criterionID,
+        kind: "ref",
+        ref,
+        detail: input.summary,
+      });
     }
-    const updated = this.store.recordRound({
-      goalID: goal.id,
-      generation: goal.generation,
-      classification: "progress",
-      detail: input.summary.slice(0, 300),
-    });
-    return { recorded: true, goal: updated };
+    // Evidence annotation only. No round is manufactured here.
+    return { recorded: true, goal: this.store.byID(goal.id) };
+  }
+
+  /**
+   * `goal_add_criterion` — refine the acceptance criteria during investigation.
+   *
+   * Criteria are additive and generation-fenced. The original objective is
+   * never rewritten, and an explicit requirement may not be removed to pass
+   * verification.
+   */
+  addCriterion(
+    sessionID: string,
+    input: { text: string; spec?: CriterionSpec } & GoalRef,
+  ): { criterionID?: string; rejected?: string } {
+    const target = this.resolveTarget(sessionID, input);
+    if (!target.ok) return { rejected: target.rejected };
+    try {
+      const criterionID = this.store.addCriterion(
+        target.goal.id,
+        input.text,
+        input.spec,
+        "model",
+      );
+      return { criterionID };
+    } catch (error) {
+      return { rejected: String(error) };
+    }
   }
 
   /**
@@ -152,7 +347,11 @@ export class GoalController {
    */
   proposeComplete(
     sessionID: string,
-    input: { summary: string; evidenceRefs?: string[] } & GoalRef,
+    input: {
+      summary: string;
+      evidenceRefs?: string[];
+      criteria?: { criterionID: string; evidenceRefs: string[] }[];
+    } & GoalRef,
   ): { goal?: Goal; rejected?: string } {
     const target = this.resolveTarget(sessionID, input);
     if (!target.ok) return { rejected: target.rejected };
@@ -160,6 +359,9 @@ export class GoalController {
 
     for (const ref of input.evidenceRefs ?? []) {
       this.store.addEvidence({ goalID: goal.id, kind: "ref", ref, detail: input.summary });
+    }
+    for (const binding of input.criteria ?? []) {
+      this.bindCriterionEvidence(goal.id, binding.criterionID, binding.evidenceRefs);
     }
     const updated = this.store.transition({
       goalID: goal.id,
@@ -174,9 +376,10 @@ export class GoalController {
   /**
    * `goal_report_blocked` — a claim of blockage, not an accepted blocker.
    *
-   * A single report does not park the goal. The controller requires repeated
-   * confirmations before treating a blocker as genuine, so that a model asking
-   * an optional workflow question cannot force the goal into `blocked`.
+   * A single report does not park the goal, and a model asserting
+   * `externalDependency: true` is not self-authenticating. The controller counts
+   * *distinct reporting rounds* with an equivalent unresolved blocker, so
+   * repeating the tool call inside one turn cannot manufacture a blocker.
    */
   reportBlocked(
     sessionID: string,
@@ -192,21 +395,25 @@ export class GoalController {
       this.store.addEvidence({ goalID: goal.id, kind: "blocker-ref", ref, detail: report.reason });
     }
 
-    // Count the report first, then decide. One report is not enough unless the
-    // model identified a concrete external dependency.
-    const counted = this.store.recordRound({
+    // The reporting round is the next unsettled round. Multiple calls in this
+    // turn share it, so they count once; a later round increments it.
+    const roundNumber = goal.rounds + 1;
+    const confirmations = this.store.recordBlockerClaim({
       goalID: goal.id,
       generation: goal.generation,
-      classification: "blocked",
-      detail: report.reason.slice(0, 300),
+      roundNumber,
+      reason: report.reason,
     });
-    const confirmations = counted.repeatedBlockerRounds;
 
-    const genuine =
-      report.externalDependency === true || confirmations >= this.minBlockerConfirmations;
+    // `externalDependency` is recorded as a claim but never trusted as proof.
+    const genuine = confirmations >= this.minBlockerConfirmations;
     if (!genuine) {
       // Stay active; the goal keeps making progress rather than parking.
-      return { goal: counted, accepted: false, confirmations };
+      return {
+        goal: this.store.byID(goal.id),
+        accepted: false,
+        confirmations,
+      };
     }
 
     const blocked = this.store.transition({
@@ -224,7 +431,7 @@ export class GoalController {
   /** Record a settled round and apply the stall policy. */
   classifyRound(
     sessionID: string,
-    classification: "progress" | "verifiedWait" | "noProgress",
+    classification: "progress" | "verifiedWait" | "noProgress" | "blocked",
     detail?: string,
     tokensUsed?: number,
   ): Goal | undefined {
@@ -269,42 +476,34 @@ export class GoalController {
     return goal;
   }
 
-  /** Controller-only completion, callable after verification has passed. */
-  commitComplete(goalID: string, generation: number, reason: string): Goal {
-    // Settle any in-flight round as `complete` BEFORE the goal becomes terminal.
-    // Otherwise the round stays outstanding, and reconciliation later marks it
-    // failed — recording a spurious failure against a goal that succeeded.
-    const outstanding = this.store.outstandingRound(goalID);
-    if (outstanding) {
-      try {
-        this.store.settleRound({
-          roundID: outstanding.id,
-          classification: "complete",
-          detail: reason,
-        });
-        this.store.recordRound({
-          goalID,
-          generation,
-          classification: "complete",
-          detail: reason,
-        });
-      } catch {
-        // A round that cannot be settled must not block completion.
-      }
-    }
-    return this.store.transition({
+  /**
+   * Controller-only completion, callable after verification has passed.
+   *
+   * The in-flight round settlement and the final status transition happen in
+   * ONE transaction, guarded by the goal generation and the verification
+   * snapshot the verifier actually checked. A stale verifier that returns a
+   * result for an older evidence snapshot cannot complete the goal.
+   */
+  commitComplete(
+    goalID: string,
+    generation: number,
+    reason: string,
+    snapshot?: string,
+  ): Goal {
+    return this.store.completeGoal({
       goalID,
       generation,
-      to: "complete",
-      actor: "controller",
       reason,
+      snapshot,
+      settleClassification: "complete",
     });
   }
 
-  /** Controller-only rejection of a completion claim. */
-  rejectCompletion(sessionID: string, reason: string): Goal | undefined {
-    const goal = this.store.current(sessionID);
+  /** Controller-only rejection of a completion claim, generation-fenced. */
+  rejectCompletion(goalID: string, generation: number, reason: string): Goal | undefined {
+    const goal = this.store.byID(goalID);
     if (!goal || goal.status !== "verifying") return goal;
+    if (goal.generation !== generation) return goal;
     return this.store.transition({
       goalID: goal.id,
       generation: goal.generation,
@@ -323,9 +522,12 @@ export class GoalController {
   /**
    * Resolve the goal a model-facing call is aimed at, refusing stale references.
    *
-   * Without this, a callback from a superseded goal that happens to match the
-   * session would be applied to its replacement. Fencing on both goal ID and
-   * generation is what makes replacement safe.
+   * The goal ID and generation must be supplied and must match the current
+   * goal. A call that names a superseded goal or generation is rejected rather
+   * than applied to whatever happens to be current. A call that names neither
+   * is also rejected: the controller never infers a generation from
+   * `store.current()` at execution time, because that is exactly how a delayed
+   * callback from a superseded execution gets attributed to its replacement.
    */
   private resolveTarget(sessionID: string, ref?: GoalRef): TargetResult {
     const current = this.store.current(sessionID);
@@ -333,13 +535,25 @@ export class GoalController {
     if (!isNonTerminal(current.status)) {
       return { ok: false, rejected: `goal is ${current.status}` };
     }
-    if (ref?.goalID !== undefined && ref.goalID !== current.id) {
+    if (!ref?.goalID) {
+      return {
+        ok: false,
+        rejected: `unresolved goal reference: the tool call must name the current goal (${current.id})`,
+      };
+    }
+    if (ref.goalID !== current.id) {
       return {
         ok: false,
         rejected: `stale goal reference: ${ref.goalID} is not the current goal (${current.id})`,
       };
     }
-    if (ref?.generation !== undefined && ref.generation !== current.generation) {
+    if (ref.generation === undefined) {
+      return {
+        ok: false,
+        rejected: `unresolved generation: the tool call must name generation ${current.generation}`,
+      };
+    }
+    if (ref.generation !== current.generation) {
       return {
         ok: false,
         rejected: `stale generation: callback claimed ${ref.generation}, current is ${current.generation}`,

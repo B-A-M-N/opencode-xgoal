@@ -9,10 +9,12 @@
  *   - must not import bare specifiers (this file is bundled to ./index.js)
  *   - the entry must sit at the package root (`main: "index.js"`)
  */
-import { appendFileSync, existsSync, mkdirSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { GoalController } from "./controller/controller.ts";
+import { GoalCoordinator } from "./controller/coordinator.ts";
 import { GoalDriver } from "./controller/driver.ts";
 import { RoundObserver, SessionTransport } from "./controller/transport.ts";
 import {
@@ -23,6 +25,56 @@ import {
 import { goalRpcDefinition, goalRpcHandlers } from "./rpc.ts";
 
 const LOG = process.env.XGOAL_HARNESS_LOG ?? "";
+
+/**
+ * Resolve a captured path against the session workspace.
+ *
+ * A relative path must never resolve against the plugin process's own cwd, or a
+ * criterion like "create a.txt" could be satisfied by an unrelated file in the
+ * directory the plugin happened to start from.
+ */
+function resolveWorkspacePath(ref: string, workspace: string): string {
+  if (isAbsolute(ref)) return ref;
+  const base = workspace && workspace.length > 0 ? workspace : process.cwd();
+  return resolve(base, ref);
+}
+
+/** The workspace the current session is operating in, if known. */
+function sessionWorkspace(): string {
+  return String(process.env.XGOAL_WORKSPACE ?? process.env.PWD ?? "");
+}
+
+/** Human-readable dispatch outcome for command replies and the TUI. */
+function describeDrive(outcome: any): string {
+  if (!outcome) return "dispatch unavailable (no driver connected)";
+  switch (outcome.action) {
+    case "admitted":
+      return `execution scheduled (${outcome.inboxID}).`;
+    case "reconcile":
+      return `an outstanding round is still ${outcome.status}.`;
+    case "unknown":
+      return "dispatch outcome unknown; the recovery sweep will reconcile it.";
+    case "failed":
+      return `dispatch failed: ${outcome.detail}.`;
+    case "abandoned":
+      return `dispatch abandoned: ${outcome.detail}.`;
+    case "limited":
+      return `not dispatched: goal is ${outcome.status}.`;
+    case "idle":
+      return `not dispatched: ${outcome.reason}.`;
+    default:
+      return `dispatch: ${String(outcome.action)}.`;
+  }
+}
+
+/** Content hash, so file evidence can be checked for staleness. */
+function hashFile(path: string): string {
+  try {
+    return createHash("sha256").update(readFileSync(path)).digest("hex").slice(0, 32);
+  } catch {
+    return "";
+  }
+}
 
 type Evidence = Record<string, unknown> & { event: string };
 
@@ -90,6 +142,7 @@ export default {
     // ------------------------------------------------- continuation driver
     const observer = new RoundObserver();
     let driver: GoalDriver | undefined;
+    let coordinator: GoalCoordinator | undefined;
     let ledger: EvidenceLedger | undefined;
     let verifier: GoalVerifier | undefined;
     let sweep: ReturnType<typeof setInterval> | undefined;
@@ -108,42 +161,155 @@ export default {
             delivery: "queue",
           });
         },
+        // Authoritative state for reconciliation. The event stream is a cache;
+        // the session's own inbox and transcript decide what actually happened.
+        fetchState: async ({ sessionID }) => {
+          const messages = await ctx.session.context({ sessionID });
+          let inbox: Array<{ id: string }> = [];
+          try {
+            const api = ctx.session?.inbox;
+            if (typeof api?.list === "function") {
+              inbox = await api.list({ sessionID });
+            }
+          } catch {
+            // The inbox may not be exposed on this surface; the transcript is
+            // still authoritative enough to prove delivery and settlement.
+          }
+          return {
+            inbox: (inbox ?? []).map((item: any) => ({ id: item.id })),
+            messages: (messages as any[]).map((message: any) => ({
+              id: message.id,
+              type: message.type,
+              metadata: message.metadata,
+              time: message.time,
+              finish: message.finish,
+            })),
+          };
+        },
       });
       driver = new GoalDriver(controller.store, transport);
+
+      // One authoritative mutation path. The command, the RPC surface and the
+      // TUI all use this, so creating/replacing/resuming a goal schedules the
+      // native execution instead of leaving an active goal with no driver.
+      coordinator = new GoalCoordinator(controller, () => driver);
 
       // Evidence is captured from observed tool executions only. A model's
       // prose never reaches this ledger.
       ledger = new EvidenceLedger(controller.store);
       verifier = new GoalVerifier(controller.store, {
         async validate(evidence) {
-          // File evidence must still exist; command/test evidence is accepted
-          // because the controller observed the execution itself.
+          // File evidence must still exist AND still match the content hash
+          // captured when it was observed. Existence alone is not proof, and a
+          // relative path must resolve against the session workspace, never the
+          // plugin process's own cwd.
           if (evidence.kind === "file") {
+            const resolved = resolveWorkspacePath(evidence.ref, sessionWorkspace());
             try {
-              return existsSync(evidence.ref)
-                ? { valid: true, reason: "file present" }
-                : { valid: false, reason: "file not found" };
+              if (!existsSync(resolved)) {
+                return { valid: false, reason: `file not found: ${evidence.ref}` };
+              }
+              if (evidence.hash !== undefined) {
+                const actual = hashFile(resolved);
+                if (actual !== evidence.hash) {
+                  return {
+                    valid: false,
+                    reason: `file changed since it was observed: ${evidence.ref}`,
+                  };
+                }
+              }
+              return { valid: true, reason: "file present and unchanged" };
             } catch {
               return { valid: false, reason: "file could not be checked" };
             }
           }
+          // Command/test/runtime evidence is only proof if the observed exit
+          // status was zero. A command that merely ran proves nothing.
           if (
             evidence.kind === "command" ||
             evidence.kind === "test" ||
             evidence.kind === "runtime"
           ) {
-            return { valid: true, reason: "observed to complete by the controller" };
+            if (evidence.exitCode === undefined) {
+              return {
+                valid: false,
+                reason: "no observed exit status recorded; cannot confirm success",
+              };
+            }
+            return evidence.exitCode === 0
+              ? { valid: true, reason: `exited ${evidence.exitCode}` }
+              : { valid: false, reason: `exited ${evidence.exitCode}` };
           }
           // A bare reference is a model-provided pointer, never proof.
           return { valid: false, reason: "unverifiable reference" };
+        },
+        async checkSpec(criterion) {
+          // Only file specs are checked here. Command/test specs are proven by
+          // bound evidence of a run that actually exited with the expected
+          // status; we never re-execute arbitrary commands during verification.
+          if (criterion.spec?.type !== "file") {
+            return { valid: false, reason: "no independent check for this spec" };
+          }
+          const spec = criterion.spec;
+          const resolved = resolveWorkspacePath(spec.path, sessionWorkspace());
+          try {
+            if (!existsSync(resolved)) {
+              return { valid: false, reason: `file not found: ${spec.path}` };
+            }
+            if (spec.equals !== undefined || spec.contains !== undefined) {
+              const content = readFileSync(resolved, "utf8");
+              if (spec.equals !== undefined && content !== spec.equals) {
+                return {
+                  valid: false,
+                  reason: `${spec.path} does not exactly match the required content`,
+                };
+              }
+              if (spec.contains !== undefined && !content.includes(spec.contains)) {
+                return {
+                  valid: false,
+                  reason: `${spec.path} does not contain ${JSON.stringify(spec.contains)}`,
+                };
+              }
+            }
+            return { valid: true, reason: `${spec.path} matches the required content` };
+          } catch (error) {
+            return { valid: false, reason: `file could not be checked: ${String(error)}` };
+          }
         },
       } satisfies EvidenceValidator);
 
       // Startup recovery sweep: adopt or clean up whatever was in flight when
       // the previous process died. Driven by the ledger, not by events.
+      //
+      // Recovery is not just bookkeeping: an active goal with no outstanding
+      // round has no execution driving it, so it must be dispatched again or
+      // the goal silently dies with the process that created it.
+      const driveAll = async () => {
+        const goals = controller?.store.activeGoals() ?? [];
+        const outcomes: string[] = [];
+        for (const goal of goals) {
+          if (goal.status !== "active") continue;
+          try {
+            const outcome = await driver!.drive(goal.sessionID);
+            outcomes.push(`${goal.id}:${outcome.action}`);
+          } catch (error) {
+            record({
+              event: "driver.drive.error",
+              goalID: goal.id,
+              error: String(error),
+            });
+          }
+        }
+        return outcomes;
+      };
+
       void driver
         .reconcile()
-        .then((outcomes) => record({ event: "driver.reconciled", count: outcomes.length }))
+        .then(async (outcomes) => {
+          record({ event: "driver.reconciled", count: outcomes.length });
+          const driven = await driveAll();
+          record({ event: "driver.resumed", outcomes: driven });
+        })
         .catch((error) => record({ event: "driver.reconcile.error", error: String(error) }));
 
       // Periodic sweep. A missed event must not strand a goal, so recovery does
@@ -152,6 +318,7 @@ export default {
       sweep = setInterval(() => {
         void driver
           ?.reconcile()
+          .then(() => driveAll())
           .catch((error) => record({ event: "driver.sweep.error", error: String(error) }));
       }, sweepMs);
       // Do not hold the process open just for the sweep.
@@ -166,6 +333,43 @@ export default {
       controllerReady: controller !== undefined,
     });
 
+    // ------------------------------------------------- call fencing
+    /**
+     * Resolve which goal generation produced an assistant message.
+     *
+     * A tool call belongs to the generation that produced the message carrying
+     * it — not to whatever goal happens to be current when the callback runs.
+     * The association is derived from durable state (the message's own
+     * timestamp against goal creation times) and cached, so a delayed call from
+     * a superseded execution is fenced to its own generation and rejected by
+     * the controller instead of contaminating its replacement.
+     */
+    async function resolveMessageRef(
+      sessionID: string | undefined,
+      messageID: string | undefined,
+    ): Promise<{ goalID?: string; generation?: number }> {
+      if (!controller || !sessionID || !messageID) return {};
+      const cached = controller.store.resolveMessageGeneration(sessionID, messageID);
+      if (cached !== undefined) {
+        const goal = controller.store.byGeneration(sessionID, cached);
+        return goal ? { goalID: goal.id, generation: cached } : {};
+      }
+      let atMs: number | undefined;
+      try {
+        const messages = await ctx.session.context({ sessionID });
+        const message = (messages as any[]).find((m) => m?.id === messageID);
+        if (typeof message?.time?.created === "number") atMs = message.time.created;
+      } catch (error) {
+        record({ event: "call.resolve.error", sessionID, messageID, error: String(error) });
+      }
+      if (atMs === undefined) return {};
+      const generation = controller.store.generationAt(sessionID, atMs);
+      if (generation === undefined) return {};
+      controller.store.rememberMessageGeneration(sessionID, messageID, generation, atMs);
+      const goal = controller.store.byGeneration(sessionID, generation);
+      return goal ? { goalID: goal.id, generation } : {};
+    }
+
     // ---------------------------------------------------------------- tools
     try {
       await ctx.tool.transform((editor: any) => {
@@ -179,6 +383,16 @@ export default {
             const goal = controller.get(toolCtx?.sessionID);
             if (!goal) return { content: "No active goal for this session." };
             const criteria = controller.store.listCriteria(goal.id);
+            // Expose captured evidence so the model can bind it to criteria.
+            // Without this it can only re-assert completion and be rejected.
+            const evidence = controller.store.listEvidence(goal.id).map((item) => ({
+              id: item.id,
+              kind: item.kind,
+              ref: item.ref,
+              exitCode: item.exitCode ?? null,
+              hash: item.hash ?? null,
+              criterionID: item.criterionID ?? null,
+            }));
             return {
               content: JSON.stringify(
                 {
@@ -191,6 +405,7 @@ export default {
                   tokensUsed: goal.tokensUsed ?? null,
                   tokenBudget: goal.tokenBudget ?? null,
                   criteria,
+                  evidence,
                 },
                 null,
                 2,
@@ -203,11 +418,12 @@ export default {
         editor.add({
           name: "goal_checkpoint",
           description:
-            "Record progress toward the current goal without changing its status. Use for completed work, or for investigation that materially narrows the problem.",
+            "Record progress toward the current goal without changing its status. Use for completed work, or for investigation that materially narrows the problem. Optionally bind evidence to a criterion.",
           input: obj(
             {
               summary: str,
               evidence_refs: strArray,
+              criterion_id: str,
               goal_id: str,
               generation: num,
             },
@@ -215,11 +431,13 @@ export default {
           ),
           async execute(input: any, toolCtx: any) {
             if (!controller) return { content: `goal controller unavailable: ${startupError}` };
+            const ref = await resolveMessageRef(toolCtx?.sessionID, toolCtx?.messageID);
             const out = controller.checkpoint(toolCtx?.sessionID, {
               summary: String(input?.summary ?? ""),
               evidenceRefs: input?.evidence_refs,
-              goalID: input?.goal_id,
-              generation: input?.generation,
+              criterionID: input?.criterion_id,
+              goalID: ref.goalID ?? input?.goal_id,
+              generation: ref.generation ?? input?.generation,
             });
             if (!out.recorded) return { content: `Checkpoint not recorded: ${out.rejected}` };
             return {
@@ -232,18 +450,43 @@ export default {
         editor.add({
           name: "goal_propose_complete",
           description:
-            "Propose that the goal's original objective has been fully achieved. This moves the goal to verification; it does not complete it. The controller decides completion.",
-          input: obj({ summary: str, evidence_refs: strArray, goal_id: str, generation: num }, [
-            "summary",
-          ]),
+            "Propose that the goal's original objective has been fully achieved. This moves the goal to verification; it does not complete it. The controller decides completion. File criteria with a machine-checkable spec are re-checked independently; other criteria require explicitly bound evidence. Call goal_get first and pass criteria: [{criterion_id, evidence_refs}], where evidence_refs are evidence IDs or refs from goal_get.",
+          input: obj(
+            {
+              summary: str,
+              evidence_refs: strArray,
+              criteria: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    criterion_id: { type: "string" },
+                    evidence_refs: { type: "array", items: { type: "string" } },
+                  },
+                  required: ["criterion_id"],
+                  additionalProperties: false,
+                },
+              },
+              goal_id: str,
+              generation: num,
+            },
+            ["summary"],
+          ),
           async execute(input: any, toolCtx: any) {
             if (!controller) return { content: `goal controller unavailable: ${startupError}` };
             const sessionID = toolCtx?.sessionID;
+            const ref = await resolveMessageRef(sessionID, toolCtx?.messageID);
             const out = controller.proposeComplete(sessionID, {
               summary: String(input?.summary ?? ""),
               evidenceRefs: input?.evidence_refs,
-              goalID: input?.goal_id,
-              generation: input?.generation,
+              criteria: Array.isArray(input?.criteria)
+                ? input.criteria.map((c: any) => ({
+                    criterionID: String(c?.criterion_id ?? ""),
+                    evidenceRefs: Array.isArray(c?.evidence_refs) ? c.evidence_refs : [],
+                  }))
+                : undefined,
+              goalID: ref.goalID ?? input?.goal_id,
+              generation: ref.generation ?? input?.generation,
             });
             if (out.rejected) return { content: `Completion proposal rejected: ${out.rejected}` };
 
@@ -259,7 +502,12 @@ export default {
 
             const result = await verifier.verify(goal.id);
             if (result.verdict === "complete") {
-              const done = controller.commitComplete(goal.id, goal.generation, result.reason);
+              const done = controller.commitComplete(
+                goal.id,
+                goal.generation,
+                result.reason,
+                result.snapshot,
+              );
               record({ event: "completion.verified", goalID: goal.id, reason: result.reason });
               return {
                 content: `Completion verified and the goal is now complete. ${result.reason}`,
@@ -269,7 +517,7 @@ export default {
 
             // Not verified: return the goal to work with the specific gaps, so
             // the model knows exactly what is still required.
-            const back = controller.rejectCompletion(sessionID, result.reason);
+            const back = controller.rejectCompletion(goal.id, goal.generation, result.reason);
             record({
               event: "completion.rejected",
               goalID: goal.id,
@@ -306,12 +554,13 @@ export default {
           ),
           async execute(input: any, toolCtx: any) {
             if (!controller) return { content: `goal controller unavailable: ${startupError}` };
+            const ref = await resolveMessageRef(toolCtx?.sessionID, toolCtx?.messageID);
             const out = controller.reportBlocked(toolCtx?.sessionID, {
               reason: String(input?.reason ?? ""),
               evidenceRefs: input?.evidence_refs,
               externalDependency: input?.external_dependency === true,
-              goalID: input?.goal_id,
-              generation: input?.generation,
+              goalID: ref.goalID ?? input?.goal_id,
+              generation: ref.generation ?? input?.generation,
             });
             if (out.rejected) return { content: `Blocker report rejected: ${out.rejected}` };
             if (!out.accepted) {
@@ -339,7 +588,10 @@ export default {
     // against generation N cannot replace generation N+1.
     try {
       if (controller && ctx.rpc?.register) {
-        await ctx.rpc.register(goalRpcDefinition as never, goalRpcHandlers(controller) as never);
+        await ctx.rpc.register(
+          goalRpcDefinition as never,
+          goalRpcHandlers(controller, coordinator) as never,
+        );
         record({ event: "rpc.registered", ok: true });
       } else {
         record({ event: "rpc.registered", ok: false, reason: "rpc domain unavailable" });
@@ -389,17 +641,26 @@ export default {
                 return;
               }
               if (verb === "pause") {
-                reply(`Paused: ${controller.pause(sessionID).status}`);
+                reply(`Paused: ${(coordinator ?? controller).pause(sessionID).status}`);
                 return;
               }
               if (verb === "resume") {
-                reply(`Resumed: ${controller.resume(sessionID).status}`);
+                if (coordinator) {
+                  const result = await coordinator.resume(sessionID);
+                  reply(`Resumed: ${result.goal.status}. ${describeDrive(result.drive)}`);
+                } else {
+                  reply(`Resumed: ${controller.resume(sessionID).status}`);
+                }
                 return;
               }
               if (verb === "replace") {
                 if (!arg) return reply("Usage: /goal replace <objective>");
-                const goal = controller.replace(sessionID, arg);
-                reply(`Replaced. Generation ${goal.generation} is now active.`);
+                const result = coordinator
+                  ? await coordinator.replace(sessionID, arg)
+                  : { goal: controller.replace(sessionID, arg) };
+                reply(
+                  `Replaced. Generation ${result.goal.generation} is now active. ${describeDrive(result.drive)}`,
+                );
                 return;
               }
               if (verb === "budget") {
@@ -412,25 +673,40 @@ export default {
                   );
                   return;
                 }
+                if (/^(off|none|clear)$/i.test(arg)) {
+                  controller.setBudget(sessionID, undefined);
+                  return reply("Token budget cleared.");
+                }
                 // `/goal budget <n>` sets the ceiling; the controller enforces it.
                 const n = Number(arg);
                 if (!Number.isFinite(n) || n <= 0) return reply("Usage: /goal budget <positive number>");
-                controller.store.db
-                  .query("UPDATE goals SET token_budget = ? WHERE id = ?")
-                  .run(Math.floor(n), goal.id);
+                controller.setBudget(sessionID, Math.floor(n));
                 reply(`Budget set to ${Math.floor(n)} tokens (used ${used}).`);
                 return;
               }
 
               // `/goal <objective>` — start, or report that replacement is needed.
               const objective = raw;
+              if (coordinator) {
+                const result = await coordinator.start(sessionID, objective);
+                if (result.existing) {
+                  reply(
+                    `A goal is already active (generation ${result.existing.generation}): ${result.existing.objective}\nUse /goal replace <objective> to supersede it.`,
+                  );
+                } else {
+                  reply(
+                    `Goal created (generation ${result.created!.generation}). ${describeDrive(result.drive)}`,
+                  );
+                }
+                return;
+              }
               const out = controller.startOrDescribe(sessionID, objective);
               if ("existing" in out) {
                 reply(
                   `A goal is already active (generation ${out.existing.generation}): ${out.existing.objective}\nUse /goal replace <objective> to supersede it.`,
                 );
               } else {
-                reply(`Goal created (generation ${out.created.generation}).`);
+                reply(`Goal created (generation ${out.created.generation}); no driver is connected.`);
               }
             } catch (error) {
               reply(`Goal command failed: ${String(error)}`);
@@ -506,13 +782,30 @@ export default {
           sessionID,
           status: event?.status,
         });
+        if (process.env.XGOAL_DEBUG_TOOLS === "1") {
+          const result = (event?.result ?? null) as Record<string, unknown> | null;
+          record({
+            event: "tool.result.shape",
+            tool: event?.tool,
+            eventKeys: event && typeof event === "object" ? Object.keys(event) : [],
+            resultKeys: result && typeof result === "object" ? Object.keys(result) : [],
+            metadata: result?.metadata ?? null,
+            content:
+              typeof result?.content === "string" ? result.content.slice(0, 200) : undefined,
+          });
+        }
 
         // Capture evidence only for goals that are actually active, and only
         // from executions the controller observed. This is what makes evidence
-        // machine-verifiable rather than model-asserted.
+        // machine-verifiable rather than model-asserted. The goal is resolved
+        // from the message that produced the call, so a delayed execution from
+        // a superseded goal cannot contaminate its replacement.
         if (!controller || !ledger || !sessionID) return;
-        const goal = controller.status(sessionID);
+        const ref = await resolveMessageRef(sessionID, event?.messageID);
+        const goal = ref.goalID ? controller.store.byID(ref.goalID) : undefined;
         if (!goal || goal.status !== "active") return;
+        const current = controller.status(sessionID);
+        if (!current || current.id !== goal.id || current.generation !== goal.generation) return;
         try {
           const captured = ledger.capture({
             goalID: goal.id,
@@ -520,6 +813,7 @@ export default {
             status: event?.status === "completed" ? "completed" : "error",
             args: event?.input ?? event?.args,
             result: event?.result,
+            workspace: sessionWorkspace(),
           });
           if (captured) {
             record({
@@ -556,6 +850,34 @@ export default {
           eventsSeen.add(type);
           observer.observe(event);
           record({ event: "event", type, total: eventsSeen.size });
+
+          // Session usage is a running total; charge the delta to the active
+          // goal so the budget ceiling is driven by real usage rather than
+          // staying at zero forever.
+          if (controller && type === "session.usage.updated") {
+            const data = (event as any)?.data;
+            const usageSession = data?.sessionID;
+            const tokens = data?.tokens;
+            if (usageSession && tokens) {
+              const total =
+                Number(tokens.input ?? 0) +
+                Number(tokens.output ?? 0) +
+                Number(tokens.reasoning ?? 0) +
+                Number(tokens.cache?.read ?? 0) +
+                Number(tokens.cache?.write ?? 0);
+              try {
+                const goal = controller.recordUsage(usageSession, total);
+                record({
+                  event: "usage.recorded",
+                  sessionID: usageSession,
+                  tokensUsed: goal?.tokensUsed ?? null,
+                  tokenBudget: goal?.tokenBudget ?? null,
+                });
+              } catch (error) {
+                record({ event: "usage.record.error", error: String(error) });
+              }
+            }
+          }
 
           if (!driver || !IDLE_SIGNALS.has(type)) continue;
           // Debounce: a burst of signals should produce one drive, not several.

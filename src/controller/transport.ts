@@ -114,6 +114,24 @@ export interface SessionTransportOptions {
     text: string;
     metadata: Record<string, unknown>;
   }) => Promise<void>;
+  /**
+   * Read authoritative session state. The event stream can miss events and the
+   * in-memory observer dies with the process, so a round must be reconciled
+   * against the session's own inbox and message history.
+   */
+  fetchState?: (input: { sessionID: string }) => Promise<SessionState>;
+}
+
+/** The minimal authoritative view a probe needs. */
+export interface SessionState {
+  inbox: Array<{ id: string }>;
+  messages: Array<{
+    id: string;
+    type?: string;
+    metadata?: Record<string, unknown>;
+    time?: { created?: number };
+    finish?: string;
+  }>;
 }
 
 /**
@@ -140,10 +158,12 @@ function classify(error: unknown): SubmitResult {
 export class SessionTransport implements ContinuationTransport {
   private readonly observer: RoundObserver;
   private readonly send: SessionTransportOptions["send"];
+  private readonly fetchState: SessionTransportOptions["fetchState"];
 
   constructor(options: SessionTransportOptions) {
     this.observer = options.observer;
     this.send = options.send;
+    this.fetchState = options.fetchState;
   }
 
   async submit(input: {
@@ -160,7 +180,63 @@ export class SessionTransport implements ContinuationTransport {
     }
   }
 
+  /**
+   * Probe the authoritative session state, not just our own memory.
+   *
+   * The observer is a cache: it is fast and survives missed events, but it
+   * starts empty after a restart and can miss an event entirely. If it cannot
+   * prove settlement, the session's inbox and message history decide.
+   */
   async probe(input: { sessionID: string; round: GoalRound }): Promise<ProbeResult> {
-    return this.observer.probe(input.round.inboxID);
+    const cached = this.observer.probe(input.round.inboxID);
+    // A settled round is settled; no need to hit the session.
+    if (cached === "settled") {
+      this.observer.forget(input.round.inboxID);
+      return "settled";
+    }
+    if (!this.fetchState) return cached;
+
+    let state: SessionState;
+    try {
+      state = await this.fetchState({ sessionID: input.sessionID });
+    } catch {
+      // Authoritative read failed: fall back to the observer rather than
+      // guessing, so the round stays outstanding and is retried.
+      return cached;
+    }
+
+    const queued = state.inbox.some((item) => item.id === input.round.inboxID);
+    const index = state.messages.findIndex(
+      (message) =>
+        message.id === input.round.inboxID ||
+        message.metadata?.inboxID === input.round.inboxID ||
+        message.metadata?.roundID === input.round.id,
+    );
+
+    // Not in the transcript yet. If it is still in the inbox it is queued;
+    // otherwise the outcome is genuinely unknown, which keeps it outstanding.
+    if (index === -1) {
+      if (queued) return "running";
+      return cached === "unknown" ? "unknown" : cached;
+    }
+
+    // Delivered. The turn is over when the session has gone idle or the last
+    // assistant message finished. `tool-calls` is not a finish: the loop
+    // continues with more tool work.
+    const after = state.messages.slice(index + 1);
+    const idle = after.some((message) => message.type === "idle");
+    const lastAssistant = [...after].reverse().find((message) => message.type === "assistant");
+    const finished =
+      idle ||
+      lastAssistant?.finish === "stop" ||
+      lastAssistant?.finish === "length" ||
+      lastAssistant?.finish === "content-filter" ||
+      lastAssistant?.finish === "error";
+
+    if (finished) {
+      this.observer.forget(input.round.inboxID);
+      return "settled";
+    }
+    return "running";
   }
 }

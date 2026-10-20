@@ -138,7 +138,7 @@ console.log("=".repeat(64));
   const verifying = c.status("ses_4")!;
 
   // The controller refuses to complete it and sends it back to work.
-  const back = c.rejectCompletion("ses_4", "no evidence submitted for any criterion")!;
+  const back = c.rejectCompletion(g.id, g.generation, "no evidence submitted for any criterion")!;
   const criteria = c.store.listCriteria(g.id);
   const ok =
     verifying.status === "verifying" &&

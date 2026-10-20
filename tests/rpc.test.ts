@@ -10,6 +10,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GoalController } from "../src/controller/controller.ts";
+import { GoalCoordinator } from "../src/controller/coordinator.ts";
 import { goalRpcDefinition, goalRpcHandlers } from "../src/rpc.ts";
 
 let dir: string;
@@ -39,6 +40,9 @@ describe("rpc definition", () => {
     expect(methods).toContain("goal.pause");
     expect(methods).toContain("goal.resume");
     expect(methods).toContain("goal.history");
+    expect(methods).toContain("goal.create");
+    expect(methods).toContain("goal.health");
+    expect(methods).toContain("goal.budget");
   });
 
   test("replace requires an expectedGeneration", () => {
@@ -64,7 +68,9 @@ describe("goal.status", () => {
     expect(res.goal?.generation).toBe(1);
     expect(res.goal?.objective).toBe("build the thing");
     expect(res.goal?.status).toBe("active");
-    expect(res.goal?.criteria).toHaveLength(1);
+    // `/goal` establishes criteria automatically; the explicit one is additive.
+    expect(res.goal?.criteria.length).toBeGreaterThanOrEqual(1);
+    expect(res.goal?.criteria.some((c: any) => c.text === "it works")).toBe(true);
   });
 
   test("a malformed call does not throw", async () => {
@@ -222,5 +228,67 @@ describe("headless parity", () => {
     expect((await handlers["goal.status"]({ sessionID: "ses_b" })).goal?.objective).toBe("goal B");
     await handlers["goal.pause"]({ sessionID: "ses_a" });
     expect((await handlers["goal.status"]({ sessionID: "ses_b" })).goal?.status).toBe("active");
+  });
+});
+
+describe("mutations schedule execution (audit defect 7)", () => {
+  function withCoordinator() {
+    const driven: string[] = [];
+    const coordinator = new GoalCoordinator(controller, () => ({
+      async drive(sessionID: string) {
+        driven.push(sessionID);
+        return { action: "admitted" as const, roundID: "round_test", inboxID: "msg_test" };
+      },
+    }));
+    return { coordinator, driven, handlers: goalRpcHandlers(controller, coordinator) };
+  }
+
+  test("goal.create creates the goal AND drives it", async () => {
+    const { driven, handlers: h } = withCoordinator();
+    const res = await h["goal.create"]({ sessionID: "ses_a", objective: "do the work" });
+    expect(res.goal?.status).toBe("active");
+    expect(res.error).toBeUndefined();
+    expect(driven).toEqual(["ses_a"]);
+  });
+
+  test("goal.create refuses to silently supersede an existing goal", async () => {
+    const { driven, handlers: h } = withCoordinator();
+    await h["goal.create"]({ sessionID: "ses_a", objective: "first" });
+    const res = await h["goal.create"]({ sessionID: "ses_a", objective: "second" });
+    expect(res.error).toContain("already active");
+    expect(controller.status("ses_a")?.objective).toBe("first");
+    // No second dispatch for a mutation that did not happen.
+    expect(driven).toHaveLength(1);
+  });
+
+  test("goal.replace drives the new generation", async () => {
+    const { driven, handlers: h } = withCoordinator();
+    await h["goal.create"]({ sessionID: "ses_a", objective: "first" });
+    const res = await h["goal.replace"]({
+      sessionID: "ses_a",
+      objective: "second",
+      expectedGeneration: 1,
+    });
+    expect(res.error).toBeUndefined();
+    expect(res.goal?.generation).toBe(2);
+    expect(driven).toHaveLength(2);
+  });
+
+  test("goal.resume drives; goal.pause does not", async () => {
+    const { driven, handlers: h } = withCoordinator();
+    await h["goal.create"]({ sessionID: "ses_a", objective: "x" });
+    await h["goal.pause"]({ sessionID: "ses_a" });
+    expect(driven).toHaveLength(1);
+    const resumed = await h["goal.resume"]({ sessionID: "ses_a" });
+    expect(resumed.goal?.status).toBe("active");
+    expect(driven).toHaveLength(2);
+  });
+
+  test("goal.health names an active goal that nothing is driving", async () => {
+    const { handlers: h } = withCoordinator();
+    controller.startOrDescribe("ses_a", "x");
+    const res = await h["goal.health"]({ sessionID: "ses_a" });
+    expect(res.health.ok).toBe(false);
+    expect((res.health.problems as string[]).join(" ")).toContain("nothing is driving it");
   });
 });

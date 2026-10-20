@@ -13,6 +13,31 @@
  */
 import type { GoalStore, GoalRound } from "./store.ts";
 import type { Goal } from "./state.ts";
+import type { CriterionSpec } from "./criteria.ts";
+import { existsSync, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { isAbsolute, resolve } from "node:path";
+
+/** Resolve a captured path against the session workspace, never the cwd. */
+export function resolveWorkspacePath(ref: string, workspace: string): string {
+  if (isAbsolute(ref)) return ref;
+  const base = workspace && workspace.length > 0 ? workspace : process.cwd();
+  return resolve(base, ref);
+}
+
+/** The workspace the current session is operating in, if known. */
+function sessionWorkspace(): string {
+  return String(process.env.XGOAL_WORKSPACE ?? process.env.PWD ?? "");
+}
+
+/** Content hash, so file evidence can be checked for staleness. */
+export function hashFile(path: string): string {
+  try {
+    return createHash("sha256").update(readFileSync(path)).digest("hex").slice(0, 32);
+  } catch {
+    return "";
+  }
+}
 
 /** Evidence kinds the controller can machine-verify. */
 export type EvidenceKind =
@@ -48,6 +73,12 @@ export interface EvidenceValidation {
  */
 export interface EvidenceValidator {
   validate(evidence: CapturedEvidence): Promise<EvidenceValidation>;
+  /**
+   * Independently check a criterion's machine spec against the world. This is
+   * what stops an unrelated successful command from satisfying a requirement
+   * about file content: the check does not consult the evidence at all.
+   */
+  checkSpec?(criterion: { text: string; spec?: CriterionSpec }): Promise<EvidenceValidation>;
 }
 
 export interface VerificationResult {
@@ -55,7 +86,24 @@ export interface VerificationResult {
   /** Specific conditions that are not satisfied. */
   unmet: string[];
   reason: string;
+  /** Per-criterion proof of how each was (or was not) established. */
+  proofs?: CriterionProof[];
+  /** Hash of the criteria+evidence snapshot this verification checked. */
+  snapshot?: string;
 }
+
+/** Proof that a single criterion was established. */
+export interface CriterionProof {
+  criterionID: string;
+  evidenceIDs: string[];
+  validatorID: string;
+  verdict: "pass" | "fail" | "unknown";
+  detail: string;
+}
+
+/** Evidence kinds that can prove an objective-level criterion. A bare command
+ *  is deliberately excluded: `pwd` exits zero but proves nothing. */
+const OBJECTIVE_PROOF_KINDS = new Set<EvidenceKind>(["test", "file"]);
 
 /**
  * Records evidence the controller observed, keyed by goal.
@@ -81,9 +129,11 @@ export class EvidenceLedger {
     status: "completed" | "error";
     args: unknown;
     result?: unknown;
+    workspace?: string;
   }): CapturedEvidence | undefined {
     const args = (input.args ?? {}) as Record<string, unknown>;
     const now = Date.now();
+    const workspace = input.workspace ?? sessionWorkspace();
 
     // A shell/bash command that completed successfully is real evidence.
     if ((input.tool === "shell" || input.tool === "bash") && input.status === "completed") {
@@ -101,6 +151,8 @@ export class EvidenceLedger {
         kind,
         ref: evidence.ref,
         detail: exitCode === undefined ? undefined : `exit ${exitCode}`,
+        exitCode,
+        workspace,
       });
       return evidence;
     }
@@ -110,12 +162,17 @@ export class EvidenceLedger {
     if (input.status === "completed" && /write|edit|patch|create/.test(input.tool)) {
       const path = String(args.filePath ?? args.file_path ?? args.path ?? "").trim();
       if (!path) return undefined;
-      const evidence: CapturedEvidence = { kind: "file", ref: path, atMs: now };
+      // Hash what was written so later verification can detect staleness.
+      const resolved = resolveWorkspacePath(path, workspace);
+      const hash = hashFile(resolved);
+      const evidence: CapturedEvidence = { kind: "file", ref: path, hash, atMs: now };
       this.store.addEvidence({
         goalID: input.goalID,
         kind: "file",
         ref: path,
         detail: "observed write",
+        hash,
+        workspace,
       });
       return evidence;
     }
@@ -128,6 +185,9 @@ export class EvidenceLedger {
     return this.store.listEvidence(goalID).map((e) => ({
       kind: e.kind as EvidenceKind,
       ref: e.ref,
+      exitCode: e.exitCode,
+      hash: e.hash,
+      workspace: e.workspace,
       atMs: Date.now(),
       criterionID: e.criterionID,
     }));
@@ -137,11 +197,56 @@ export class EvidenceLedger {
 function extractExitCode(result: unknown): number | undefined {
   if (!result) return undefined;
   const r = result as Record<string, unknown>;
-  const direct = r.exitCode ?? r.exit_code ?? r.code;
-  if (typeof direct === "number") return direct;
-  const nested = (r.metadata as Record<string, unknown> | undefined)?.exitCode;
-  if (typeof nested === "number") return nested;
-  return undefined;
+  const asNumber = (value: unknown): number | undefined => {
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (typeof value === "string" && /^-?\d+$/.test(value.trim())) return Number(value.trim());
+    return undefined;
+  };
+  const metadata = (r.metadata ?? {}) as Record<string, unknown>;
+  for (const candidate of [
+    r.exitCode,
+    r.exit_code,
+    r.code,
+    r.exit,
+    r.statusCode,
+    metadata.exitCode,
+    metadata.exit_code,
+    metadata.exit,
+    metadata.code,
+  ]) {
+    const n = asNumber(candidate);
+    if (n !== undefined) return n;
+  }
+  // Some tools only surface the status in their textual result.
+  const content = r.content;
+  const text =
+    typeof content === "string"
+      ? content
+      : Array.isArray(content)
+        ? content
+            .map((part) =>
+              typeof part === "string"
+                ? part
+                : (part as { text?: unknown })?.text ?? "",
+            )
+            .join("\n")
+        : typeof r.output === "string"
+          ? r.output
+          : "";
+  const match = /\bexit(?:\s+code)?\s*[:=]?\s*(-?\d+)\b/i.exec(text);
+  return match ? Number(match[1]) : undefined;
+}
+
+/** Hash the criteria + evidence snapshot a verification will check. */
+function snapshotOf(
+  criteria: { id: string; text: string; spec?: CriterionSpec }[],
+  evidence: { id: string; kind: string; ref: string; exitCode?: number; hash?: string; criterionID?: string }[],
+): string {
+  const canonical = JSON.stringify({
+    criteria: criteria.map((c) => [c.id, c.text, c.spec ?? null]),
+    evidence: evidence.map((e) => [e.id, e.kind, e.ref, e.exitCode ?? null, e.hash ?? null, e.criterionID ?? null]),
+  });
+  return createHash("sha256").update(canonical).digest("hex").slice(0, 32);
 }
 
 export class GoalVerifier {
@@ -156,8 +261,13 @@ export class GoalVerifier {
   /**
    * Verify a completion claim against the objective and current evidence.
    *
-   * This is deliberately conservative: an unverifiable reference is not proof,
-   * a missing criterion is a failure, and a failing validator is a failure.
+   * Each criterion is proven one of two ways:
+   *  - a machine spec is re-checked against the world, independent of the
+   *    evidence the model claims; or
+   *  - evidence explicitly bound to the criterion currently validates.
+   *
+   * There is no "general coverage" fallback: unrelated evidence can never
+   * satisfy a criterion.
    */
   async verify(goalID: string): Promise<VerificationResult> {
     const goal = this.store.byID(goalID);
@@ -166,10 +276,10 @@ export class GoalVerifier {
     const criteria = this.store.listCriteria(goalID);
     const evidence = this.store.listEvidence(goalID);
     const unmet: string[] = [];
+    const proofs: CriterionProof[] = [];
 
-    // 1. The objective must still be the authoritative target. A goal with no
-    //    criteria at all cannot be verified — the controller will not accept a
-    //    bare assertion that an objective is met.
+    // 1. A goal with no criteria cannot be verified: the controller will not
+    //    accept a bare assertion that an objective is met.
     if (criteria.length === 0) {
       return {
         verdict: "incomplete",
@@ -191,47 +301,149 @@ export class GoalVerifier {
       };
     }
 
-    // 3. Every captured item must still validate against current state.
+    // 3. Only evidence bound to a criterion is load-bearing. An exploratory
+    //    `ls` that the model happened to run is not a completion claim, and an
+    //    unbound command without an exit status must not make the objective
+    //    "incomplete" by itself. Validate what a criterion actually relies on.
+    const boundIDs = new Set<string>();
+    for (const criterion of criteria) {
+      for (const item of verifiable) {
+        if (item.criterionID === criterion.id) boundIDs.add(item.id);
+      }
+    }
+    const invalid = new Set<string>();
     for (const item of verifiable) {
+      if (!boundIDs.has(item.id)) continue;
       const validation = await this.validator.validate({
         kind: item.kind as EvidenceKind,
         ref: item.ref,
+        exitCode: item.exitCode,
+        hash: item.hash,
         atMs: Date.now(),
         criterionID: item.criterionID,
       });
       if (!validation.valid) {
+        invalid.add(item.id);
         unmet.push(`evidence no longer valid: ${item.ref} (${validation.reason})`);
       }
     }
 
-    // 4. Each criterion must have at least one piece of validating evidence
-    //    bound to it, or be covered by general validating evidence.
-    const validatingRefs = new Set(
-      verifiable
-        .filter((e) => !unmet.some((u) => u.includes(e.ref)))
-        .map((e) => e.ref),
-    );
+    // 4. Prove each criterion explicitly.
     for (const criterion of criteria) {
-      const bound = evidence.some(
-        (e) => e.criterionID === criterion.id && validatingRefs.has(e.ref),
+      const bound = evidence.filter(
+        (e) => e.criterionID === criterion.id && !invalid.has(e.id) && e.kind !== "ref",
       );
-      const coveredByGeneral = validatingRefs.size > 0 && criteria.length <= validatingRefs.size;
-      if (!bound && !coveredByGeneral) {
+      const evidenceIDs = bound.map((e) => e.id);
+
+      if (criterion.spec?.type === "file" && this.validator.checkSpec) {
+        // Independent machine check: the spec, not the model's claim.
+        const check = await this.validator.checkSpec(criterion);
+        proofs.push({
+          criterionID: criterion.id,
+          evidenceIDs,
+          validatorID: "spec.file",
+          verdict: check.valid ? "pass" : "fail",
+          detail: check.reason,
+        });
+        if (!check.valid) unmet.push(`criterion not satisfied: ${criterion.text} (${check.reason})`);
+        continue;
+      }
+
+      if (criterion.spec?.type === "command" || criterion.spec?.type === "test") {
+        // A command criterion is proven by a bound command/test execution that
+        // actually exited with the expected status.
+        const expected = criterion.spec.type === "test" ? 0 : (criterion.spec.expectExit ?? 0);
+        const proof = bound.filter(
+          (e) => (e.kind === "command" || e.kind === "test") && e.exitCode === expected,
+        );
+        if (proof.length === 0) {
+          proofs.push({
+            criterionID: criterion.id,
+            evidenceIDs: [],
+            validatorID: "spec.command",
+            verdict: "fail",
+            detail: `no bound command/test evidence exited ${expected}`,
+          });
+          unmet.push(
+            `criterion not evidenced: ${criterion.text} (no bound command/test exited ${expected})`,
+          );
+        } else {
+          proofs.push({
+            criterionID: criterion.id,
+            evidenceIDs: proof.map((e) => e.id),
+            validatorID: "spec.command",
+            verdict: "pass",
+            detail: `${proof.length} bound run(s) exited ${expected}`,
+          });
+        }
+        continue;
+      }
+
+      if (criterion.spec?.type === "objective") {
+        // An objective-level criterion needs explicitly bound evidence of a
+        // passing test or a real file change. A bare command is not proof.
+        const proof = bound.filter((e) => OBJECTIVE_PROOF_KINDS.has(e.kind as EvidenceKind));
+        if (proof.length === 0) {
+          proofs.push({
+            criterionID: criterion.id,
+            evidenceIDs: [],
+            validatorID: "objective-evidence",
+            verdict: "fail",
+            detail: "no bound passing test or file change",
+          });
+          unmet.push(`criterion not evidenced: ${criterion.text} (no bound passing test or file change)`);
+        } else {
+          proofs.push({
+            criterionID: criterion.id,
+            evidenceIDs: proof.map((e) => e.id),
+            validatorID: "objective-evidence",
+            verdict: "pass",
+            detail: `${proof.length} bound test/file evidence item(s)`,
+          });
+        }
+        continue;
+      }
+
+      // No spec: a manual criterion still requires explicitly bound, valid,
+      // machine-verifiable evidence.
+      if (bound.length === 0) {
+        proofs.push({
+          criterionID: criterion.id,
+          evidenceIDs: [],
+          validatorID: "bound-evidence",
+          verdict: "fail",
+          detail: "no bound, currently-valid evidence",
+        });
         unmet.push(`criterion not evidenced: ${criterion.text}`);
+      } else {
+        proofs.push({
+          criterionID: criterion.id,
+          evidenceIDs,
+          validatorID: "bound-evidence",
+          verdict: "pass",
+          detail: `${bound.length} bound evidence item(s)`,
+        });
       }
     }
+
+    const snapshot = snapshotOf(criteria, evidence);
+    this.store.recordProofs(goalID, proofs, snapshot);
 
     if (unmet.length > 0) {
       return {
         verdict: "incomplete",
         unmet,
         reason: `${unmet.length} condition(s) unsatisfied against current evidence`,
+        proofs,
+        snapshot,
       };
     }
     return {
       verdict: "complete",
       unmet: [],
-      reason: `objective satisfied: ${criteria.length} criteria covered by ${validatingRefs.size} validated evidence item(s)`,
+      reason: `objective satisfied: ${criteria.length} criteria covered by ${verifiable.length} validated evidence item(s)`,
+      proofs,
+      snapshot,
     };
   }
 }

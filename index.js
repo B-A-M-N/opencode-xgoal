@@ -1,6 +1,7 @@
 // src/index.ts
-import { appendFileSync, existsSync, mkdirSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { appendFileSync, existsSync as existsSync2, mkdirSync, readFileSync as readFileSync2 } from "node:fs";
+import { createHash as createHash2 } from "node:crypto";
+import { dirname, isAbsolute as isAbsolute2, join, resolve as resolve2 } from "node:path";
 import { homedir } from "node:os";
 
 // src/controller/store.ts
@@ -119,6 +120,15 @@ CREATE TABLE IF NOT EXISTS goals (
   updated_at_ms            INTEGER NOT NULL,
   completed_at_ms          INTEGER,
   superseded_by            TEXT,
+  -- Verification is only valid for the goal and evidence snapshot it actually
+  -- checked. A stale verifier must not be able to complete a goal whose
+  -- evidence changed underneath it.
+  verification_revision    INTEGER NOT NULL DEFAULT 0,
+  verification_snapshot    TEXT,
+  -- Set when a continuation submission terminally failed. While set, the
+  -- driver refuses to dispatch until recovery clears it, so a terminal
+  -- delivery failure cannot be circumvented by minting a fresh continuation.
+  delivery_failed          INTEGER NOT NULL DEFAULT 0,
   UNIQUE (session_id, generation)
 );
 
@@ -146,6 +156,14 @@ CREATE TABLE IF NOT EXISTS goal_criteria (
   goal_id     TEXT NOT NULL,
   generation  INTEGER NOT NULL,
   text        TEXT NOT NULL,
+  -- Optional machine-checkable spec (JSON). A criterion with a spec is
+  -- verified independently of any evidence the model claims; a criterion
+  -- without one still requires explicitly bound evidence.
+  spec        TEXT,
+  -- Who established the criterion: derived from the objective, an explicit
+  -- user requirement, or a model refinement. Never removed to pass
+  -- verification.
+  source      TEXT NOT NULL DEFAULT 'derived',
   met         INTEGER NOT NULL DEFAULT 0,
   created_at_ms INTEGER NOT NULL
 );
@@ -159,9 +177,69 @@ CREATE TABLE IF NOT EXISTS goal_evidence (
   kind        TEXT NOT NULL,
   ref         TEXT NOT NULL,
   detail      TEXT,
+  -- Persisted so validation can be real rather than trusting the capture:
+  -- command/test/runtime must record the observed exit status, and file
+  -- evidence records a content hash so staleness is detectable. The workspace
+  -- is the session workspace the path resolved against at capture time, so a
+  -- relative path can never be re-checked against the plugin's own cwd.
+  exit_code   INTEGER,
+  hash        TEXT,
+  workspace   TEXT,
   at_ms       INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS goal_evidence_goal ON goal_evidence (goal_id);
+CREATE INDEX IF NOT EXISTS goal_evidence_criterion ON goal_evidence (criterion_id);
+
+-- Per-criterion verification proofs. One row per criterion per verification
+-- attempt, so an accepted proof can never be silently reused for a different
+-- evidence snapshot.
+CREATE TABLE IF NOT EXISTS goal_criterion_proofs (
+  id            TEXT PRIMARY KEY,
+  goal_id       TEXT NOT NULL,
+  generation    INTEGER NOT NULL,
+  criterion_id  TEXT NOT NULL,
+  evidence_ids  TEXT NOT NULL,
+  validator_id  TEXT NOT NULL,
+  verdict       TEXT NOT NULL,
+  detail        TEXT,
+  created_at_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS goal_proofs_goal ON goal_criterion_proofs (goal_id);
+
+-- Durable association between an assistant message and the goal generation
+-- that produced it. This is what lets a tool call be fenced to the generation
+-- it actually belongs to, instead of being resolved from whatever goal is
+-- current when the callback arrives.
+CREATE TABLE IF NOT EXISTS goal_message_generations (
+  session_id TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  at_ms      INTEGER NOT NULL,
+  PRIMARY KEY (session_id, message_id)
+);
+
+-- Blocker claims, one per reporting round. A model can call the blocker tool
+-- many times in one turn; only distinct rounds count as confirmations, so
+-- repetition inside a single execution cannot manufacture a blocker.
+CREATE TABLE IF NOT EXISTS goal_blocker_claims (
+  id           TEXT PRIMARY KEY,
+  goal_id      TEXT NOT NULL,
+  generation   INTEGER NOT NULL,
+  round_number INTEGER NOT NULL,
+  reason       TEXT NOT NULL,
+  at_ms        INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS goal_blocker_goal ON goal_blocker_claims (goal_id);
+
+-- Last observed session-level token total. Usage events report a session
+-- running total, not a per-goal delta, so we persist the total and charge the
+-- difference to whatever goal is active. Without this the goal's budget is
+-- never driven by real usage.
+CREATE TABLE IF NOT EXISTS session_usage (
+  session_id  TEXT PRIMARY KEY,
+  total_tokens INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL
+);
 
 -- Continuation ledger. One row per continuation attempt.
 --
@@ -186,6 +264,10 @@ CREATE TABLE IF NOT EXISTS goal_rounds (
   classification TEXT,
   attempts       INTEGER NOT NULL DEFAULT 1,
   detail         TEXT,
+  -- Number of evidence rows for the goal when this round was prepared. The
+  -- delta at settlement is what distinguishes a round that produced verified
+  -- work from one that merely emitted text: a no-evidence round is not progress.
+  evidence_baseline INTEGER NOT NULL DEFAULT 0,
   prepared_at_ms INTEGER NOT NULL,
   admitted_at_ms INTEGER,
   settled_at_ms  INTEGER
@@ -213,8 +295,14 @@ function toGoal(row) {
     createdAtMs: row.created_at_ms,
     updatedAtMs: row.updated_at_ms,
     completedAtMs: row.completed_at_ms ?? undefined,
-    supersededBy: row.superseded_by ?? undefined
+    supersededBy: row.superseded_by ?? undefined,
+    verificationRevision: row.verification_revision,
+    verificationSnapshot: row.verification_snapshot ?? undefined,
+    deliveryFailed: row.delivery_failed === 1
   };
+}
+function normalizeBlockerReason(reason) {
+  return reason.trim().toLowerCase().replace(/\s+/g, " ").replace(/[.!]+$/g, "");
 }
 var counter = 0;
 function newID(prefix) {
@@ -224,6 +312,7 @@ function newID(prefix) {
 
 class GoalStore {
   db;
+  depth = 0;
   constructor(path) {
     this.db = new Database(path, { create: true });
     this.db.exec("PRAGMA journal_mode = WAL");
@@ -235,6 +324,9 @@ class GoalStore {
     this.db.close();
   }
   tx(fn) {
+    if (this.depth > 0)
+      return fn();
+    this.depth += 1;
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const out = fn();
@@ -245,6 +337,8 @@ class GoalStore {
         this.db.exec("ROLLBACK");
       } catch {}
       throw error;
+    } finally {
+      this.depth -= 1;
     }
   }
   appendEvent(goalID, generation, kind, extra = {}) {
@@ -259,8 +353,15 @@ class GoalStore {
     const row = this.db.query(`SELECT * FROM goals WHERE id = ?`).get(id);
     return row ? toGoal(row) : undefined;
   }
+  byGeneration(sessionID, generation) {
+    const row = this.db.query(`SELECT * FROM goals WHERE session_id = ? AND generation = ?`).get(sessionID, generation);
+    return row ? toGoal(row) : undefined;
+  }
   history(sessionID) {
     return this.db.query(`SELECT * FROM goals WHERE session_id = ? ORDER BY generation DESC`).all(sessionID).map(toGoal);
+  }
+  activeGoals() {
+    return this.db.query(`SELECT * FROM goals WHERE status NOT IN ('complete','superseded') ORDER BY created_at_ms ASC`).all().map(toGoal);
   }
   events(goalID) {
     return this.db.query(`SELECT * FROM goal_events WHERE goal_id = ? ORDER BY seq ASC`).all(goalID).map((r) => ({
@@ -286,7 +387,9 @@ class GoalStore {
       }
       const now = Date.now();
       const id = newID("goal");
-      const generation = 1;
+      const nextGen = this.db.query(`SELECT COALESCE(MAX(generation), 0) + 1 AS next_generation
+           FROM goals WHERE session_id = ?`).get(input.sessionID).next_generation;
+      const generation = nextGen;
       this.db.query(`INSERT INTO goals (id, session_id, generation, objective, status, rounds,
              no_progress_rounds, repeated_blocker_rounds, token_budget, version,
              created_at_ms, updated_at_ms)
@@ -296,6 +399,9 @@ class GoalStore {
         actor: input.actor ?? "user",
         detail: input.objective.trim().slice(0, 200)
       });
+      for (const criterion of input.criteria ?? []) {
+        this.insertCriterion(id, generation, criterion, now);
+      }
       return this.byID(id);
     });
   }
@@ -331,6 +437,9 @@ class GoalStore {
         actor: input.actor ?? "user",
         detail: `replaces ${existing.id} (generation ${existing.generation})`
       });
+      for (const criterion of input.criteria ?? []) {
+        this.insertCriterion(newIDValue, nextGeneration, criterion, now);
+      }
       return this.byID(newIDValue);
     });
   }
@@ -410,37 +519,152 @@ class GoalStore {
       return this.byID(goal.id);
     });
   }
-  addCriterion(goalID, text) {
+  insertCriterion(goalID, generation, input, atMs) {
+    const id = newID("crit");
+    this.db.query(`INSERT INTO goal_criteria (id, goal_id, generation, text, spec, source, met, created_at_ms)
+         VALUES (?, ?, ?, ?, ?, ?, 0, ?)`).run(id, goalID, generation, input.text.trim(), input.spec ? JSON.stringify(input.spec) : null, input.source ?? "user", atMs);
+    return id;
+  }
+  addCriterion(goalID, text, spec, source = "user") {
     const goal = this.byID(goalID);
     if (!goal)
       throw new GoalConflictError(`unknown goal ${goalID}`);
     if (!isNonTerminal(goal.status)) {
       throw new TransitionRejectedError(`cannot add criteria to terminal goal ${goalID}`);
     }
+    let id = "";
     this.tx(() => {
-      this.db.query(`INSERT INTO goal_criteria (id, goal_id, generation, text, met, created_at_ms)
-           VALUES (?, ?, ?, ?, 0, ?)`).run(newID("crit"), goalID, goal.generation, text, Date.now());
+      id = this.insertCriterion(goalID, goal.generation, { text, spec, source }, Date.now());
     });
+    return id;
   }
   addEvidence(input) {
     const goal = this.byID(input.goalID);
     if (!goal)
       throw new GoalConflictError(`unknown goal ${input.goalID}`);
     this.tx(() => {
-      this.db.query(`INSERT INTO goal_evidence (id, goal_id, generation, criterion_id, kind, ref, detail, at_ms)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(newID("ev"), input.goalID, goal.generation, input.criterionID ?? null, input.kind, input.ref, input.detail ?? null, Date.now());
+      this.db.query(`INSERT INTO goal_evidence (id, goal_id, generation, criterion_id, kind, ref, detail, exit_code, hash, workspace, at_ms)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(newID("ev"), input.goalID, goal.generation, input.criterionID ?? null, input.kind, input.ref, input.detail ?? null, input.exitCode ?? null, input.hash ?? null, input.workspace ?? null, Date.now());
     });
   }
   listCriteria(goalID) {
-    return this.db.query(`SELECT id, text, met FROM goal_criteria WHERE goal_id = ? ORDER BY created_at_ms ASC`).all(goalID).map((r) => ({ id: r.id, text: r.text, met: r.met === 1 }));
+    return this.db.query(`SELECT id, text, met, spec, source FROM goal_criteria WHERE goal_id = ? ORDER BY created_at_ms ASC`).all(goalID).map((r) => ({
+      id: r.id,
+      text: r.text,
+      met: r.met === 1,
+      spec: r.spec ? JSON.parse(r.spec) : undefined,
+      source: r.source
+    }));
   }
   listEvidence(goalID) {
-    return this.db.query(`SELECT id, criterion_id, kind, ref FROM goal_evidence WHERE goal_id = ? ORDER BY at_ms ASC`).all(goalID).map((r) => ({
+    return this.db.query(`SELECT id, criterion_id, kind, ref, exit_code, hash, workspace
+           FROM goal_evidence WHERE goal_id = ? ORDER BY at_ms ASC`).all(goalID).map((r) => ({
       id: r.id,
       criterionID: r.criterion_id ?? undefined,
       kind: r.kind,
-      ref: r.ref
+      ref: r.ref,
+      exitCode: r.exit_code ?? undefined,
+      hash: r.hash ?? undefined,
+      workspace: r.workspace ?? undefined
     }));
+  }
+  bindEvidence(criterionID, evidenceIDs) {
+    return this.tx(() => {
+      const criterion = this.db.query(`SELECT id, goal_id FROM goal_criteria WHERE id = ?`).get(criterionID);
+      if (!criterion)
+        throw new GoalConflictError(`unknown criterion ${criterionID}`);
+      let bound = 0;
+      for (const evidenceID of evidenceIDs) {
+        const updated = this.db.query(`UPDATE goal_evidence SET criterion_id = ?
+              WHERE id = ? AND goal_id = ?`).run(criterionID, evidenceID, criterion.goal_id);
+        bound += updated.changes;
+      }
+      return bound;
+    });
+  }
+  recordProofs(goalID, proofs, snapshot) {
+    this.tx(() => {
+      const goal = this.byID(goalID);
+      if (!goal)
+        throw new GoalConflictError(`unknown goal ${goalID}`);
+      const now = Date.now();
+      for (const proof of proofs) {
+        this.db.query(`INSERT INTO goal_criterion_proofs
+               (id, goal_id, generation, criterion_id, evidence_ids, validator_id, verdict, detail, created_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(newID("proof"), goalID, goal.generation, proof.criterionID, JSON.stringify(proof.evidenceIDs), proof.validatorID, proof.verdict, proof.detail, now);
+      }
+      this.db.query(`UPDATE goals
+              SET verification_revision = verification_revision + 1,
+                  verification_snapshot = ?,
+                  updated_at_ms = ?,
+                  version = version + 1
+            WHERE id = ? AND version = ?`).run(snapshot, now, goalID, goal.version);
+    });
+  }
+  listProofs(goalID) {
+    return this.db.query(`SELECT id, criterion_id, evidence_ids, validator_id, verdict, detail
+           FROM goal_criterion_proofs WHERE goal_id = ? ORDER BY created_at_ms ASC`).all(goalID).map((r) => ({
+      id: r.id,
+      criterionID: r.criterion_id,
+      evidenceIDs: JSON.parse(r.evidence_ids),
+      validatorID: r.validator_id,
+      verdict: r.verdict,
+      detail: r.detail ?? undefined
+    }));
+  }
+  rememberMessageGeneration(sessionID, messageID, generation, atMs) {
+    this.tx(() => {
+      this.db.query(`INSERT INTO goal_message_generations (session_id, message_id, generation, at_ms)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(session_id, message_id) DO NOTHING`).run(sessionID, messageID, generation, atMs);
+    });
+  }
+  resolveMessageGeneration(sessionID, messageID) {
+    const row = this.db.query(`SELECT generation FROM goal_message_generations WHERE session_id = ? AND message_id = ?`).get(sessionID, messageID);
+    return row?.generation;
+  }
+  recordBlockerClaim(input) {
+    return this.tx(() => {
+      const normalized = normalizeBlockerReason(input.reason);
+      this.db.query(`INSERT INTO goal_blocker_claims (id, goal_id, generation, round_number, reason, at_ms)
+           VALUES (?, ?, ?, ?, ?, ?)`).run(newID("blk"), input.goalID, input.generation, input.roundNumber, normalized, Date.now());
+      const row = this.db.query(`SELECT COUNT(DISTINCT round_number) AS n
+             FROM goal_blocker_claims
+            WHERE goal_id = ? AND generation = ? AND reason = ?`).get(input.goalID, input.generation, normalized);
+      return row.n;
+    });
+  }
+  blockerConfirmations(goalID, generation, reason) {
+    const row = this.db.query(`SELECT COUNT(DISTINCT round_number) AS n
+           FROM goal_blocker_claims
+          WHERE goal_id = ? AND generation = ? AND reason = ?`).get(goalID, generation, normalizeBlockerReason(reason));
+    return row.n;
+  }
+  recordSessionUsage(sessionID, totalTokens) {
+    return this.tx(() => {
+      const previous = this.db.query(`SELECT total_tokens FROM session_usage WHERE session_id = ?`).get(sessionID)?.total_tokens ?? 0;
+      const delta = Math.max(0, Math.floor(totalTokens) - previous);
+      this.db.query(`INSERT INTO session_usage (session_id, total_tokens, updated_at_ms)
+           VALUES (?, ?, ?)
+           ON CONFLICT(session_id) DO UPDATE SET
+             total_tokens = excluded.total_tokens,
+             updated_at_ms = excluded.updated_at_ms`).run(sessionID, Math.floor(totalTokens), Date.now());
+      const current = this.current(sessionID);
+      if (!delta || !current || !isNonTerminal(current.status)) {
+        return { goal: current, delta };
+      }
+      this.db.query(`UPDATE goals SET tokens_used = COALESCE(tokens_used, 0) + ?, updated_at_ms = ? WHERE id = ?`).run(delta, Date.now(), current.id);
+      return { goal: this.byID(current.id), delta };
+    });
+  }
+  setTokenBudget(goalID, budget) {
+    return this.tx(() => {
+      this.db.query(`UPDATE goals SET token_budget = ?, updated_at_ms = ? WHERE id = ?`).run(budget === undefined ? null : Math.floor(budget), Date.now(), goalID);
+      const goal = this.byID(goalID);
+      if (!goal)
+        throw new GoalConflictError(`unknown goal ${goalID}`);
+      return goal;
+    });
   }
   reconcileAfterRestart() {
     return this.tx(() => {
@@ -476,8 +700,10 @@ class GoalStore {
       }
       const id = newID("round");
       const now = Date.now();
-      this.db.query(`INSERT INTO goal_rounds (id, goal_id, generation, inbox_id, status, attempts, prepared_at_ms)
-           VALUES (?, ?, ?, ?, 'prepared', 1, ?)`).run(id, input.goalID, input.generation, input.inboxID, now);
+      const baseline = this.db.query(`SELECT COUNT(*) AS n FROM goal_evidence WHERE goal_id = ?`).get(input.goalID).n;
+      this.db.query(`INSERT INTO goal_rounds
+             (id, goal_id, generation, inbox_id, status, attempts, evidence_baseline, prepared_at_ms)
+           VALUES (?, ?, ?, ?, 'prepared', 1, ?, ?)`).run(id, input.goalID, input.generation, input.inboxID, baseline, now);
       this.appendEvent(input.goalID, input.generation, "round-prepared", {
         actor: "controller",
         detail: input.inboxID
@@ -512,7 +738,11 @@ class GoalStore {
       const round = this.roundByID(roundID);
       if (!round)
         throw new GoalConflictError(`unknown round ${roundID}`);
-      this.db.query(`UPDATE goal_rounds SET status='admitted', admitted_at_ms=? WHERE id=? AND status='prepared'`).run(Date.now(), roundID);
+      const updated = this.db.query(`UPDATE goal_rounds SET status='admitted', admitted_at_ms=?
+            WHERE id=? AND status IN ('prepared','unknown')`).run(Date.now(), roundID);
+      if (updated.changes !== 1) {
+        throw new GoalConflictError(`cannot admit round ${roundID}: expected prepared/unknown, found ${round.status}`);
+      }
       this.appendEvent(round.goalID, round.generation, "round-admitted", {
         actor: "controller",
         detail: round.inboxID
@@ -549,6 +779,11 @@ class GoalStore {
       if (!round)
         throw new GoalConflictError(`unknown round ${roundID}`);
       this.db.query(`UPDATE goal_rounds SET status='failed', detail=?, settled_at_ms=? WHERE id=?`).run(detail, Date.now(), roundID);
+      const goal = this.byID(round.goalID);
+      if (goal) {
+        this.db.query(`UPDATE goals SET delivery_failed=1, updated_at_ms=?, version=version+1
+              WHERE id=? AND version=?`).run(Date.now(), goal.id, goal.version);
+      }
       this.appendEvent(round.goalID, round.generation, "round-failed", {
         actor: "controller",
         detail
@@ -556,11 +791,29 @@ class GoalStore {
       return this.roundByID(roundID);
     });
   }
+  clearDeliveryFailure(goalID) {
+    return this.tx(() => {
+      const goal = this.byID(goalID);
+      if (!goal)
+        return;
+      if (!goal.deliveryFailed)
+        return goal;
+      this.db.query(`UPDATE goals SET delivery_failed=0, updated_at_ms=?, version=version+1
+            WHERE id=? AND version=?`).run(Date.now(), goal.id, goal.version);
+      this.appendEvent(goal.id, goal.generation, "delivery-recovered", {
+        actor: "controller",
+        detail: "terminal delivery failure cleared"
+      });
+      return this.byID(goal.id);
+    });
+  }
   settleRound(input) {
     return this.tx(() => {
       const round = this.roundByID(input.roundID);
       if (!round)
         throw new GoalConflictError(`unknown round ${input.roundID}`);
+      if (round.status === "settled")
+        return round;
       this.db.query(`UPDATE goal_rounds SET status='settled', classification=?, detail=?, settled_at_ms=? WHERE id=?`).run(input.classification, input.detail ?? null, Date.now(), input.roundID);
       this.appendEvent(round.goalID, round.generation, "round-settled", {
         actor: "controller",
@@ -568,6 +821,67 @@ class GoalStore {
       });
       return this.roundByID(input.roundID);
     });
+  }
+  settleAndRecord(input) {
+    return this.tx(() => {
+      const before = this.roundByID(input.roundID);
+      if (!before)
+        throw new GoalConflictError(`unknown round ${input.roundID}`);
+      if (before.status === "settled")
+        return { round: before };
+      this.settleRound(input);
+      const goal = this.recordRound({
+        goalID: before.goalID,
+        generation: before.generation,
+        classification: input.classification,
+        detail: input.detail,
+        tokensUsed: input.tokensUsed
+      });
+      return { round: this.roundByID(input.roundID), goal };
+    });
+  }
+  completeGoal(input) {
+    return this.tx(() => {
+      const goal = this.byID(input.goalID);
+      if (!goal)
+        throw new GoalConflictError(`unknown goal ${input.goalID}`);
+      if (goal.generation !== input.generation) {
+        throw new GoalConflictError(`stale generation: ${input.goalID} is generation ${goal.generation}, completion claimed ${input.generation}`);
+      }
+      if (goal.status !== "verifying") {
+        throw new TransitionRejectedError(`cannot complete goal ${input.goalID} from status ${goal.status}; verification is required first`);
+      }
+      if (input.snapshot !== undefined && goal.verificationSnapshot !== input.snapshot) {
+        throw new GoalConflictError(`verification snapshot mismatch: the verifier checked ${goal.verificationSnapshot ?? "none"}, ` + `this completion claims ${input.snapshot}`);
+      }
+      const outstanding = this.outstandingRound(input.goalID);
+      if (outstanding) {
+        this.settleRound({
+          roundID: outstanding.id,
+          classification: input.settleClassification,
+          detail: input.reason
+        });
+        this.recordRound({
+          goalID: input.goalID,
+          generation: input.generation,
+          classification: input.settleClassification,
+          detail: input.reason
+        });
+      }
+      return this.transition({
+        goalID: input.goalID,
+        generation: input.generation,
+        to: "complete",
+        actor: "controller",
+        reason: input.reason
+      });
+    });
+  }
+  generationAt(sessionID, atMs) {
+    const row = this.db.query(`SELECT generation FROM goals
+          WHERE session_id = ? AND created_at_ms <= ?
+          ORDER BY created_at_ms DESC LIMIT 1`).get(sessionID, atMs);
+    return row?.generation;
   }
 }
 function toRound(r) {
@@ -579,6 +893,7 @@ function toRound(r) {
     status: r.status,
     classification: r.classification ?? undefined,
     attempts: r.attempts,
+    evidenceBaseline: r.evidence_baseline,
     detail: r.detail ?? undefined,
     preparedAtMs: r.prepared_at_ms,
     admittedAtMs: r.admitted_at_ms ?? undefined,
@@ -586,15 +901,140 @@ function toRound(r) {
   };
 }
 
+// src/controller/criteria.ts
+var FILE_NAME = "[\\w./\\-]+\\.[A-Za-z0-9]+";
+var PATH_TOKEN = "(`[^`]+`|\"[^\"]+\"|'[^']+'|[^\\s,;]+)";
+var CONTENT_TOKEN = "(`[^`]+`|\"[^\"]+\"|'[^']+'|[^.;\\n]+)";
+var PATH_NAME = `(${FILE_NAME}|\`[^\`]+\`|"[^"]+"|'[^']+')`;
+var FILE_PATTERNS = [
+  {
+    re: new RegExp(`(?:create|write|make|add)\\s+(?:a\\s+|the\\s+)?(?:file\\s+)?(?:called\\s+|named\\s+)?${PATH_TOKEN}\\s+(?:containing|with|that contains|that has|must contain|contains)\\s+(?:exactly:?\\s+)?${CONTENT_TOKEN}`, "gi"),
+    build: (m) => {
+      const path = strip(m[1]);
+      const content = strip(m[2]);
+      if (!path)
+        return;
+      return { type: "file", path, contains: content || undefined };
+    }
+  },
+  {
+    re: new RegExp(`write\\s+${CONTENT_TOKEN}\\s+(?:to|into)\\s+${PATH_TOKEN}`, "gi"),
+    build: (m) => {
+      const content = strip(m[1]);
+      const path = strip(m[2]);
+      if (!path)
+        return;
+      return { type: "file", path, contains: content || undefined };
+    }
+  },
+  {
+    re: new RegExp(`${FILE_NAME}\\s+(?:must\\s+)?(?:contain|include|have)\\s+(?:exactly:?\\s+)?${CONTENT_TOKEN}`, "gi"),
+    build: (m) => {
+      const path = strip(m[0].split(/\s+/)[0]);
+      const content = strip(m[1]);
+      if (!path)
+        return;
+      return { type: "file", path, contains: content || undefined };
+    }
+  },
+  {
+    re: new RegExp(`(?:create|write|make|add)\\s+(?:a\\s+|the\\s+)?(?:file\\s+)?(?:called\\s+|named\\s+)?${PATH_NAME}`, "gi"),
+    build: (m) => {
+      const path = strip(m[1]);
+      if (!path)
+        return;
+      return { type: "file", path };
+    }
+  }
+];
+function strip(value) {
+  if (!value)
+    return "";
+  const trimmed = value.trim();
+  if (/^([`"']).*\1$/s.test(trimmed))
+    return trimmed.slice(1, -1).trim();
+  return trimmed.replace(/[.!?]+$/, "");
+}
+function deriveCriteria(objective) {
+  const text = objective.trim();
+  if (!text)
+    return [];
+  const rawLines = text.split(/\n+/);
+  const listLines = rawLines.filter((line) => /^\s*(?:\d+[.)]|[-*+])\s*/.test(line)).map((line) => line.replace(/^\s*(?:\d+[.)]|[-*+])\s*/, "").trim()).filter((line) => line.length > 0);
+  const allLines = rawLines.map((line) => line.replace(/^\s*(?:\d+[.)]|[-*+])\s*/, "").trim()).filter((line) => line.length > 0);
+  const enumerated = listLines.length > 1 && listLines.length >= Math.ceil(allLines.length / 2);
+  const criteria = [];
+  const seen = new Set;
+  const push = (criterionText, spec) => {
+    const key = `${spec.type}::${criterionText}`;
+    if (seen.has(key))
+      return;
+    seen.add(key);
+    criteria.push({ text: criterionText, spec, source: "derived" });
+  };
+  const targets = enumerated ? listLines : [text];
+  const contentPaths = new Set;
+  for (const target of targets) {
+    let matched = false;
+    for (const { re, build } of FILE_PATTERNS) {
+      for (const match of target.matchAll(re)) {
+        const spec = build(match);
+        if (!spec || spec.type !== "file")
+          continue;
+        const content = "contains" in spec ? spec.contains : undefined;
+        if (!content)
+          continue;
+        matched = true;
+        contentPaths.add(spec.path);
+        push(`${spec.path} contains ${content}`, spec);
+        if (criteria.length >= 8)
+          break;
+      }
+      if (criteria.length >= 8)
+        break;
+    }
+    if (criteria.length < 8) {
+      for (const { re, build } of FILE_PATTERNS) {
+        if (criteria.length >= 8)
+          break;
+        for (const match of target.matchAll(re)) {
+          const spec = build(match);
+          if (!spec || spec.type !== "file")
+            continue;
+          if ("contains" in spec && spec.contains)
+            continue;
+          if (contentPaths.has(spec.path))
+            continue;
+          matched = true;
+          push(`${spec.path} exists`, spec);
+          if (criteria.length >= 8)
+            break;
+        }
+      }
+    }
+    if (!matched) {
+      push(`The requirement is achieved: ${target}`, { type: "objective" });
+    }
+    if (criteria.length >= 8)
+      break;
+  }
+  if (criteria.length === 0) {
+    push(`The objective is achieved: ${text}`, { type: "objective" });
+  }
+  return criteria;
+}
+
 // src/controller/controller.ts
 class GoalController {
   store;
   maxNoProgressRounds;
   minBlockerConfirmations;
+  deriveCriteria;
   constructor(options) {
     this.store = new GoalStore(options.dbPath);
     this.maxNoProgressRounds = options.maxNoProgressRounds ?? 3;
     this.minBlockerConfirmations = options.minBlockerConfirmations ?? 2;
+    this.deriveCriteria = options.deriveCriteria ?? deriveCriteria;
   }
   close() {
     this.store.close();
@@ -602,22 +1042,33 @@ class GoalController {
   reconcileStartup() {
     return this.store.reconcileAfterRestart();
   }
+  criteriaFor(objective) {
+    return this.deriveCriteria(objective);
+  }
   startOrDescribe(sessionID, objective) {
     const existing = this.store.current(sessionID);
     if (existing)
       return { existing };
-    return { created: this.store.create({ sessionID, objective, actor: "user" }) };
+    const goal = this.store.create({
+      sessionID,
+      objective,
+      actor: "user",
+      criteria: this.criteriaFor(objective)
+    });
+    return { created: goal };
   }
   replace(sessionID, objective, expectedGeneration) {
     const existing = this.store.current(sessionID);
+    const criteria = this.criteriaFor(objective);
     if (!existing) {
-      return this.store.create({ sessionID, objective, actor: "user" });
+      return this.store.create({ sessionID, objective, actor: "user", criteria });
     }
     return this.store.replace({
       sessionID,
       expectedGeneration: expectedGeneration ?? existing.generation,
       objective,
-      actor: "user"
+      actor: "user",
+      criteria
     });
   }
   pause(sessionID) {
@@ -631,16 +1082,86 @@ class GoalController {
   }
   resume(sessionID) {
     const goal = this.requireCurrent(sessionID);
-    return this.store.transition({
+    const resumed = this.store.transition({
       goalID: goal.id,
       generation: goal.generation,
       to: "active",
       actor: "user",
       reason: "resumed by user"
     });
+    if (resumed.deliveryFailed)
+      this.store.clearDeliveryFailure(resumed.id);
+    return this.store.byID(resumed.id) ?? resumed;
   }
   status(sessionID) {
     return this.store.current(sessionID);
+  }
+  recordUsage(sessionID, totalTokens) {
+    return this.store.recordSessionUsage(sessionID, totalTokens).goal;
+  }
+  setBudget(sessionID, budget) {
+    const goal = this.requireCurrent(sessionID);
+    return this.store.setTokenBudget(goal.id, budget);
+  }
+  health(sessionID) {
+    const goal = this.store.current(sessionID);
+    if (!goal)
+      return { ok: true, goal: null };
+    const criteria = this.store.listCriteria(goal.id);
+    const evidence = this.store.listEvidence(goal.id);
+    const round = this.store.outstandingRound(goal.id);
+    const rounds = this.store.roundsFor(goal.id);
+    const last = rounds[rounds.length - 1];
+    const stuckMs = round ? Date.now() - round.preparedAtMs : 0;
+    const problems = [];
+    if (goal.status === "active" && !round) {
+      problems.push("active goal has no outstanding round: nothing is driving it");
+    }
+    if (goal.deliveryFailed) {
+      problems.push("continuation delivery failed; automatic dispatch is halted");
+    }
+    if (round && round.attempts > 3) {
+      problems.push(`round ${round.id} has ${round.attempts} submission attempts`);
+    }
+    if (round && stuckMs > 5 * 60000) {
+      problems.push(`round ${round.id} has been outstanding for ${Math.round(stuckMs / 1000)}s`);
+    }
+    if (goal.status === "verifying") {
+      const unmet = criteria.filter((criterion) => !criterion.met);
+      if (unmet.length)
+        problems.push(`${unmet.length} unmet criterion/criteria during verification`);
+    }
+    return {
+      ok: problems.length === 0,
+      goal: {
+        id: goal.id,
+        generation: goal.generation,
+        status: goal.status,
+        objective: goal.objective
+      },
+      drive: {
+        outstandingRound: round ? { id: round.id, status: round.status, attempts: round.attempts, ageMs: stuckMs } : null,
+        lastRound: last ? { id: last.id, status: last.status, classification: last.classification ?? null } : null,
+        deliveryFailed: goal.deliveryFailed,
+        rounds: goal.rounds,
+        noProgressRounds: goal.noProgressRounds
+      },
+      usage: {
+        tokensUsed: goal.tokensUsed ?? 0,
+        tokenBudget: goal.tokenBudget ?? null
+      },
+      verification: {
+        criteria: criteria.map((criterion) => ({
+          id: criterion.id,
+          text: criterion.text,
+          met: criterion.met,
+          source: criterion.source
+        })),
+        evidenceCount: evidence.length,
+        verificationRevision: goal.verificationRevision
+      },
+      problems
+    };
   }
   history(sessionID) {
     return this.store.history(sessionID);
@@ -648,21 +1169,57 @@ class GoalController {
   get(sessionID) {
     return this.store.current(sessionID);
   }
+  bindCriterionEvidence(goalID, criterionID, refs) {
+    const evidence = this.store.listEvidence(goalID);
+    const chosen = new Set;
+    for (const ref of refs) {
+      const byID = evidence.find((e) => e.id === ref);
+      if (byID) {
+        chosen.add(byID.id);
+        continue;
+      }
+      const exact = evidence.filter((e) => e.ref === ref);
+      if (exact.length > 0) {
+        for (const e of exact)
+          chosen.add(e.id);
+        continue;
+      }
+      const candidate = ref.includes("/") || ref.includes("\\") ? evidence.filter((e) => e.ref.endsWith(ref) || e.ref.endsWith(`/${ref}`)) : evidence.filter((e) => e.kind === "file" && e.ref.split("/").pop() === ref);
+      if (candidate.length > 0 && new Set(candidate.map((e) => e.ref)).size === 1) {
+        for (const e of candidate)
+          chosen.add(e.id);
+      }
+    }
+    if (chosen.size === 0)
+      return 0;
+    return this.store.bindEvidence(criterionID, [...chosen]);
+  }
   checkpoint(sessionID, input) {
     const target = this.resolveTarget(sessionID, input);
     if (!target.ok)
       return { recorded: false, rejected: target.rejected };
     const goal = target.goal;
     for (const ref of input.evidenceRefs ?? []) {
-      this.store.addEvidence({ goalID: goal.id, kind: "ref", ref, detail: input.summary });
+      this.store.addEvidence({
+        goalID: goal.id,
+        criterionID: input.criterionID,
+        kind: "ref",
+        ref,
+        detail: input.summary
+      });
     }
-    const updated = this.store.recordRound({
-      goalID: goal.id,
-      generation: goal.generation,
-      classification: "progress",
-      detail: input.summary.slice(0, 300)
-    });
-    return { recorded: true, goal: updated };
+    return { recorded: true, goal: this.store.byID(goal.id) };
+  }
+  addCriterion(sessionID, input) {
+    const target = this.resolveTarget(sessionID, input);
+    if (!target.ok)
+      return { rejected: target.rejected };
+    try {
+      const criterionID = this.store.addCriterion(target.goal.id, input.text, input.spec, "model");
+      return { criterionID };
+    } catch (error) {
+      return { rejected: String(error) };
+    }
   }
   proposeComplete(sessionID, input) {
     const target = this.resolveTarget(sessionID, input);
@@ -671,6 +1228,9 @@ class GoalController {
     const goal = target.goal;
     for (const ref of input.evidenceRefs ?? []) {
       this.store.addEvidence({ goalID: goal.id, kind: "ref", ref, detail: input.summary });
+    }
+    for (const binding of input.criteria ?? []) {
+      this.bindCriterionEvidence(goal.id, binding.criterionID, binding.evidenceRefs);
     }
     const updated = this.store.transition({
       goalID: goal.id,
@@ -690,16 +1250,20 @@ class GoalController {
     for (const ref of report.evidenceRefs ?? []) {
       this.store.addEvidence({ goalID: goal.id, kind: "blocker-ref", ref, detail: report.reason });
     }
-    const counted = this.store.recordRound({
+    const roundNumber = goal.rounds + 1;
+    const confirmations = this.store.recordBlockerClaim({
       goalID: goal.id,
       generation: goal.generation,
-      classification: "blocked",
-      detail: report.reason.slice(0, 300)
+      roundNumber,
+      reason: report.reason
     });
-    const confirmations = counted.repeatedBlockerRounds;
-    const genuine = report.externalDependency === true || confirmations >= this.minBlockerConfirmations;
+    const genuine = confirmations >= this.minBlockerConfirmations;
     if (!genuine) {
-      return { goal: counted, accepted: false, confirmations };
+      return {
+        goal: this.store.byID(goal.id),
+        accepted: false,
+        confirmations
+      };
     }
     const blocked = this.store.transition({
       goalID: goal.id,
@@ -747,34 +1311,20 @@ class GoalController {
     }
     return goal;
   }
-  commitComplete(goalID, generation, reason) {
-    const outstanding = this.store.outstandingRound(goalID);
-    if (outstanding) {
-      try {
-        this.store.settleRound({
-          roundID: outstanding.id,
-          classification: "complete",
-          detail: reason
-        });
-        this.store.recordRound({
-          goalID,
-          generation,
-          classification: "complete",
-          detail: reason
-        });
-      } catch {}
-    }
-    return this.store.transition({
+  commitComplete(goalID, generation, reason, snapshot) {
+    return this.store.completeGoal({
       goalID,
       generation,
-      to: "complete",
-      actor: "controller",
-      reason
+      reason,
+      snapshot,
+      settleClassification: "complete"
     });
   }
-  rejectCompletion(sessionID, reason) {
-    const goal = this.store.current(sessionID);
+  rejectCompletion(goalID, generation, reason) {
+    const goal = this.store.byID(goalID);
     if (!goal || goal.status !== "verifying")
+      return goal;
+    if (goal.generation !== generation)
       return goal;
     return this.store.transition({
       goalID: goal.id,
@@ -797,13 +1347,25 @@ class GoalController {
     if (!isNonTerminal(current.status)) {
       return { ok: false, rejected: `goal is ${current.status}` };
     }
-    if (ref?.goalID !== undefined && ref.goalID !== current.id) {
+    if (!ref?.goalID) {
+      return {
+        ok: false,
+        rejected: `unresolved goal reference: the tool call must name the current goal (${current.id})`
+      };
+    }
+    if (ref.goalID !== current.id) {
       return {
         ok: false,
         rejected: `stale goal reference: ${ref.goalID} is not the current goal (${current.id})`
       };
     }
-    if (ref?.generation !== undefined && ref.generation !== current.generation) {
+    if (ref.generation === undefined) {
+      return {
+        ok: false,
+        rejected: `unresolved generation: the tool call must name generation ${current.generation}`
+      };
+    }
+    if (ref.generation !== current.generation) {
       return {
         ok: false,
         rejected: `stale generation: callback claimed ${ref.generation}, current is ${current.generation}`
@@ -813,7 +1375,55 @@ class GoalController {
   }
 }
 
+// src/controller/coordinator.ts
+class GoalCoordinator {
+  controller;
+  dispatcher;
+  constructor(controller, dispatcher) {
+    this.controller = controller;
+    this.dispatcher = dispatcher;
+  }
+  async start(sessionID, objective) {
+    const out = this.controller.startOrDescribe(sessionID, objective);
+    if ("existing" in out)
+      return { existing: out.existing };
+    const drive = await this.drive(sessionID);
+    return { created: out.created, drive };
+  }
+  async replace(sessionID, objective, expectedGeneration) {
+    const goal = this.controller.replace(sessionID, objective, expectedGeneration);
+    const drive = await this.drive(sessionID);
+    return { goal, drive };
+  }
+  async resume(sessionID) {
+    const goal = this.controller.resume(sessionID);
+    const drive = await this.drive(sessionID);
+    return { goal, drive };
+  }
+  pause(sessionID) {
+    return this.controller.pause(sessionID);
+  }
+  async drive(sessionID) {
+    const dispatcher = this.dispatcher();
+    if (!dispatcher)
+      return;
+    try {
+      return await dispatcher.drive(sessionID);
+    } catch {
+      return;
+    }
+  }
+}
+
 // src/controller/driver.ts
+var DEFAULT_CLASSIFY = ({
+  evidenceDelta
+}) => {
+  if (evidenceDelta > 0) {
+    return { classification: "progress", detail: `${evidenceDelta} new evidence item(s)` };
+  }
+  return { classification: "noProgress", detail: "no new evidence captured this round" };
+};
 var seq = 0;
 function newInboxID() {
   seq += 1;
@@ -838,14 +1448,25 @@ class GoalDriver {
   maxNoProgressRounds;
   maxRoundAttempts;
   render;
+  classify;
   constructor(store, transport, options = {}) {
     this.store = store;
     this.transport = transport;
     this.maxNoProgressRounds = options.maxNoProgressRounds ?? 3;
     this.maxRoundAttempts = options.maxRoundAttempts ?? 5;
     this.render = options.renderContinuation ?? DEFAULT_CONTINUATION;
+    this.classify = options.classify ?? DEFAULT_CLASSIFY;
   }
   async drive(sessionID) {
+    const goal = this.store.current(sessionID);
+    if (goal && goal.status === "active") {
+      const outstanding = this.store.outstandingRound(goal.id);
+      if (outstanding) {
+        const outcome = await this.reconcileRound(outstanding);
+        if (outcome.action !== "reconcile")
+          return outcome;
+      }
+    }
     const decision = this.reserve(sessionID);
     if (decision.action !== "dispatch")
       return decision.outcome;
@@ -866,6 +1487,12 @@ class GoalDriver {
       return {
         action: "done",
         outcome: { action: "reconcile", roundID: outstanding.id, status: outstanding.status }
+      };
+    }
+    if (goal.deliveryFailed) {
+      return {
+        action: "done",
+        outcome: { action: "idle", reason: "delivery failed; awaiting recovery" }
       };
     }
     if (goal.tokenBudget !== undefined && (goal.tokensUsed ?? 0) >= goal.tokenBudget) {
@@ -898,7 +1525,12 @@ class GoalDriver {
         sessionID,
         inboxID: round.inboxID,
         text: this.render(goal),
-        metadata: { goalID: goal.id, generation: goal.generation, roundID: round.id }
+        metadata: {
+          goalID: goal.id,
+          generation: goal.generation,
+          roundID: round.id,
+          inboxID: round.inboxID
+        }
       });
       if (result.ok) {
         this.store.markRoundAdmitted(round.id);
@@ -931,6 +1563,11 @@ class GoalDriver {
     for (const round of this.store.outstandingRounds()) {
       out.push(await this.reconcileRound(round));
     }
+    for (const goal of this.store.activeGoals()) {
+      if (goal.deliveryFailed && !this.store.outstandingRound(goal.id)) {
+        this.store.clearDeliveryFailure(goal.id);
+      }
+    }
     return out;
   }
   async reconcileRound(round) {
@@ -954,8 +1591,39 @@ class GoalDriver {
       case "running":
         this.store.markRoundRunning(round.id);
         return { action: "reconcile", roundID: round.id, status: "running" };
-      case "settled":
-        return { action: "reconcile", roundID: round.id, status: "settled" };
+      case "settled": {
+        const evidenceCount = this.store.listEvidence(goal.id).length;
+        const evidenceDelta = Math.max(0, evidenceCount - round.evidenceBaseline);
+        const verdict = this.classify({ goal, round, evidenceCount, evidenceDelta });
+        const settledGoal = this.settleRound({
+          roundID: round.id,
+          classification: verdict.classification,
+          detail: verdict.detail
+        });
+        const settledStatus = settledGoal?.status ?? round.status;
+        const after = this.store.byID(goal.id);
+        if (!after || !isNonTerminal(after.status)) {
+          return { action: "reconcile", roundID: round.id, status: settledStatus };
+        }
+        if (after.generation !== round.generation) {
+          return { action: "reconcile", roundID: round.id, status: settledStatus };
+        }
+        const stalled = verdict.classification === "noProgress" && after.noProgressRounds >= this.maxNoProgressRounds && after.status === "active";
+        if (stalled) {
+          const parked = this.store.transition({
+            goalID: after.id,
+            generation: after.generation,
+            to: "stalled",
+            actor: "controller",
+            reason: `${after.noProgressRounds} consecutive rounds without progress`
+          });
+          return { action: "reconcile", roundID: round.id, status: parked.status };
+        }
+        const next = this.reserve(after.sessionID);
+        if (next.action === "dispatch")
+          return this.dispatch(next.round, after.sessionID);
+        return next.outcome;
+      }
       case "notDelivered": {
         try {
           this.store.markRoundUnknown(round.id, "not delivered; retrying with original id");
@@ -972,18 +1640,13 @@ class GoalDriver {
     const round = this.store.roundByID(input.roundID);
     if (!round)
       throw new GoalConflictError(`unknown round ${input.roundID}`);
-    this.store.settleRound({
+    const { goal } = this.store.settleAndRecord({
       roundID: input.roundID,
-      classification: input.classification,
-      detail: input.detail
-    });
-    return this.store.recordRound({
-      goalID: round.goalID,
-      generation: round.generation,
       classification: input.classification,
       detail: input.detail,
       tokensUsed: input.tokensUsed
     });
+    return goal;
   }
   get stallThreshold() {
     return this.maxNoProgressRounds;
@@ -1066,9 +1729,11 @@ function classify(error) {
 class SessionTransport {
   observer;
   send;
+  fetchState;
   constructor(options) {
     this.observer = options.observer;
     this.send = options.send;
+    this.fetchState = options.fetchState;
   }
   async submit(input) {
     try {
@@ -1079,11 +1744,60 @@ class SessionTransport {
     }
   }
   async probe(input) {
-    return this.observer.probe(input.round.inboxID);
+    const cached = this.observer.probe(input.round.inboxID);
+    if (cached === "settled") {
+      this.observer.forget(input.round.inboxID);
+      return "settled";
+    }
+    if (!this.fetchState)
+      return cached;
+    let state;
+    try {
+      state = await this.fetchState({ sessionID: input.sessionID });
+    } catch {
+      return cached;
+    }
+    const queued = state.inbox.some((item) => item.id === input.round.inboxID);
+    const index = state.messages.findIndex((message) => message.id === input.round.inboxID || message.metadata?.inboxID === input.round.inboxID || message.metadata?.roundID === input.round.id);
+    if (index === -1) {
+      if (queued)
+        return "running";
+      return cached === "unknown" ? "unknown" : cached;
+    }
+    const after = state.messages.slice(index + 1);
+    const idle = after.some((message) => message.type === "idle");
+    const lastAssistant = [...after].reverse().find((message) => message.type === "assistant");
+    const finished = idle || lastAssistant?.finish === "stop" || lastAssistant?.finish === "length" || lastAssistant?.finish === "content-filter" || lastAssistant?.finish === "error";
+    if (finished) {
+      this.observer.forget(input.round.inboxID);
+      return "settled";
+    }
+    return "running";
   }
 }
 
 // src/controller/verification.ts
+import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { isAbsolute, resolve } from "node:path";
+function resolveWorkspacePath(ref, workspace) {
+  if (isAbsolute(ref))
+    return ref;
+  const base = workspace && workspace.length > 0 ? workspace : process.cwd();
+  return resolve(base, ref);
+}
+function sessionWorkspace() {
+  return String(process.env.XGOAL_WORKSPACE ?? process.env.PWD ?? "");
+}
+function hashFile(path) {
+  try {
+    return createHash("sha256").update(readFileSync(path)).digest("hex").slice(0, 32);
+  } catch {
+    return "";
+  }
+}
+var OBJECTIVE_PROOF_KINDS = new Set(["test", "file"]);
+
 class EvidenceLedger {
   store;
   constructor(store) {
@@ -1092,6 +1806,7 @@ class EvidenceLedger {
   capture(input) {
     const args = input.args ?? {};
     const now = Date.now();
+    const workspace = input.workspace ?? sessionWorkspace();
     if ((input.tool === "shell" || input.tool === "bash") && input.status === "completed") {
       const command = String(args.command ?? args.cmd ?? "").trim();
       if (!command)
@@ -1103,7 +1818,9 @@ class EvidenceLedger {
         goalID: input.goalID,
         kind,
         ref: evidence.ref,
-        detail: exitCode === undefined ? undefined : `exit ${exitCode}`
+        detail: exitCode === undefined ? undefined : `exit ${exitCode}`,
+        exitCode,
+        workspace
       });
       return evidence;
     }
@@ -1111,12 +1828,16 @@ class EvidenceLedger {
       const path = String(args.filePath ?? args.file_path ?? args.path ?? "").trim();
       if (!path)
         return;
-      const evidence = { kind: "file", ref: path, atMs: now };
+      const resolved = resolveWorkspacePath(path, workspace);
+      const hash = hashFile(resolved);
+      const evidence = { kind: "file", ref: path, hash, atMs: now };
       this.store.addEvidence({
         goalID: input.goalID,
         kind: "file",
         ref: path,
-        detail: "observed write"
+        detail: "observed write",
+        hash,
+        workspace
       });
       return evidence;
     }
@@ -1126,6 +1847,9 @@ class EvidenceLedger {
     return this.store.listEvidence(goalID).map((e) => ({
       kind: e.kind,
       ref: e.ref,
+      exitCode: e.exitCode,
+      hash: e.hash,
+      workspace: e.workspace,
       atMs: Date.now(),
       criterionID: e.criterionID
     }));
@@ -1135,13 +1859,41 @@ function extractExitCode(result) {
   if (!result)
     return;
   const r = result;
-  const direct = r.exitCode ?? r.exit_code ?? r.code;
-  if (typeof direct === "number")
-    return direct;
-  const nested = r.metadata?.exitCode;
-  if (typeof nested === "number")
-    return nested;
-  return;
+  const asNumber = (value) => {
+    if (typeof value === "number" && Number.isFinite(value))
+      return value;
+    if (typeof value === "string" && /^-?\d+$/.test(value.trim()))
+      return Number(value.trim());
+    return;
+  };
+  const metadata = r.metadata ?? {};
+  for (const candidate of [
+    r.exitCode,
+    r.exit_code,
+    r.code,
+    r.exit,
+    r.statusCode,
+    metadata.exitCode,
+    metadata.exit_code,
+    metadata.exit,
+    metadata.code
+  ]) {
+    const n = asNumber(candidate);
+    if (n !== undefined)
+      return n;
+  }
+  const content = r.content;
+  const text = typeof content === "string" ? content : Array.isArray(content) ? content.map((part) => typeof part === "string" ? part : part?.text ?? "").join(`
+`) : typeof r.output === "string" ? r.output : "";
+  const match = /\bexit(?:\s+code)?\s*[:=]?\s*(-?\d+)\b/i.exec(text);
+  return match ? Number(match[1]) : undefined;
+}
+function snapshotOf(criteria, evidence) {
+  const canonical = JSON.stringify({
+    criteria: criteria.map((c) => [c.id, c.text, c.spec ?? null]),
+    evidence: evidence.map((e) => [e.id, e.kind, e.ref, e.exitCode ?? null, e.hash ?? null, e.criterionID ?? null])
+  });
+  return createHash("sha256").update(canonical).digest("hex").slice(0, 32);
 }
 
 class GoalVerifier {
@@ -1158,6 +1910,7 @@ class GoalVerifier {
     const criteria = this.store.listCriteria(goalID);
     const evidence = this.store.listEvidence(goalID);
     const unmet = [];
+    const proofs = [];
     if (criteria.length === 0) {
       return {
         verdict: "incomplete",
@@ -1173,36 +1926,127 @@ class GoalVerifier {
         reason: "completion requires evidence the controller observed (a command that ran, a file that changed); a model statement is not evidence"
       };
     }
+    const boundIDs = new Set;
+    for (const criterion of criteria) {
+      for (const item of verifiable) {
+        if (item.criterionID === criterion.id)
+          boundIDs.add(item.id);
+      }
+    }
+    const invalid = new Set;
     for (const item of verifiable) {
+      if (!boundIDs.has(item.id))
+        continue;
       const validation = await this.validator.validate({
         kind: item.kind,
         ref: item.ref,
+        exitCode: item.exitCode,
+        hash: item.hash,
         atMs: Date.now(),
         criterionID: item.criterionID
       });
       if (!validation.valid) {
+        invalid.add(item.id);
         unmet.push(`evidence no longer valid: ${item.ref} (${validation.reason})`);
       }
     }
-    const validatingRefs = new Set(verifiable.filter((e) => !unmet.some((u) => u.includes(e.ref))).map((e) => e.ref));
     for (const criterion of criteria) {
-      const bound = evidence.some((e) => e.criterionID === criterion.id && validatingRefs.has(e.ref));
-      const coveredByGeneral = validatingRefs.size > 0 && criteria.length <= validatingRefs.size;
-      if (!bound && !coveredByGeneral) {
+      const bound = evidence.filter((e) => e.criterionID === criterion.id && !invalid.has(e.id) && e.kind !== "ref");
+      const evidenceIDs = bound.map((e) => e.id);
+      if (criterion.spec?.type === "file" && this.validator.checkSpec) {
+        const check = await this.validator.checkSpec(criterion);
+        proofs.push({
+          criterionID: criterion.id,
+          evidenceIDs,
+          validatorID: "spec.file",
+          verdict: check.valid ? "pass" : "fail",
+          detail: check.reason
+        });
+        if (!check.valid)
+          unmet.push(`criterion not satisfied: ${criterion.text} (${check.reason})`);
+        continue;
+      }
+      if (criterion.spec?.type === "command" || criterion.spec?.type === "test") {
+        const expected = criterion.spec.type === "test" ? 0 : criterion.spec.expectExit ?? 0;
+        const proof = bound.filter((e) => (e.kind === "command" || e.kind === "test") && e.exitCode === expected);
+        if (proof.length === 0) {
+          proofs.push({
+            criterionID: criterion.id,
+            evidenceIDs: [],
+            validatorID: "spec.command",
+            verdict: "fail",
+            detail: `no bound command/test evidence exited ${expected}`
+          });
+          unmet.push(`criterion not evidenced: ${criterion.text} (no bound command/test exited ${expected})`);
+        } else {
+          proofs.push({
+            criterionID: criterion.id,
+            evidenceIDs: proof.map((e) => e.id),
+            validatorID: "spec.command",
+            verdict: "pass",
+            detail: `${proof.length} bound run(s) exited ${expected}`
+          });
+        }
+        continue;
+      }
+      if (criterion.spec?.type === "objective") {
+        const proof = bound.filter((e) => OBJECTIVE_PROOF_KINDS.has(e.kind));
+        if (proof.length === 0) {
+          proofs.push({
+            criterionID: criterion.id,
+            evidenceIDs: [],
+            validatorID: "objective-evidence",
+            verdict: "fail",
+            detail: "no bound passing test or file change"
+          });
+          unmet.push(`criterion not evidenced: ${criterion.text} (no bound passing test or file change)`);
+        } else {
+          proofs.push({
+            criterionID: criterion.id,
+            evidenceIDs: proof.map((e) => e.id),
+            validatorID: "objective-evidence",
+            verdict: "pass",
+            detail: `${proof.length} bound test/file evidence item(s)`
+          });
+        }
+        continue;
+      }
+      if (bound.length === 0) {
+        proofs.push({
+          criterionID: criterion.id,
+          evidenceIDs: [],
+          validatorID: "bound-evidence",
+          verdict: "fail",
+          detail: "no bound, currently-valid evidence"
+        });
         unmet.push(`criterion not evidenced: ${criterion.text}`);
+      } else {
+        proofs.push({
+          criterionID: criterion.id,
+          evidenceIDs,
+          validatorID: "bound-evidence",
+          verdict: "pass",
+          detail: `${bound.length} bound evidence item(s)`
+        });
       }
     }
+    const snapshot = snapshotOf(criteria, evidence);
+    this.store.recordProofs(goalID, proofs, snapshot);
     if (unmet.length > 0) {
       return {
         verdict: "incomplete",
         unmet,
-        reason: `${unmet.length} condition(s) unsatisfied against current evidence`
+        reason: `${unmet.length} condition(s) unsatisfied against current evidence`,
+        proofs,
+        snapshot
       };
     }
     return {
       verdict: "complete",
       unmet: [],
-      reason: `objective satisfied: ${criteria.length} criteria covered by ${validatingRefs.size} validated evidence item(s)`
+      reason: `objective satisfied: ${criteria.length} criteria covered by ${verifiable.length} validated evidence item(s)`,
+      proofs,
+      snapshot
     };
   }
 }
@@ -1244,6 +2088,14 @@ var goalRpcDefinition = {
         properties: { goals: { type: "array", items: { type: "object" } } }
       }
     },
+    "goal.create": {
+      input: {
+        type: "object",
+        properties: { sessionID: str, objective: str },
+        required: ["sessionID", "objective"]
+      },
+      output: { type: "object", properties: { goal: goalOrNull, error: str, drive: { type: "object" } } }
+    },
     "goal.replace": {
       input: {
         type: "object",
@@ -1262,7 +2114,19 @@ var goalRpcDefinition = {
     },
     "goal.resume": {
       input: { type: "object", properties: { sessionID: str }, required: ["sessionID"] },
-      output: { type: "object", properties: { goal: goalOrNull } }
+      output: { type: "object", properties: { goal: goalOrNull, error: str } }
+    },
+    "goal.health": {
+      input: { type: "object", properties: { sessionID: str }, required: ["sessionID"] },
+      output: { type: "object", properties: { health: { type: "object" } } }
+    },
+    "goal.budget": {
+      input: {
+        type: "object",
+        properties: { sessionID: str, budget: num },
+        required: ["sessionID"]
+      },
+      output: { type: "object", properties: { goal: goalOrNull, error: str } }
     }
   },
   events: {
@@ -1274,7 +2138,7 @@ var goalRpcDefinition = {
     }
   }
 };
-function goalRpcHandlers(controller) {
+function goalRpcHandlers(controller, coordinator) {
   return {
     "goal.status": async (input) => {
       if (!input?.sessionID)
@@ -1288,12 +2152,39 @@ function goalRpcHandlers(controller) {
         goals: controller.history(input.sessionID).map((g) => wire(controller, g)).filter(Boolean)
       };
     },
+    "goal.create": async (input) => {
+      const { sessionID, objective } = input ?? {};
+      if (!sessionID || !objective) {
+        return { goal: null, error: "sessionID and objective are required" };
+      }
+      try {
+        if (coordinator) {
+          const result = await coordinator.start(sessionID, objective);
+          const goal = result.created ?? result.existing;
+          if (result.existing) {
+            return {
+              goal: wire(controller, result.existing),
+              error: `a goal is already active (generation ${result.existing.generation}); replace it explicitly`
+            };
+          }
+          return { goal: wire(controller, goal), drive: result.drive ?? null };
+        }
+        const out = controller.startOrDescribe(sessionID, objective);
+        return { goal: wire(controller, "created" in out ? out.created : out.existing) };
+      } catch (error) {
+        return { goal: null, error: String(error) };
+      }
+    },
     "goal.replace": async (input) => {
       const { sessionID, objective, expectedGeneration } = input ?? {};
       if (!sessionID || !objective || typeof expectedGeneration !== "number") {
         return { goal: null, error: "sessionID, objective and expectedGeneration are required" };
       }
       try {
+        if (coordinator) {
+          const result = await coordinator.replace(sessionID, objective, expectedGeneration);
+          return { goal: wire(controller, result.goal), drive: result.drive ?? null };
+        }
         const goal = controller.replace(sessionID, objective, expectedGeneration);
         return { goal: wire(controller, goal) };
       } catch (error) {
@@ -1313,7 +2204,30 @@ function goalRpcHandlers(controller) {
       if (!input?.sessionID)
         return { goal: null };
       try {
+        if (coordinator) {
+          const result = await coordinator.resume(input.sessionID);
+          return { goal: wire(controller, result.goal), drive: result.drive ?? null };
+        }
         return { goal: wire(controller, controller.resume(input.sessionID)) };
+      } catch (error) {
+        return { goal: null, error: String(error) };
+      }
+    },
+    "goal.health": async (input) => {
+      if (!input?.sessionID)
+        return { health: { ok: false, error: "sessionID is required" } };
+      try {
+        return { health: controller.health(input.sessionID) };
+      } catch (error) {
+        return { health: { ok: false, error: String(error) } };
+      }
+    },
+    "goal.budget": async (input) => {
+      if (!input?.sessionID)
+        return { goal: null, error: "sessionID is required" };
+      try {
+        const budget = typeof input.budget === "number" && Number.isFinite(input.budget) && input.budget > 0 ? Math.floor(input.budget) : undefined;
+        return { goal: wire(controller, controller.setBudget(input.sessionID, budget)) };
       } catch (error) {
         return { goal: null, error: String(error) };
       }
@@ -1323,6 +2237,44 @@ function goalRpcHandlers(controller) {
 
 // src/index.ts
 var LOG = process.env.XGOAL_HARNESS_LOG ?? "";
+function resolveWorkspacePath2(ref, workspace) {
+  if (isAbsolute2(ref))
+    return ref;
+  const base = workspace && workspace.length > 0 ? workspace : process.cwd();
+  return resolve2(base, ref);
+}
+function sessionWorkspace2() {
+  return String(process.env.XGOAL_WORKSPACE ?? process.env.PWD ?? "");
+}
+function describeDrive(outcome) {
+  if (!outcome)
+    return "dispatch unavailable (no driver connected)";
+  switch (outcome.action) {
+    case "admitted":
+      return `execution scheduled (${outcome.inboxID}).`;
+    case "reconcile":
+      return `an outstanding round is still ${outcome.status}.`;
+    case "unknown":
+      return "dispatch outcome unknown; the recovery sweep will reconcile it.";
+    case "failed":
+      return `dispatch failed: ${outcome.detail}.`;
+    case "abandoned":
+      return `dispatch abandoned: ${outcome.detail}.`;
+    case "limited":
+      return `not dispatched: goal is ${outcome.status}.`;
+    case "idle":
+      return `not dispatched: ${outcome.reason}.`;
+    default:
+      return `dispatch: ${String(outcome.action)}.`;
+  }
+}
+function hashFile2(path) {
+  try {
+    return createHash2("sha256").update(readFileSync2(path)).digest("hex").slice(0, 32);
+  } catch {
+    return "";
+  }
+}
 function record(entry) {
   if (!LOG)
     return;
@@ -1365,6 +2317,7 @@ var src_default = {
     }
     const observer = new RoundObserver;
     let driver;
+    let coordinator;
     let ledger;
     let verifier;
     let sweep;
@@ -1379,29 +2332,122 @@ var src_default = {
             metadata,
             delivery: "queue"
           });
+        },
+        fetchState: async ({ sessionID }) => {
+          const messages = await ctx.session.context({ sessionID });
+          let inbox = [];
+          try {
+            const api = ctx.session?.inbox;
+            if (typeof api?.list === "function") {
+              inbox = await api.list({ sessionID });
+            }
+          } catch {}
+          return {
+            inbox: (inbox ?? []).map((item) => ({ id: item.id })),
+            messages: messages.map((message) => ({
+              id: message.id,
+              type: message.type,
+              metadata: message.metadata,
+              time: message.time,
+              finish: message.finish
+            }))
+          };
         }
       });
       driver = new GoalDriver(controller.store, transport);
+      coordinator = new GoalCoordinator(controller, () => driver);
       ledger = new EvidenceLedger(controller.store);
       verifier = new GoalVerifier(controller.store, {
         async validate(evidence) {
           if (evidence.kind === "file") {
+            const resolved = resolveWorkspacePath2(evidence.ref, sessionWorkspace2());
             try {
-              return existsSync(evidence.ref) ? { valid: true, reason: "file present" } : { valid: false, reason: "file not found" };
+              if (!existsSync2(resolved)) {
+                return { valid: false, reason: `file not found: ${evidence.ref}` };
+              }
+              if (evidence.hash !== undefined) {
+                const actual = hashFile2(resolved);
+                if (actual !== evidence.hash) {
+                  return {
+                    valid: false,
+                    reason: `file changed since it was observed: ${evidence.ref}`
+                  };
+                }
+              }
+              return { valid: true, reason: "file present and unchanged" };
             } catch {
               return { valid: false, reason: "file could not be checked" };
             }
           }
           if (evidence.kind === "command" || evidence.kind === "test" || evidence.kind === "runtime") {
-            return { valid: true, reason: "observed to complete by the controller" };
+            if (evidence.exitCode === undefined) {
+              return {
+                valid: false,
+                reason: "no observed exit status recorded; cannot confirm success"
+              };
+            }
+            return evidence.exitCode === 0 ? { valid: true, reason: `exited ${evidence.exitCode}` } : { valid: false, reason: `exited ${evidence.exitCode}` };
           }
           return { valid: false, reason: "unverifiable reference" };
+        },
+        async checkSpec(criterion) {
+          if (criterion.spec?.type !== "file") {
+            return { valid: false, reason: "no independent check for this spec" };
+          }
+          const spec = criterion.spec;
+          const resolved = resolveWorkspacePath2(spec.path, sessionWorkspace2());
+          try {
+            if (!existsSync2(resolved)) {
+              return { valid: false, reason: `file not found: ${spec.path}` };
+            }
+            if (spec.equals !== undefined || spec.contains !== undefined) {
+              const content = readFileSync2(resolved, "utf8");
+              if (spec.equals !== undefined && content !== spec.equals) {
+                return {
+                  valid: false,
+                  reason: `${spec.path} does not exactly match the required content`
+                };
+              }
+              if (spec.contains !== undefined && !content.includes(spec.contains)) {
+                return {
+                  valid: false,
+                  reason: `${spec.path} does not contain ${JSON.stringify(spec.contains)}`
+                };
+              }
+            }
+            return { valid: true, reason: `${spec.path} matches the required content` };
+          } catch (error) {
+            return { valid: false, reason: `file could not be checked: ${String(error)}` };
+          }
         }
       });
-      driver.reconcile().then((outcomes) => record({ event: "driver.reconciled", count: outcomes.length })).catch((error) => record({ event: "driver.reconcile.error", error: String(error) }));
+      const driveAll = async () => {
+        const goals = controller?.store.activeGoals() ?? [];
+        const outcomes = [];
+        for (const goal of goals) {
+          if (goal.status !== "active")
+            continue;
+          try {
+            const outcome = await driver.drive(goal.sessionID);
+            outcomes.push(`${goal.id}:${outcome.action}`);
+          } catch (error) {
+            record({
+              event: "driver.drive.error",
+              goalID: goal.id,
+              error: String(error)
+            });
+          }
+        }
+        return outcomes;
+      };
+      driver.reconcile().then(async (outcomes) => {
+        record({ event: "driver.reconciled", count: outcomes.length });
+        const driven = await driveAll();
+        record({ event: "driver.resumed", outcomes: driven });
+      }).catch((error) => record({ event: "driver.reconcile.error", error: String(error) }));
       const sweepMs = Number(process.env.XGOAL_SWEEP_MS ?? "20000");
       sweep = setInterval(() => {
-        driver?.reconcile().catch((error) => record({ event: "driver.sweep.error", error: String(error) }));
+        driver?.reconcile().then(() => driveAll()).catch((error) => record({ event: "driver.sweep.error", error: String(error) }));
       }, sweepMs);
       sweep?.unref?.();
     }
@@ -1412,6 +2458,32 @@ var src_default = {
       sessionMethods: typeof ctx?.session === "object" ? Object.keys(ctx.session).sort() : [],
       controllerReady: controller !== undefined
     });
+    async function resolveMessageRef(sessionID, messageID) {
+      if (!controller || !sessionID || !messageID)
+        return {};
+      const cached = controller.store.resolveMessageGeneration(sessionID, messageID);
+      if (cached !== undefined) {
+        const goal2 = controller.store.byGeneration(sessionID, cached);
+        return goal2 ? { goalID: goal2.id, generation: cached } : {};
+      }
+      let atMs;
+      try {
+        const messages = await ctx.session.context({ sessionID });
+        const message = messages.find((m) => m?.id === messageID);
+        if (typeof message?.time?.created === "number")
+          atMs = message.time.created;
+      } catch (error) {
+        record({ event: "call.resolve.error", sessionID, messageID, error: String(error) });
+      }
+      if (atMs === undefined)
+        return {};
+      const generation = controller.store.generationAt(sessionID, atMs);
+      if (generation === undefined)
+        return {};
+      controller.store.rememberMessageGeneration(sessionID, messageID, generation, atMs);
+      const goal = controller.store.byGeneration(sessionID, generation);
+      return goal ? { goalID: goal.id, generation } : {};
+    }
     try {
       await ctx.tool.transform((editor) => {
         editor.add({
@@ -1425,6 +2497,14 @@ var src_default = {
             if (!goal)
               return { content: "No active goal for this session." };
             const criteria = controller.store.listCriteria(goal.id);
+            const evidence = controller.store.listEvidence(goal.id).map((item) => ({
+              id: item.id,
+              kind: item.kind,
+              ref: item.ref,
+              exitCode: item.exitCode ?? null,
+              hash: item.hash ?? null,
+              criterionID: item.criterionID ?? null
+            }));
             return {
               content: JSON.stringify({
                 id: goal.id,
@@ -1435,7 +2515,8 @@ var src_default = {
                 noProgressRounds: goal.noProgressRounds,
                 tokensUsed: goal.tokensUsed ?? null,
                 tokenBudget: goal.tokenBudget ?? null,
-                criteria
+                criteria,
+                evidence
               }, null, 2),
               metadata: { goalID: goal.id, generation: goal.generation, status: goal.status }
             };
@@ -1443,21 +2524,24 @@ var src_default = {
         });
         editor.add({
           name: "goal_checkpoint",
-          description: "Record progress toward the current goal without changing its status. Use for completed work, or for investigation that materially narrows the problem.",
+          description: "Record progress toward the current goal without changing its status. Use for completed work, or for investigation that materially narrows the problem. Optionally bind evidence to a criterion.",
           input: obj({
             summary: str2,
             evidence_refs: strArray,
+            criterion_id: str2,
             goal_id: str2,
             generation: num2
           }, ["summary"]),
           async execute(input, toolCtx) {
             if (!controller)
               return { content: `goal controller unavailable: ${startupError}` };
+            const ref = await resolveMessageRef(toolCtx?.sessionID, toolCtx?.messageID);
             const out = controller.checkpoint(toolCtx?.sessionID, {
               summary: String(input?.summary ?? ""),
               evidenceRefs: input?.evidence_refs,
-              goalID: input?.goal_id,
-              generation: input?.generation
+              criterionID: input?.criterion_id,
+              goalID: ref.goalID ?? input?.goal_id,
+              generation: ref.generation ?? input?.generation
             });
             if (!out.recorded)
               return { content: `Checkpoint not recorded: ${out.rejected}` };
@@ -1469,19 +2553,39 @@ var src_default = {
         });
         editor.add({
           name: "goal_propose_complete",
-          description: "Propose that the goal's original objective has been fully achieved. This moves the goal to verification; it does not complete it. The controller decides completion.",
-          input: obj({ summary: str2, evidence_refs: strArray, goal_id: str2, generation: num2 }, [
-            "summary"
-          ]),
+          description: "Propose that the goal's original objective has been fully achieved. This moves the goal to verification; it does not complete it. The controller decides completion. File criteria with a machine-checkable spec are re-checked independently; other criteria require explicitly bound evidence. Call goal_get first and pass criteria: [{criterion_id, evidence_refs}], where evidence_refs are evidence IDs or refs from goal_get.",
+          input: obj({
+            summary: str2,
+            evidence_refs: strArray,
+            criteria: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  criterion_id: { type: "string" },
+                  evidence_refs: { type: "array", items: { type: "string" } }
+                },
+                required: ["criterion_id"],
+                additionalProperties: false
+              }
+            },
+            goal_id: str2,
+            generation: num2
+          }, ["summary"]),
           async execute(input, toolCtx) {
             if (!controller)
               return { content: `goal controller unavailable: ${startupError}` };
             const sessionID = toolCtx?.sessionID;
+            const ref = await resolveMessageRef(sessionID, toolCtx?.messageID);
             const out = controller.proposeComplete(sessionID, {
               summary: String(input?.summary ?? ""),
               evidenceRefs: input?.evidence_refs,
-              goalID: input?.goal_id,
-              generation: input?.generation
+              criteria: Array.isArray(input?.criteria) ? input.criteria.map((c) => ({
+                criterionID: String(c?.criterion_id ?? ""),
+                evidenceRefs: Array.isArray(c?.evidence_refs) ? c.evidence_refs : []
+              })) : undefined,
+              goalID: ref.goalID ?? input?.goal_id,
+              generation: ref.generation ?? input?.generation
             });
             if (out.rejected)
               return { content: `Completion proposal rejected: ${out.rejected}` };
@@ -1494,14 +2598,14 @@ var src_default = {
             }
             const result = await verifier.verify(goal.id);
             if (result.verdict === "complete") {
-              const done = controller.commitComplete(goal.id, goal.generation, result.reason);
+              const done = controller.commitComplete(goal.id, goal.generation, result.reason, result.snapshot);
               record({ event: "completion.verified", goalID: goal.id, reason: result.reason });
               return {
                 content: `Completion verified and the goal is now complete. ${result.reason}`,
                 metadata: { status: done.status }
               };
             }
-            const back = controller.rejectCompletion(sessionID, result.reason);
+            const back = controller.rejectCompletion(goal.id, goal.generation, result.reason);
             record({
               event: "completion.rejected",
               goalID: goal.id,
@@ -1535,12 +2639,13 @@ ${result.unmet.map((u) => `- ${u}`).join(`
           async execute(input, toolCtx) {
             if (!controller)
               return { content: `goal controller unavailable: ${startupError}` };
+            const ref = await resolveMessageRef(toolCtx?.sessionID, toolCtx?.messageID);
             const out = controller.reportBlocked(toolCtx?.sessionID, {
               reason: String(input?.reason ?? ""),
               evidenceRefs: input?.evidence_refs,
               externalDependency: input?.external_dependency === true,
-              goalID: input?.goal_id,
-              generation: input?.generation
+              goalID: ref.goalID ?? input?.goal_id,
+              generation: ref.generation ?? input?.generation
             });
             if (out.rejected)
               return { content: `Blocker report rejected: ${out.rejected}` };
@@ -1563,7 +2668,7 @@ ${result.unmet.map((u) => `- ${u}`).join(`
     }
     try {
       if (controller && ctx.rpc?.register) {
-        await ctx.rpc.register(goalRpcDefinition, goalRpcHandlers(controller));
+        await ctx.rpc.register(goalRpcDefinition, goalRpcHandlers(controller, coordinator));
         record({ event: "rpc.registered", ok: true });
       } else {
         record({ event: "rpc.registered", ok: false, reason: "rpc domain unavailable" });
@@ -1602,18 +2707,23 @@ ${result.unmet.map((u) => `- ${u}`).join(`
                 return;
               }
               if (verb === "pause") {
-                reply(`Paused: ${controller.pause(sessionID).status}`);
+                reply(`Paused: ${(coordinator ?? controller).pause(sessionID).status}`);
                 return;
               }
               if (verb === "resume") {
-                reply(`Resumed: ${controller.resume(sessionID).status}`);
+                if (coordinator) {
+                  const result = await coordinator.resume(sessionID);
+                  reply(`Resumed: ${result.goal.status}. ${describeDrive(result.drive)}`);
+                } else {
+                  reply(`Resumed: ${controller.resume(sessionID).status}`);
+                }
                 return;
               }
               if (verb === "replace") {
                 if (!arg)
                   return reply("Usage: /goal replace <objective>");
-                const goal = controller.replace(sessionID, arg);
-                reply(`Replaced. Generation ${goal.generation} is now active.`);
+                const result = coordinator ? await coordinator.replace(sessionID, arg) : { goal: controller.replace(sessionID, arg) };
+                reply(`Replaced. Generation ${result.goal.generation} is now active. ${describeDrive(result.drive)}`);
                 return;
               }
               if (verb === "budget") {
@@ -1625,20 +2735,34 @@ ${result.unmet.map((u) => `- ${u}`).join(`
                   reply(`Tokens: ${used}${goal.tokenBudget !== undefined ? ` / ${goal.tokenBudget}` : " (no budget set)"}`);
                   return;
                 }
+                if (/^(off|none|clear)$/i.test(arg)) {
+                  controller.setBudget(sessionID, undefined);
+                  return reply("Token budget cleared.");
+                }
                 const n = Number(arg);
                 if (!Number.isFinite(n) || n <= 0)
                   return reply("Usage: /goal budget <positive number>");
-                controller.store.db.query("UPDATE goals SET token_budget = ? WHERE id = ?").run(Math.floor(n), goal.id);
+                controller.setBudget(sessionID, Math.floor(n));
                 reply(`Budget set to ${Math.floor(n)} tokens (used ${used}).`);
                 return;
               }
               const objective = raw;
+              if (coordinator) {
+                const result = await coordinator.start(sessionID, objective);
+                if (result.existing) {
+                  reply(`A goal is already active (generation ${result.existing.generation}): ${result.existing.objective}
+Use /goal replace <objective> to supersede it.`);
+                } else {
+                  reply(`Goal created (generation ${result.created.generation}). ${describeDrive(result.drive)}`);
+                }
+                return;
+              }
               const out = controller.startOrDescribe(sessionID, objective);
               if ("existing" in out) {
                 reply(`A goal is already active (generation ${out.existing.generation}): ${out.existing.objective}
 Use /goal replace <objective> to supersede it.`);
               } else {
-                reply(`Goal created (generation ${out.created.generation}).`);
+                reply(`Goal created (generation ${out.created.generation}); no driver is connected.`);
               }
             } catch (error) {
               reply(`Goal command failed: ${String(error)}`);
@@ -1710,10 +2834,25 @@ ${unmet.join(`
           sessionID,
           status: event?.status
         });
+        if (process.env.XGOAL_DEBUG_TOOLS === "1") {
+          const result = event?.result ?? null;
+          record({
+            event: "tool.result.shape",
+            tool: event?.tool,
+            eventKeys: event && typeof event === "object" ? Object.keys(event) : [],
+            resultKeys: result && typeof result === "object" ? Object.keys(result) : [],
+            metadata: result?.metadata ?? null,
+            content: typeof result?.content === "string" ? result.content.slice(0, 200) : undefined
+          });
+        }
         if (!controller || !ledger || !sessionID)
           return;
-        const goal = controller.status(sessionID);
+        const ref = await resolveMessageRef(sessionID, event?.messageID);
+        const goal = ref.goalID ? controller.store.byID(ref.goalID) : undefined;
         if (!goal || goal.status !== "active")
+          return;
+        const current = controller.status(sessionID);
+        if (!current || current.id !== goal.id || current.generation !== goal.generation)
           return;
         try {
           const captured = ledger.capture({
@@ -1721,7 +2860,8 @@ ${unmet.join(`
             tool: String(event?.tool ?? ""),
             status: event?.status === "completed" ? "completed" : "error",
             args: event?.input ?? event?.args,
-            result: event?.result
+            result: event?.result,
+            workspace: sessionWorkspace2()
           });
           if (captured) {
             record({
@@ -1754,6 +2894,25 @@ ${unmet.join(`
           eventsSeen.add(type);
           observer.observe(event);
           record({ event: "event", type, total: eventsSeen.size });
+          if (controller && type === "session.usage.updated") {
+            const data = event?.data;
+            const usageSession = data?.sessionID;
+            const tokens = data?.tokens;
+            if (usageSession && tokens) {
+              const total = Number(tokens.input ?? 0) + Number(tokens.output ?? 0) + Number(tokens.reasoning ?? 0) + Number(tokens.cache?.read ?? 0) + Number(tokens.cache?.write ?? 0);
+              try {
+                const goal = controller.recordUsage(usageSession, total);
+                record({
+                  event: "usage.recorded",
+                  sessionID: usageSession,
+                  tokensUsed: goal?.tokensUsed ?? null,
+                  tokenBudget: goal?.tokenBudget ?? null
+                });
+              } catch (error) {
+                record({ event: "usage.record.error", error: String(error) });
+              }
+            }
+          }
           if (!driver || !IDLE_SIGNALS.has(type))
             continue;
           const now = Date.now();

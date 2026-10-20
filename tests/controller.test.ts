@@ -28,10 +28,17 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+/** The current goal's fencing reference, as a model tool call must supply. */
+function ref(sessionID = "ses_a"): { goalID: string; generation: number } {
+  const goal = controller.status(sessionID);
+  if (!goal) throw new Error(`no current goal for ${sessionID}`);
+  return { goalID: goal.id, generation: goal.generation };
+}
+
 describe("model cannot commit its own completion", () => {
   test("proposeComplete only moves the goal to verifying", () => {
     controller.startOrDescribe("ses_a", "fix all bugs in the subsystem");
-    const out = controller.proposeComplete("ses_a", { summary: "I finished everything" });
+    const out = controller.proposeComplete("ses_a", { ...ref(), summary: "I finished everything" });
 
     expect(out.goal?.status).toBe("verifying");
     // Crucially, not complete — the model's assertion is a proposal.
@@ -41,7 +48,7 @@ describe("model cannot commit its own completion", () => {
 
   test("only the controller can commit completion", () => {
     controller.startOrDescribe("ses_a", "x");
-    controller.proposeComplete("ses_a", { summary: "done" });
+    controller.proposeComplete("ses_a", { ...ref(), summary: "done" });
     const goal = controller.status("ses_a")!;
     const committed = controller.commitComplete(goal.id, goal.generation, "evidence verified");
     expect(committed.status).toBe("complete");
@@ -50,8 +57,13 @@ describe("model cannot commit its own completion", () => {
 
   test("a rejected completion returns the goal to active, not complete", () => {
     controller.startOrDescribe("ses_a", "x");
-    controller.proposeComplete("ses_a", { summary: "done, honest" });
-    const back = controller.rejectCompletion("ses_a", "verification failed: no evidence for criterion 2");
+    controller.proposeComplete("ses_a", { ...ref(), summary: "done, honest" });
+    const goal = controller.status("ses_a")!;
+    const back = controller.rejectCompletion(
+      goal.id,
+      goal.generation,
+      "verification failed: no evidence for criterion 2",
+    );
     expect(back?.status).toBe("active");
     expect(back?.completedAtMs).toBeUndefined();
     expect(back?.reason).toContain("verification failed");
@@ -62,6 +74,7 @@ describe("blockers must be genuine", () => {
   test("a single blocker report does not park the goal", () => {
     controller.startOrDescribe("ses_a", "build the replacement");
     const out = controller.reportBlocked("ses_a", {
+      ...ref(),
       reason: "I finished phase 01 and asked the user whether to push or continue",
     });
     expect(out.accepted).toBe(false);
@@ -70,32 +83,55 @@ describe("blockers must be genuine", () => {
     expect(controller.status("ses_a")?.status).toBe("active");
   });
 
-  test("repeated confirmation eventually accepts a blocker", () => {
+  test("repeated calls in one round count once; a later round confirms", () => {
     controller.startOrDescribe("ses_a", "x");
-    const first = controller.reportBlocked("ses_a", { reason: "waiting on vendor API key" });
+    const first = controller.reportBlocked("ses_a", { ...ref(), reason: "waiting on vendor API key" });
     expect(first.accepted).toBe(false);
-    const second = controller.reportBlocked("ses_a", { reason: "still waiting on vendor API key" });
+    // A second call in the same turn must NOT be a second confirmation.
+    const sameRound = controller.reportBlocked("ses_a", {
+      ...ref(),
+      reason: "waiting on vendor API key",
+    });
+    expect(sameRound.accepted).toBe(false);
+    expect(sameRound.confirmations).toBe(1);
+
+    // Settle the round, then report again in the next independently evaluated round.
+    controller.classifyRound("ses_a", "blocked", "round ended with the same unresolved blocker");
+    const second = controller.reportBlocked("ses_a", { ...ref(), reason: "waiting on vendor API key" });
     expect(second.accepted).toBe(true);
+    expect(second.confirmations).toBe(2);
     expect(second.goal?.status).toBe("blocked");
   });
 
-  test("a concrete external dependency blocks immediately", () => {
+  test("a claimed external dependency is not self-authenticating", () => {
     controller.startOrDescribe("ses_a", "x");
     const out = controller.reportBlocked("ses_a", {
+      ...ref(),
       reason: "cannot proceed without the production API credential",
       externalDependency: true,
     });
-    expect(out.accepted).toBe(true);
-    expect(out.goal?.status).toBe("blocked");
+    // The claim alone does not park the goal.
+    expect(out.accepted).toBe(false);
+    expect(controller.status("ses_a")?.status).toBe("active");
+
+    controller.classifyRound("ses_a", "blocked");
+    const again = controller.reportBlocked("ses_a", {
+      ...ref(),
+      reason: "cannot proceed without the production API credential",
+      externalDependency: true,
+    });
+    expect(again.accepted).toBe(true);
+    expect(again.goal?.status).toBe("blocked");
   });
 
   test("REGRESSION: the Phase 01 scenario cannot force blocked or stalled", () => {
     // The exact situation the legacy plugin mis-scored: a milestone is done and
     // the agent asks an optional workflow question.
     controller.startOrDescribe("ses_a", "produce a working replacement /goal plugin");
-    controller.checkpoint("ses_a", { summary: "phase 01 complete and committed" });
+    controller.checkpoint("ses_a", { ...ref(), summary: "phase 01 complete and committed" });
 
     const out = controller.reportBlocked("ses_a", {
+      ...ref(),
       reason: "waiting for the user's decision on whether to publish the baseline or continue",
     });
 
@@ -241,7 +277,7 @@ describe("replacement via the controller", () => {
 describe("startup reconciliation", () => {
   test("a goal stranded mid-verification is returned to active on startup", () => {
     controller.startOrDescribe("ses_a", "x");
-    controller.proposeComplete("ses_a", { summary: "done" });
+    controller.proposeComplete("ses_a", { ...ref(), summary: "done" });
     expect(controller.status("ses_a")?.status).toBe("verifying");
     controller.close();
 

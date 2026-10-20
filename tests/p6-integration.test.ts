@@ -48,7 +48,7 @@ describe("Model omitting an explicit requirement", () => {
     controller.store.addCriterion(goal.id, "tests are written and passing");
 
     // Model only completes the first criterion
-    const criteria = controller.store.listCriteria(goal.id);
+    const criteria = controller.store.listCriteria(goal.id).filter((c) => c.source === "user");
     controller.store.addEvidence({
       goalID: goal.id,
       kind: "command",
@@ -236,11 +236,16 @@ describe("A compaction boundary", () => {
   test("criteria survive compaction", () => {
     const goal = startGoal("ses_a", "do work");
     controller.store.addCriterion(goal.id, "work is done");
+    const before = controller.store.listCriteria(goal.id);
+    const derivedCount = before.filter((c) => c.source === "derived").length;
+    expect(derivedCount).toBeGreaterThan(0);
     controller.close();
     controller = new GoalController({ dbPath: join(dir, "goals.db") });
     const status = controller.status("ses_a");
     const criteria = controller.store.listCriteria(status!.id);
-    expect(criteria.length).toBe(1);
+    // Criteria are durable and the explicit requirement survives compaction.
+    expect(criteria.length).toBe(before.length);
+    expect(criteria.some((c) => c.text === "work is done")).toBe(true);
   });
 });
 

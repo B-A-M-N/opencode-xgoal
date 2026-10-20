@@ -179,4 +179,10 @@ export interface Goal {
   updatedAtMs: number;
   completedAtMs?: number;
   supersededBy?: string;
+  /** Revision of the evidence snapshot the last verification checked. */
+  verificationRevision: number;
+  /** Hash of the criteria+evidence snapshot the last verification checked. */
+  verificationSnapshot?: string;
+  /** True when a continuation submission terminally failed and dispatch is stopped. */
+  deliveryFailed: boolean;
 }
