@@ -1926,6 +1926,7 @@ class GoalVerifier {
       return { verdict: "incomplete", unmet: [], reason: "unknown goal" };
     const criteria = this.store.listCriteria(goalID);
     const evidence = this.store.listEvidence(goalID);
+    const workspace = await this.validator.workspaceFor?.(goal.sessionID) ?? "";
     const unmet = [];
     const proofs = [];
     if (criteria.length === 0) {
@@ -1961,7 +1962,7 @@ class GoalVerifier {
         hash: item.hash,
         atMs: Date.now(),
         criterionID: item.criterionID
-      });
+      }, workspace);
       if (!validation.valid) {
         invalid.add(item.id);
         unmet.push(`evidence no longer valid: ${item.ref} (${validation.reason})`);
@@ -1971,7 +1972,7 @@ class GoalVerifier {
       const bound = evidence.filter((e) => e.criterionID === criterion.id && !invalid.has(e.id) && e.kind !== "ref");
       const evidenceIDs = bound.map((e) => e.id);
       if (criterion.spec?.type === "file" && this.validator.checkSpec) {
-        const check = await this.validator.checkSpec(criterion);
+        const check = await this.validator.checkSpec(criterion, workspace);
         proofs.push({
           criterionID: criterion.id,
           evidenceIDs,
@@ -2338,6 +2339,25 @@ var src_default = {
     let ledger;
     let verifier;
     let sweep;
+    const sessionWorkspaces = new Map;
+    const resolveSessionWorkspace = async (sessionID) => {
+      if (sessionID) {
+        const cached = sessionWorkspaces.get(sessionID);
+        if (cached)
+          return cached;
+      }
+      if (sessionID) {
+        try {
+          const session = await ctx.session.get({ sessionID });
+          const directory = session?.location?.directory;
+          if (typeof directory === "string" && directory.length > 0) {
+            sessionWorkspaces.set(sessionID, directory);
+            return directory;
+          }
+        } catch {}
+      }
+      return sessionWorkspace2();
+    };
     if (controller) {
       const transport = new SessionTransport({
         observer,
@@ -2375,9 +2395,12 @@ var src_default = {
       coordinator = new GoalCoordinator(controller, () => driver);
       ledger = new EvidenceLedger(controller.store);
       verifier = new GoalVerifier(controller.store, {
-        async validate(evidence) {
+        async workspaceFor(sessionID) {
+          return resolveSessionWorkspace(sessionID);
+        },
+        async validate(evidence, workspace) {
           if (evidence.kind === "file") {
-            const resolved = resolveWorkspacePath2(evidence.ref, sessionWorkspace2());
+            const resolved = resolveWorkspacePath2(evidence.ref, workspace);
             try {
               if (!existsSync2(resolved)) {
                 return { valid: false, reason: `file not found: ${evidence.ref}` };
@@ -2407,12 +2430,12 @@ var src_default = {
           }
           return { valid: false, reason: "unverifiable reference" };
         },
-        async checkSpec(criterion) {
+        async checkSpec(criterion, workspace) {
           if (criterion.spec?.type !== "file") {
             return { valid: false, reason: "no independent check for this spec" };
           }
           const spec = criterion.spec;
-          const resolved = resolveWorkspacePath2(spec.path, sessionWorkspace2());
+          const resolved = resolveWorkspacePath2(spec.path, workspace);
           try {
             if (!existsSync2(resolved)) {
               return { valid: false, reason: `file not found: ${spec.path}` };
@@ -2878,7 +2901,7 @@ ${unmet.join(`
             status: event?.status === "completed" ? "completed" : "error",
             args: event?.input ?? event?.args,
             result: event?.result,
-            workspace: sessionWorkspace2()
+            workspace: await resolveSessionWorkspace(sessionID)
           });
           if (captured) {
             record({

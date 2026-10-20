@@ -72,13 +72,21 @@ export interface EvidenceValidation {
  * it with real filesystem/process checks.
  */
 export interface EvidenceValidator {
-  validate(evidence: CapturedEvidence): Promise<EvidenceValidation>;
+  validate(evidence: CapturedEvidence, workspace: string): Promise<EvidenceValidation>;
   /**
    * Independently check a criterion's machine spec against the world. This is
    * what stops an unrelated successful command from satisfying a requirement
    * about file content: the check does not consult the evidence at all.
    */
-  checkSpec?(criterion: { text: string; spec?: CriterionSpec }): Promise<EvidenceValidation>;
+  checkSpec?(
+    criterion: { text: string; spec?: CriterionSpec },
+    workspace: string,
+  ): Promise<EvidenceValidation>;
+  /**
+   * The workspace the session is actually operating in. Relative paths observed
+   * from tool calls must resolve there, not against the plugin process's cwd.
+   */
+  workspaceFor?(sessionID: string): Promise<string | undefined>;
 }
 
 export interface VerificationResult {
@@ -275,6 +283,7 @@ export class GoalVerifier {
 
     const criteria = this.store.listCriteria(goalID);
     const evidence = this.store.listEvidence(goalID);
+    const workspace = (await this.validator.workspaceFor?.(goal.sessionID)) ?? "";
     const unmet: string[] = [];
     const proofs: CriterionProof[] = [];
 
@@ -314,14 +323,17 @@ export class GoalVerifier {
     const invalid = new Set<string>();
     for (const item of verifiable) {
       if (!boundIDs.has(item.id)) continue;
-      const validation = await this.validator.validate({
-        kind: item.kind as EvidenceKind,
-        ref: item.ref,
-        exitCode: item.exitCode,
-        hash: item.hash,
-        atMs: Date.now(),
-        criterionID: item.criterionID,
-      });
+      const validation = await this.validator.validate(
+        {
+          kind: item.kind as EvidenceKind,
+          ref: item.ref,
+          exitCode: item.exitCode,
+          hash: item.hash,
+          atMs: Date.now(),
+          criterionID: item.criterionID,
+        },
+        workspace,
+      );
       if (!validation.valid) {
         invalid.add(item.id);
         unmet.push(`evidence no longer valid: ${item.ref} (${validation.reason})`);
@@ -337,7 +349,7 @@ export class GoalVerifier {
 
       if (criterion.spec?.type === "file" && this.validator.checkSpec) {
         // Independent machine check: the spec, not the model's claim.
-        const check = await this.validator.checkSpec(criterion);
+        const check = await this.validator.checkSpec(criterion, workspace);
         proofs.push({
           criterionID: criterion.id,
           evidenceIDs,

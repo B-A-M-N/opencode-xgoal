@@ -147,6 +147,32 @@ export default {
     let verifier: GoalVerifier | undefined;
     let sweep: ReturnType<typeof setInterval> | undefined;
 
+    // A session can be opened in a subdirectory of the project. Relative paths
+    // observed from its tool calls belong to that directory, not to whatever cwd
+    // the plugin host happens to have. Cache per session; a move is rare and the
+    // next process rebuilds the cache.
+    const sessionWorkspaces = new Map<string, string>();
+    const resolveSessionWorkspace = async (sessionID: string | undefined): Promise<string> => {
+      if (sessionID) {
+        const cached = sessionWorkspaces.get(sessionID);
+        if (cached) return cached;
+      }
+      if (sessionID) {
+        try {
+          const session = await ctx.session.get({ sessionID } as never);
+          const directory = (session as { location?: { directory?: unknown } } | undefined)
+            ?.location?.directory;
+          if (typeof directory === "string" && directory.length > 0) {
+            sessionWorkspaces.set(sessionID, directory);
+            return directory;
+          }
+        } catch {
+          // Older host or a session that has gone away: fall back below.
+        }
+      }
+      return sessionWorkspace();
+    };
+
     if (controller) {
       const transport = new SessionTransport({
         observer,
@@ -198,13 +224,16 @@ export default {
       // prose never reaches this ledger.
       ledger = new EvidenceLedger(controller.store);
       verifier = new GoalVerifier(controller.store, {
-        async validate(evidence) {
+        async workspaceFor(sessionID) {
+          return resolveSessionWorkspace(sessionID);
+        },
+        async validate(evidence, workspace) {
           // File evidence must still exist AND still match the content hash
           // captured when it was observed. Existence alone is not proof, and a
           // relative path must resolve against the session workspace, never the
           // plugin process's own cwd.
           if (evidence.kind === "file") {
-            const resolved = resolveWorkspacePath(evidence.ref, sessionWorkspace());
+            const resolved = resolveWorkspacePath(evidence.ref, workspace);
             try {
               if (!existsSync(resolved)) {
                 return { valid: false, reason: `file not found: ${evidence.ref}` };
@@ -243,7 +272,7 @@ export default {
           // A bare reference is a model-provided pointer, never proof.
           return { valid: false, reason: "unverifiable reference" };
         },
-        async checkSpec(criterion) {
+        async checkSpec(criterion, workspace) {
           // Only file specs are checked here. Command/test specs are proven by
           // bound evidence of a run that actually exited with the expected
           // status; we never re-execute arbitrary commands during verification.
@@ -251,7 +280,7 @@ export default {
             return { valid: false, reason: "no independent check for this spec" };
           }
           const spec = criterion.spec;
-          const resolved = resolveWorkspacePath(spec.path, sessionWorkspace());
+          const resolved = resolveWorkspacePath(spec.path, workspace);
           try {
             if (!existsSync(resolved)) {
               return { valid: false, reason: `file not found: ${spec.path}` };
@@ -813,7 +842,7 @@ export default {
             status: event?.status === "completed" ? "completed" : "error",
             args: event?.input ?? event?.args,
             result: event?.result,
-            workspace: sessionWorkspace(),
+            workspace: await resolveSessionWorkspace(sessionID),
           });
           if (captured) {
             record({

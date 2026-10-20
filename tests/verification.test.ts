@@ -9,7 +9,7 @@
  * a checkpoint or continue.
  */
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GoalStore } from "../src/controller/store.ts";
@@ -152,6 +152,50 @@ describe("completion requires objective-level evidence", () => {
     expect(result.unmet.some((u) => u.includes("criterion not evidenced"))).toBe(true);
     // The criterion was never bound, so its id is unused.
     expect(criterionID).toBeTruthy();
+  });
+
+  // Audit defect 4: a relative file path belongs to the session's workspace,
+  // not to whatever cwd the plugin host happens to have.
+  test("relative file checks resolve against the session workspace", async () => {
+    const workspace = mkdtempSync(join(tmpdir(), "xgoal-workspace-"));
+    try {
+      writeFileSync(join(workspace, "notes.txt"), "ok\n");
+      const goal = store.create({ sessionID: "ses_ws", objective: "write notes.txt" });
+      const criterionID = store.addCriterion(goal.id, "notes.txt contains ok", {
+        type: "file",
+        path: "notes.txt",
+        contains: "ok",
+      });
+      store.addEvidence({
+        goalID: goal.id,
+        criterionID,
+        kind: "file",
+        ref: "notes.txt",
+      });
+
+      const seen: string[] = [];
+      const verifier = new GoalVerifier(store, {
+        workspaceFor: async (sessionID) => {
+          expect(sessionID).toBe("ses_ws");
+          return workspace;
+        },
+        validate: async (_evidence, sessionWorkspace) => {
+          seen.push(`validate:${sessionWorkspace}`);
+          return { valid: true, reason: "file present" };
+        },
+        checkSpec: async (_criterion, sessionWorkspace) => {
+          seen.push(`checkSpec:${sessionWorkspace}`);
+          return { valid: true, reason: "content matches" };
+        },
+      });
+
+      const result = await verifier.verify(goal.id);
+      expect(result.verdict).toBe("complete");
+      expect(seen).toContain(`validate:${workspace}`);
+      expect(seen).toContain(`checkSpec:${workspace}`);
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
   });
 });
 
