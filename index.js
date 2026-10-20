@@ -1219,11 +1219,11 @@ function wire(controller, goal) {
     generation: goal.generation,
     objective: goal.objective,
     status: goal.status,
-    reason: goal.reason,
+    reason: goal.reason ?? null,
     rounds: goal.rounds,
     noProgressRounds: goal.noProgressRounds,
-    tokensUsed: goal.tokensUsed,
-    tokenBudget: goal.tokenBudget,
+    tokensUsed: goal.tokensUsed ?? null,
+    tokenBudget: goal.tokenBudget ?? null,
     criteria: controller.store.listCriteria(goal.id)
   };
 }

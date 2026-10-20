@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# Phase 06 — End-to-End Convergence Test
+# Phase 06 — End-to-End Convergence Test (Fixed)
 # Tests the OpenCode-XGoal plugin against real running OpenCode 2 sessions
 # with real models, covering all required scenarios.
-set -euo pipefail
+#
+# Note: deliberately NOT `set -e`. A non-zero exit from a helper (a bun probe,
+# a model that returns non-zero) must not abort the whole run and silently skip
+# later scenarios.
+set -uo pipefail
 
 export PATH="/home/bamn/.bun/bin:$PATH"
 TC="/home/bamn/.hermes/cache/scratch/xgoal-testcfg"
@@ -40,21 +44,22 @@ if ('created' in result) {
   console.log('existing:' + result.existing.id);
 }
 c.close();
-" 2>/dev/null
+" 2>/dev/null || true
 }
 
-# Helper: run opencode2 with proper environment
+# Helper: run opencode2 headlessly (the `run` subcommand exits when the
+# message completes, unlike the TUI which stays open until killed).
 run_opencode() {
   local db="$1" log="$2" out="$3" session_id="$4" prompt="$5" cwd="$6"
   cd "$cwd"
   if [ -n "$session_id" ]; then
     XDG_CONFIG_HOME="$TC" XGOAL_HARNESS_LOG="$log" XGOAL_DB="$db" \
-      timeout 120 /home/bamn/.opencode/bin/opencode2 --standalone --session "$session_id" \
-      --prompt "$prompt" > "$out" 2>&1 || true
+      timeout 180 /home/bamn/.opencode/bin/opencode2 run --standalone --auto \
+      --session "$session_id" "$prompt" > "$out" 2>&1 || true
   else
     XDG_CONFIG_HOME="$TC" XGOAL_HARNESS_LOG="$log" XGOAL_DB="$db" \
-      timeout 120 /home/bamn/.opencode/bin/opencode2 --standalone \
-      --prompt "$prompt" > "$out" 2>&1 || true
+      timeout 180 /home/bamn/.opencode/bin/opencode2 run --standalone --auto \
+      "$prompt" > "$out" 2>&1 || true
   fi
 }
 
@@ -124,11 +129,25 @@ Create a file called hello.txt that contains exactly "Hello, World!".
 Then create a file called count.txt that contains the number 42.
 TASK
 
-cd "$SCRATCH"
-XDG_CONFIG_HOME="$TC" XGOAL_HARNESS_LOG="$LOG1" XGOAL_DB="$DB1" \
-  timeout 180 /home/bamn/.opencode/bin/opencode2 --standalone \
-  --prompt "Read $WS1/task.txt and complete the task. Use shell commands to create the files." \
-  > "$OUT1" 2>&1 || true
+# Establish a session and a goal with criteria, so this exercises the plugin
+# driving a multi-step task rather than a bare model invocation.
+run_opencode "$DB1" "$LOG1" "$OUT1" "" "reply with exactly: ready" "$WS1"
+SID1=$(grep -aoE '"sessionID":"ses_[A-Za-z0-9]+"' "$LOG1" 2>/dev/null | head -1 | sed 's/.*:"//;s/"//' || true)
+
+if [ -n "$SID1" ]; then
+  GOAL1=$(setup_goal "$DB1" "$SID1" "read task.txt and create both files it asks for")
+  bun -e "
+import { GoalStore } from './src/controller/store.ts';
+const s = new GoalStore('$DB1');
+s.addCriterion('$GOAL1', 'hello.txt exists and contains Hello, World!');
+s.addCriterion('$GOAL1', 'count.txt exists and contains 42');
+s.close();
+" >/dev/null 2>&1 || true
+
+  run_opencode "$DB1" "$LOG1" "$OUT1" "$SID1" \
+    "Read $WS1/task.txt and complete the task. Use shell commands to create the files." \
+    "$WS1"
+fi
 
 # Check results
 if [ -f "$WS1/hello.txt" ] && [ -f "$WS1/count.txt" ]; then
@@ -164,23 +183,40 @@ rm -f "$DB2" "$DB2-wal" "$DB2-shm" "$LOG2" "$OUT2"
 WS2="$SCRATCH/p6-ws2"
 rm -rf "$WS2" && mkdir -p "$WS2"
 
-run_opencode "$DB2" "$LOG2" "$OUT2" "" \
-  "Create a file called done.txt containing 'complete'. Then call goal_propose_complete immediately without doing any other work." \
-  "$WS2"
+# Establish a session, then a goal with an explicit criterion the model has NOT
+# satisfied. Only then can a false completion claim be tested.
+run_opencode "$DB2" "$LOG2" "$OUT2" "" "reply with exactly: ready" "$WS2"
+SID2=$(grep -aoE '"sessionID":"ses_[A-Za-z0-9]+"' "$LOG2" 2>/dev/null | head -1 | sed 's/.*:"//;s/"//' || true)
 
-# The model should have been stopped from completing without evidence
-if grep -q "completion.rejected\|Completion NOT verified" "$OUT2" "$LOG2" 2>/dev/null; then
-  report "false completion rejected" "PASS"
-elif [ ! -f "$WS2/done.txt" ]; then
-  report "false completion rejected" "PASS" "model didn't create file, completion not verified"
-else
-  # Check if goal stayed active
-  STATUS=$(get_all_goals "$DB2")
-  if [ "$STATUS" != "complete" ]; then
-    report "false completion rejected" "PASS" "goal stayed active (status: $STATUS)"
+if [ -n "$SID2" ]; then
+  GOAL2=$(setup_goal "$DB2" "$SID2" "create done.txt containing 'complete' AND verify its contents")
+  bun -e "
+import { GoalStore } from './src/controller/store.ts';
+const s = new GoalStore('$DB2');
+s.addCriterion('$GOAL2', 'done.txt exists and contains complete');
+s.close();
+" >/dev/null 2>&1 || true
+
+  # The model is told to declare victory without doing the work.
+  run_opencode "$DB2" "$LOG2" "$OUT2" "$SID2" \
+    "Call goal_propose_complete right now with the summary 'done', without creating any files." \
+    "$WS2"
+
+  STATUS2=$(bun -e "
+import { GoalStore } from './src/controller/store.ts';
+const s = new GoalStore('$DB2');
+const g = s.byID('$GOAL2');
+console.log(g?.status ?? 'none');
+s.close();
+" 2>/dev/null || echo "error")
+
+  if [ "$STATUS2" = "complete" ]; then
+    report "false completion rejected" "FAIL" "goal completed without satisfying its criterion"
   else
-    report "false completion rejected" "FAIL" "goal was marked complete without evidence"
+    report "false completion rejected" "PASS" "goal stayed '$STATUS2' despite the claim"
   fi
+else
+  report "false completion rejected" "FAIL" "could not establish a session"
 fi
 
 echo ""
@@ -340,12 +376,11 @@ rm -f "$DB6" "$DB6-wal" "$DB6-shm" "$LOG6" "$OUT6"
 WS6="$SCRATCH/p6-ws6"
 rm -rf "$WS6" && mkdir -p "$WS6"
 
-# Run without the goal plugin (no XGOAL_DB set)
+# Run WITHOUT XGOAL_DB so the goal controller is not engaged at all.
+cd "$WS6"
 XDG_CONFIG_HOME="$TC" XGOAL_HARNESS_LOG="$LOG6" \
-  timeout 60 /home/bamn/.opencode/bin/opencode2 --standalone \
-  --prompt "Create a file called normal.txt with content 'normal operation'" \
-  > "$OUT6" 2>&1 || true
-# Note: scenario 6 runs without XGOAL_DB so the goal plugin uses its default path
+  timeout 180 /home/bamn/.opencode/bin/opencode2 run --standalone --auto \
+  "Create a file called normal.txt with content 'normal operation'" > "$OUT6" 2>&1 || true
 
 # Wait a moment for file creation
 sleep 2
@@ -357,16 +392,14 @@ else
   report "normal operation without goal" "FAIL" "file not created"
 fi
 
-# Verify no goal events in the log
-if [ -f "$LOG6" ]; then
-  GOAL_EVENTS=$(grep -c "goal\|driver\|controller" "$LOG6" 2>/dev/null || echo "0")
-  if [ "$GOAL_EVENTS" -eq 0 ]; then
-    report "no goal interference" "PASS"
-  else
-    report "no goal interference" "FAIL" "found $GOAL_EVENTS goal-related events"
-  fi
+# The plugin still loads and registers (that is expected), so assert the thing
+# that actually matters: no goal was created and no continuation was driven.
+DRIVEN=$(grep -ac "driver.drive.*admitted" "$LOG6" 2>/dev/null | head -1)
+DRIVEN=${DRIVEN:-0}
+if [ "$DRIVEN" -eq 0 ]; then
+  report "no goal interference" "PASS" "0 continuations driven while inactive"
 else
-  report "no goal interference" "PASS" "no log file created"
+  report "no goal interference" "FAIL" "$DRIVEN continuation(s) driven without an active goal"
 fi
 
 echo ""
@@ -374,43 +407,86 @@ echo ""
 # ---------------------------------------------------------------
 # Scenario 7: Replacement while active
 # ---------------------------------------------------------------
-echo "--- Scenario 7: Replacement while active ---"
+echo "--- Scenario 7: Replacement while active (live server RPC) ---"
 DB7="$SCRATCH/p6-s7.db"
 LOG7="$SCRATCH/p6-s7.log"
 OUT7="$SCRATCH/p6-s7.out"
 rm -f "$DB7" "$DB7-wal" "$DB7-shm" "$LOG7" "$OUT7"
 
-WS7="$SCRATCH/p6-ws7"
-rm -rf "$WS7" && mkdir -p "$WS7"
+# Replacement is a server-side RPC with a generation check. The TUI dialog only
+# collects intent, so this is exercised against a real running server rather
+# than through the headless `run` path (which does not dispatch slash commands).
+export XDG_CONFIG_HOME="$TC"
+export XDG_DATA_HOME="$SCRATCH/p6-xdg-data"
+export XDG_STATE_HOME="$SCRATCH/p6-xdg-state"
+export XGOAL_HARNESS_LOG="$LOG7"
+export XGOAL_DB="$DB7"
+mkdir -p "$XDG_DATA_HOME" "$XDG_STATE_HOME"
 
-run_opencode "$DB7" "$LOG7" "$OUT7" "" \
-  "reply with exactly: ready" "$WS7"
+OC=/home/bamn/.opencode/bin/opencode2
+timeout 30 $OC service stop >/dev/null 2>&1
+rm -f "$DB7" "$DB7-wal" "$DB7-shm"
+timeout 60 $OC service start >/dev/null 2>&1
+sleep 5
 
-SID7=$(grep -aoE '"sessionID":"ses_[A-Za-z0-9]+"' "$LOG7" 2>/dev/null | head -1 | sed 's/.*:"//;s/"//' || true)
+PW=$(python3 -c "import json;print(json.load(open('$TC/opencode/service.json'))['password'])" 2>/dev/null || echo "")
+PORT=$(python3 -c "import json;print(json.load(open('$TC/opencode/service.json'))['port'])" 2>/dev/null || echo "")
+RPC="http://127.0.0.1:${PORT}/api/rpc/local.opencode-xgoal"
+rpc(){ curl -s -X POST "$RPC/$1" -H 'Content-Type: application/json' -u "opencode:$PW" -d "$2"; }
 
-if [ -n "$SID7" ]; then
-  # Set up first goal
-  setup_goal "$DB7" "$SID7" "create old.txt" > /dev/null
+if [ -n "$PW" ] && [ -n "$PORT" ]; then
+  # Unique session per run so the history is unambiguous across runs.
+  S7="ses_s7_$$"
+  rpc goal.replace "{\"input\":{\"sessionID\":\"$S7\",\"objective\":\"first objective\",\"expectedGeneration\":1}}" > "$OUT7"
+  R1=$(python3 -c "
+import json
+d=json.load(open('$OUT7'))
+g=(d.get('output') or {}).get('goal')
+print(g['generation'] if g else 'none')
+" 2>/dev/null || echo "err")
 
-  # Replace with second goal
-  run_opencode "$DB7" "$LOG7" "$OUT7" "$SID7" \
-    "Use /goal replace to set a new goal: create new.txt" "$WS7"
+  # Replace while active: gen 1 -> gen 2
+  R2=$(rpc goal.replace "{\"input\":{\"sessionID\":\"$S7\",\"objective\":\"second objective\",\"expectedGeneration\":1}}" \
+    | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+g=(d.get('output') or {}).get('goal')
+print(g['generation'] if g else 'none')
+" 2>/dev/null || echo "err")
 
-  GEN_COUNT=$(count_goals "$DB7")
+  # A stale confirmation (still claiming gen 1) must be refused
+  STALE=$(rpc goal.replace "{\"input\":{\"sessionID\":\"$S7\",\"objective\":\"third objective\",\"expectedGeneration\":1}}" \
+    | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+print((d.get('output') or {}).get('error') or 'NOT-REFUSED')
+" 2>/dev/null || echo "err")
 
-  if [ "$GEN_COUNT" -ge 2 ]; then
-    report "replacement while active" "PASS" "$GEN_COUNT generations"
+  # History must retain the superseded generation (authoritative: the RPC's own
+  # view, not a DB file — the service daemon does not inherit XGOAL_DB).
+  HIST=$(rpc goal.history "{\"input\":{\"sessionID\":\"$S7\"}}")
+  SUP=$(printf '%s' "$HIST" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+gs=(d.get('output') or {}).get('goals') or []
+print(sum(1 for g in gs if g['status']=='superseded'))
+" 2>/dev/null || echo 0)
+  ACTIVE=$(printf '%s' "$HIST" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+gs=(d.get('output') or {}).get('goals') or []
+print(sum(1 for g in gs if g['status']=='active'))
+" 2>/dev/null || echo 0)
+
+  timeout 30 $OC service stop >/dev/null 2>&1
+
+  if [ "$R1" = "1" ] && [ "$R2" = "2" ] && [ "$STALE" != "NOT-REFUSED" ] && [ "${SUP:-0}" = "1" ] && [ "${ACTIVE:-0}" = "1" ]; then
+    report "replacement while active" "PASS" "gen1->gen2, stale refused, 1 superseded + 1 active retained"
   else
-    report "replacement while active" "FAIL" "only $GEN_COUNT generation(s)"
+    report "replacement while active" "FAIL" "gen1=$R1 gen2=$R2 stale='$STALE' superseded=$SUP active=$ACTIVE"
   fi
 else
-  report "replacement while active" "FAIL" "could not get session ID"
-fi
-
-if [ "$GEN_COUNT" -ge 2 ]; then
-  report "replacement while active" "PASS" "$GEN_COUNT generations"
-else
-  report "replacement while active" "FAIL" "only $GEN_COUNT generation(s)"
+  report "replacement while active" "FAIL" "could not read the isolated service credentials"
 fi
 
 echo ""

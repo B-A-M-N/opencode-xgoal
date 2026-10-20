@@ -154,6 +154,51 @@ describe("pause and resume", () => {
   });
 });
 
+describe("RPC output must be JSON-serializable", () => {
+  // Regression: `undefined` is not a JSON value. The RPC output schema rejected
+  // it, so a goal.replace that had ALREADY mutated state returned
+  // `rpc.invalid_output: Expected JSON value at ["goal"]["reason"]` to the
+  // caller. A fresh goal has no `reason`, so this hit every first replacement.
+  test("a freshly created goal serializes without undefined fields", async () => {
+    const res = await handlers["goal.replace"]({
+      sessionID: "ses_a",
+      objective: "fresh objective",
+      expectedGeneration: 1,
+    });
+    expect(res.error).toBeUndefined();
+    // No property may be undefined, or the RPC output schema will reject it.
+    const flat = JSON.parse(JSON.stringify(res.goal));
+    for (const [k, v] of Object.entries(flat)) {
+      expect(v).not.toBeUndefined();
+      expect(k).toBeTruthy();
+    }
+    expect(flat.reason).toBeNull();
+    expect(flat.tokensUsed).toBeNull();
+    expect(flat.tokenBudget).toBeNull();
+  });
+
+  test("status output for a fresh goal is JSON-clean too", async () => {
+    controller.startOrDescribe("ses_a", "objective");
+    const res = await handlers["goal.status"]({ sessionID: "ses_a" });
+    const flat = JSON.parse(JSON.stringify(res.goal));
+    expect(flat.reason).toBeNull();
+    expect(flat.tokensUsed).toBeNull();
+  });
+
+  test("a round-trip through JSON preserves every field", async () => {
+    const created = await handlers["goal.replace"]({
+      sessionID: "ses_a",
+      objective: "obj",
+      expectedGeneration: 1,
+    });
+    const round = JSON.parse(JSON.stringify(created.goal));
+    expect(round.objective).toBe("obj");
+    expect(round.generation).toBe(1);
+    expect(round.status).toBe("active");
+    expect(Array.isArray(round.criteria)).toBe(true);
+  });
+});
+
 describe("headless parity", () => {
   test("every TUI action has a headless RPC equivalent", async () => {
     // A client with no dialog can still do everything the TUI does.

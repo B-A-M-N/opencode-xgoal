@@ -23,26 +23,29 @@ export interface GoalWire {
   generation: number;
   objective: string;
   status: string;
-  reason?: string;
+  reason: string | null;
   rounds: number;
   noProgressRounds: number;
-  tokensUsed?: number;
-  tokenBudget?: number;
+  tokensUsed: number | null;
+  tokenBudget: number | null;
   criteria: { id: string; text: string; met: boolean }[];
 }
 
 function wire(controller: GoalController, goal: Goal | undefined): GoalWire | null {
   if (!goal) return null;
+  // Every field must be a JSON value. `undefined` is not, and the RPC output
+  // schema rejects it — which would turn a successful mutation into a
+  // serialization error reported to the caller. Coerce to null.
   return {
     id: goal.id,
     generation: goal.generation,
     objective: goal.objective,
     status: goal.status,
-    reason: goal.reason,
+    reason: goal.reason ?? null,
     rounds: goal.rounds,
     noProgressRounds: goal.noProgressRounds,
-    tokensUsed: goal.tokensUsed,
-    tokenBudget: goal.tokenBudget,
+    tokensUsed: goal.tokensUsed ?? null,
+    tokenBudget: goal.tokenBudget ?? null,
     criteria: controller.store.listCriteria(goal.id),
   };
 }
