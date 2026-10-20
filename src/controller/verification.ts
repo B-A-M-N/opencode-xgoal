@@ -14,30 +14,11 @@
 import type { GoalStore, GoalRound } from "./store.ts";
 import type { Goal } from "./state.ts";
 import type { CriterionSpec } from "./criteria.ts";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { isAbsolute, resolve } from "node:path";
+import { hashFile, resolveWorkspacePath, sessionWorkspace } from "./workspace.ts";
 
-/** Resolve a captured path against the session workspace, never the cwd. */
-export function resolveWorkspacePath(ref: string, workspace: string): string {
-  if (isAbsolute(ref)) return ref;
-  const base = workspace && workspace.length > 0 ? workspace : process.cwd();
-  return resolve(base, ref);
-}
-
-/** The workspace the current session is operating in, if known. */
-function sessionWorkspace(): string {
-  return String(process.env.XGOAL_WORKSPACE ?? process.env.PWD ?? "");
-}
-
-/** Content hash, so file evidence can be checked for staleness. */
-export function hashFile(path: string): string {
-  try {
-    return createHash("sha256").update(readFileSync(path)).digest("hex").slice(0, 32);
-  } catch {
-    return "";
-  }
-}
+export { hashFile, resolveWorkspacePath } from "./workspace.ts";
 
 /** Evidence kinds the controller can machine-verify. */
 export type EvidenceKind =

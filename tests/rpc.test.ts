@@ -298,6 +298,26 @@ describe("mutations schedule execution (audit defect 7)", () => {
     expect(driven).toHaveLength(2);
   });
 
+  test("a dispatch throw is surfaced through the coordinator hook", async () => {
+    const errors: string[] = [];
+    const coordinator = new GoalCoordinator(
+      controller,
+      () => ({
+        async drive(sessionID: string): Promise<never> {
+          throw new Error(`boom:${sessionID}`);
+        },
+      }),
+      {
+        onDriveError: (sessionID, error) => errors.push(`${sessionID}:${String(error)}`),
+      },
+    );
+    const h = goalRpcHandlers(controller, coordinator);
+    const res = await h["goal.create"]({ sessionID: "ses_a", objective: "x" });
+    // The mutation still stands; the failure is observable instead of silent.
+    expect(res.goal?.status).toBe("active");
+    expect(errors).toEqual(["ses_a:Error: boom:ses_a"]);
+  });
+
   test("goal.health names an active goal that nothing is driving", async () => {
     const { handlers: h } = withCoordinator();
     controller.startOrDescribe("ses_a", "x");

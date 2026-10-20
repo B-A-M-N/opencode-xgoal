@@ -1,7 +1,6 @@
 // src/index.ts
-import { appendFileSync, existsSync as existsSync2, mkdirSync, readFileSync as readFileSync2 } from "node:fs";
-import { createHash as createHash2 } from "node:crypto";
-import { dirname, isAbsolute as isAbsolute2, join, resolve as resolve2 } from "node:path";
+import { appendFileSync, existsSync, mkdirSync, readFileSync as readFileSync2 } from "node:fs";
+import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 
 // src/controller/store.ts
@@ -1392,13 +1391,29 @@ class GoalController {
   }
 }
 
+// src/controller/calls.ts
+function selectToolRef(resolved, input, messageID) {
+  if (resolved.goalID && resolved.generation !== undefined) {
+    return { ok: true, ref: resolved };
+  }
+  if (messageID) {
+    return {
+      ok: false,
+      reason: "this call could not be attributed to a goal generation from its message; call goal_get and retry from the current turn"
+    };
+  }
+  return { ok: true, ref: { goalID: input?.goal_id, generation: input?.generation } };
+}
+
 // src/controller/coordinator.ts
 class GoalCoordinator {
   controller;
   dispatcher;
-  constructor(controller, dispatcher) {
+  hooks;
+  constructor(controller, dispatcher, hooks = {}) {
     this.controller = controller;
     this.dispatcher = dispatcher;
+    this.hooks = hooks;
   }
   async start(sessionID, objective) {
     const out = this.controller.startOrDescribe(sessionID, objective);
@@ -1426,7 +1441,8 @@ class GoalCoordinator {
       return;
     try {
       return await dispatcher.drive(sessionID);
-    } catch {
+    } catch (error) {
+      this.hooks.onDriveError?.(sessionID, error);
       return;
     }
   }
@@ -1793,9 +1809,9 @@ class SessionTransport {
   }
 }
 
-// src/controller/verification.ts
-import { readFileSync } from "node:fs";
+// src/controller/workspace.ts
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 function resolveWorkspacePath(ref, workspace) {
   if (isAbsolute(ref))
@@ -1813,6 +1829,9 @@ function hashFile(path) {
     return "";
   }
 }
+
+// src/controller/verification.ts
+import { createHash as createHash2 } from "node:crypto";
 var OBJECTIVE_PROOF_KINDS = new Set(["test", "file"]);
 
 class EvidenceLedger {
@@ -1910,7 +1929,7 @@ function snapshotOf(criteria, evidence) {
     criteria: criteria.map((c) => [c.id, c.text, c.spec ?? null]),
     evidence: evidence.map((e) => [e.id, e.kind, e.ref, e.exitCode ?? null, e.hash ?? null, e.criterionID ?? null])
   });
-  return createHash("sha256").update(canonical).digest("hex").slice(0, 32);
+  return createHash2("sha256").update(canonical).digest("hex").slice(0, 32);
 }
 
 class GoalVerifier {
@@ -2255,15 +2274,6 @@ function goalRpcHandlers(controller, coordinator) {
 
 // src/index.ts
 var LOG = process.env.XGOAL_HARNESS_LOG ?? "";
-function resolveWorkspacePath2(ref, workspace) {
-  if (isAbsolute2(ref))
-    return ref;
-  const base = workspace && workspace.length > 0 ? workspace : process.cwd();
-  return resolve2(base, ref);
-}
-function sessionWorkspace2() {
-  return String(process.env.XGOAL_WORKSPACE ?? process.env.PWD ?? "");
-}
 function describeDrive(outcome) {
   if (!outcome)
     return "dispatch unavailable (no driver connected)";
@@ -2284,13 +2294,6 @@ function describeDrive(outcome) {
       return `not dispatched: ${outcome.reason}.`;
     default:
       return `dispatch: ${String(outcome.action)}.`;
-  }
-}
-function hashFile2(path) {
-  try {
-    return createHash2("sha256").update(readFileSync2(path)).digest("hex").slice(0, 32);
-  } catch {
-    return "";
   }
 }
 function record(entry) {
@@ -2356,7 +2359,7 @@ var src_default = {
           }
         } catch {}
       }
-      return sessionWorkspace2();
+      return sessionWorkspace();
     };
     if (controller) {
       const transport = new SessionTransport({
@@ -2392,7 +2395,9 @@ var src_default = {
         }
       });
       driver = new GoalDriver(controller.store, transport);
-      coordinator = new GoalCoordinator(controller, () => driver);
+      coordinator = new GoalCoordinator(controller, () => driver, {
+        onDriveError: (sessionID, error) => record({ event: "coordinator.drive.error", sessionID, error: String(error) })
+      });
       ledger = new EvidenceLedger(controller.store);
       verifier = new GoalVerifier(controller.store, {
         async workspaceFor(sessionID) {
@@ -2400,13 +2405,13 @@ var src_default = {
         },
         async validate(evidence, workspace) {
           if (evidence.kind === "file") {
-            const resolved = resolveWorkspacePath2(evidence.ref, workspace);
+            const resolved = resolveWorkspacePath(evidence.ref, workspace);
             try {
-              if (!existsSync2(resolved)) {
+              if (!existsSync(resolved)) {
                 return { valid: false, reason: `file not found: ${evidence.ref}` };
               }
               if (evidence.hash !== undefined) {
-                const actual = hashFile2(resolved);
+                const actual = hashFile(resolved);
                 if (actual !== evidence.hash) {
                   return {
                     valid: false,
@@ -2435,9 +2440,9 @@ var src_default = {
             return { valid: false, reason: "no independent check for this spec" };
           }
           const spec = criterion.spec;
-          const resolved = resolveWorkspacePath2(spec.path, workspace);
+          const resolved = resolveWorkspacePath(spec.path, workspace);
           try {
-            if (!existsSync2(resolved)) {
+            if (!existsSync(resolved)) {
               return { valid: false, reason: `file not found: ${spec.path}` };
             }
             if (spec.equals !== undefined || spec.contains !== undefined) {
@@ -2576,12 +2581,15 @@ var src_default = {
             if (!controller)
               return { content: `goal controller unavailable: ${startupError}` };
             const ref = await resolveMessageRef(toolCtx?.sessionID, toolCtx?.messageID);
+            const target = selectToolRef(ref, input, toolCtx?.messageID);
+            if (!target.ok)
+              return { content: `Goal call rejected: ${target.reason}` };
             const out = controller.checkpoint(toolCtx?.sessionID, {
               summary: String(input?.summary ?? ""),
               evidenceRefs: input?.evidence_refs,
               criterionID: input?.criterion_id,
-              goalID: ref.goalID ?? input?.goal_id,
-              generation: ref.generation ?? input?.generation
+              goalID: target.ref.goalID,
+              generation: target.ref.generation
             });
             if (!out.recorded)
               return { content: `Checkpoint not recorded: ${out.rejected}` };
@@ -2617,6 +2625,9 @@ var src_default = {
               return { content: `goal controller unavailable: ${startupError}` };
             const sessionID = toolCtx?.sessionID;
             const ref = await resolveMessageRef(sessionID, toolCtx?.messageID);
+            const target = selectToolRef(ref, input, toolCtx?.messageID);
+            if (!target.ok)
+              return { content: `Goal call rejected: ${target.reason}` };
             const out = controller.proposeComplete(sessionID, {
               summary: String(input?.summary ?? ""),
               evidenceRefs: input?.evidence_refs,
@@ -2624,8 +2635,8 @@ var src_default = {
                 criterionID: String(c?.criterion_id ?? ""),
                 evidenceRefs: Array.isArray(c?.evidence_refs) ? c.evidence_refs : []
               })) : undefined,
-              goalID: ref.goalID ?? input?.goal_id,
-              generation: ref.generation ?? input?.generation
+              goalID: target.ref.goalID,
+              generation: target.ref.generation
             });
             if (out.rejected)
               return { content: `Completion proposal rejected: ${out.rejected}` };
@@ -2680,12 +2691,15 @@ ${result.unmet.map((u) => `- ${u}`).join(`
             if (!controller)
               return { content: `goal controller unavailable: ${startupError}` };
             const ref = await resolveMessageRef(toolCtx?.sessionID, toolCtx?.messageID);
+            const target = selectToolRef(ref, input, toolCtx?.messageID);
+            if (!target.ok)
+              return { content: `Goal call rejected: ${target.reason}` };
             const out = controller.reportBlocked(toolCtx?.sessionID, {
               reason: String(input?.reason ?? ""),
               evidenceRefs: input?.evidence_refs,
               externalDependency: input?.external_dependency === true,
-              goalID: ref.goalID ?? input?.goal_id,
-              generation: ref.generation ?? input?.generation
+              goalID: target.ref.goalID,
+              generation: target.ref.generation
             });
             if (out.rejected)
               return { content: `Blocker report rejected: ${out.rejected}` };

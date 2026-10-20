@@ -10,6 +10,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GoalController } from "../src/controller/controller.ts";
+import { selectToolRef } from "../src/controller/calls.ts";
 import type { Goal } from "../src/controller/state.ts";
 
 let dir: string;
@@ -354,5 +355,30 @@ describe("completion binding and post-completion lifecycle", () => {
     });
     expect(controller.latest("ses_a")?.status).toBe("superseded");
     expect(controller.status("ses_a")).toBeUndefined();
+  });
+});
+
+describe("model tool calls are fenced to their message identity", () => {
+  const resolved = { goalID: "goal_from_message", generation: 3 };
+
+  test("the resolved message generation wins over model-supplied refs", () => {
+    const choice = selectToolRef(resolved, { goal_id: "spoofed", generation: 99 }, "msg_1");
+    expect(choice).toEqual({ ok: true, ref: resolved });
+  });
+
+  test("an unresolvable message identity is rejected, not guessed", () => {
+    const choice = selectToolRef({}, { goal_id: "goal_current", generation: 2 }, "msg_1");
+    expect(choice.ok).toBe(false);
+    if (!choice.ok) expect(choice.reason).toContain("could not be attributed");
+  });
+
+  test("input refs are only accepted when the host exposes no message identity", () => {
+    const choice = selectToolRef({}, { goal_id: "legacy_goal", generation: 1 }, undefined);
+    expect(choice).toEqual({ ok: true, ref: { goalID: "legacy_goal", generation: 1 } });
+  });
+
+  test("a host without message identity may omit refs for the legacy path", () => {
+    const choice = selectToolRef({}, undefined, undefined);
+    expect(choice).toEqual({ ok: true, ref: { goalID: undefined, generation: undefined } });
   });
 });

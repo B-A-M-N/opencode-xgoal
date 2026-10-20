@@ -28,13 +28,24 @@ export interface MutationResult {
   drive?: DriveOutcome;
 }
 
+export interface CoordinatorHooks {
+  /** Called when scheduling execution throws, before the sweep retries. */
+  onDriveError?: (sessionID: string, error: unknown) => void;
+}
+
 export class GoalCoordinator {
   private readonly controller: GoalController;
   private readonly dispatcher: () => GoalDispatcher | undefined;
+  private readonly hooks: CoordinatorHooks;
 
-  constructor(controller: GoalController, dispatcher: () => GoalDispatcher | undefined) {
+  constructor(
+    controller: GoalController,
+    dispatcher: () => GoalDispatcher | undefined,
+    hooks: CoordinatorHooks = {},
+  ) {
     this.controller = controller;
     this.dispatcher = dispatcher;
+    this.hooks = hooks;
   }
 
   /**
@@ -78,9 +89,11 @@ export class GoalCoordinator {
     if (!dispatcher) return undefined;
     try {
       return await dispatcher.drive(sessionID);
-    } catch {
-      // A dispatch failure is recorded by the driver (delivery_failed); the
-      // mutation itself still stands, and the sweep will retry the round.
+    } catch (error) {
+      // The mutation itself still stands and the sweep will retry the round, but
+      // the failure must be visible rather than indistinguishable from "no
+      // dispatcher". The plugin wires this hook to its structured log.
+      this.hooks.onDriveError?.(sessionID, error);
       return undefined;
     }
   }

@@ -10,13 +10,14 @@
  *   - the entry must sit at the package root (`main: "index.js"`)
  */
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
-import { createHash } from "node:crypto";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { GoalController } from "./controller/controller.ts";
+import { selectToolRef } from "./controller/calls.ts";
 import { GoalCoordinator } from "./controller/coordinator.ts";
 import { GoalDriver } from "./controller/driver.ts";
 import { RoundObserver, SessionTransport } from "./controller/transport.ts";
+import { hashFile, resolveWorkspacePath, sessionWorkspace } from "./controller/workspace.ts";
 import {
   EvidenceLedger,
   GoalVerifier,
@@ -25,24 +26,6 @@ import {
 import { goalRpcDefinition, goalRpcHandlers } from "./rpc.ts";
 
 const LOG = process.env.XGOAL_HARNESS_LOG ?? "";
-
-/**
- * Resolve a captured path against the session workspace.
- *
- * A relative path must never resolve against the plugin process's own cwd, or a
- * criterion like "create a.txt" could be satisfied by an unrelated file in the
- * directory the plugin happened to start from.
- */
-function resolveWorkspacePath(ref: string, workspace: string): string {
-  if (isAbsolute(ref)) return ref;
-  const base = workspace && workspace.length > 0 ? workspace : process.cwd();
-  return resolve(base, ref);
-}
-
-/** The workspace the current session is operating in, if known. */
-function sessionWorkspace(): string {
-  return String(process.env.XGOAL_WORKSPACE ?? process.env.PWD ?? "");
-}
 
 /** Human-readable dispatch outcome for command replies and the TUI. */
 function describeDrive(outcome: any): string {
@@ -64,15 +47,6 @@ function describeDrive(outcome: any): string {
       return `not dispatched: ${outcome.reason}.`;
     default:
       return `dispatch: ${String(outcome.action)}.`;
-  }
-}
-
-/** Content hash, so file evidence can be checked for staleness. */
-function hashFile(path: string): string {
-  try {
-    return createHash("sha256").update(readFileSync(path)).digest("hex").slice(0, 32);
-  } catch {
-    return "";
   }
 }
 
@@ -218,7 +192,10 @@ export default {
       // One authoritative mutation path. The command, the RPC surface and the
       // TUI all use this, so creating/replacing/resuming a goal schedules the
       // native execution instead of leaving an active goal with no driver.
-      coordinator = new GoalCoordinator(controller, () => driver);
+      coordinator = new GoalCoordinator(controller, () => driver, {
+        onDriveError: (sessionID, error) =>
+          record({ event: "coordinator.drive.error", sessionID, error: String(error) }),
+      });
 
       // Evidence is captured from observed tool executions only. A model's
       // prose never reaches this ledger.
@@ -461,12 +438,14 @@ export default {
           async execute(input: any, toolCtx: any) {
             if (!controller) return { content: `goal controller unavailable: ${startupError}` };
             const ref = await resolveMessageRef(toolCtx?.sessionID, toolCtx?.messageID);
+            const target = selectToolRef(ref, input, toolCtx?.messageID);
+            if (!target.ok) return { content: `Goal call rejected: ${target.reason}` };
             const out = controller.checkpoint(toolCtx?.sessionID, {
               summary: String(input?.summary ?? ""),
               evidenceRefs: input?.evidence_refs,
               criterionID: input?.criterion_id,
-              goalID: ref.goalID ?? input?.goal_id,
-              generation: ref.generation ?? input?.generation,
+              goalID: target.ref.goalID,
+              generation: target.ref.generation,
             });
             if (!out.recorded) return { content: `Checkpoint not recorded: ${out.rejected}` };
             return {
@@ -505,6 +484,8 @@ export default {
             if (!controller) return { content: `goal controller unavailable: ${startupError}` };
             const sessionID = toolCtx?.sessionID;
             const ref = await resolveMessageRef(sessionID, toolCtx?.messageID);
+            const target = selectToolRef(ref, input, toolCtx?.messageID);
+            if (!target.ok) return { content: `Goal call rejected: ${target.reason}` };
             const out = controller.proposeComplete(sessionID, {
               summary: String(input?.summary ?? ""),
               evidenceRefs: input?.evidence_refs,
@@ -514,8 +495,8 @@ export default {
                     evidenceRefs: Array.isArray(c?.evidence_refs) ? c.evidence_refs : [],
                   }))
                 : undefined,
-              goalID: ref.goalID ?? input?.goal_id,
-              generation: ref.generation ?? input?.generation,
+              goalID: target.ref.goalID,
+              generation: target.ref.generation,
             });
             if (out.rejected) return { content: `Completion proposal rejected: ${out.rejected}` };
 
@@ -584,12 +565,14 @@ export default {
           async execute(input: any, toolCtx: any) {
             if (!controller) return { content: `goal controller unavailable: ${startupError}` };
             const ref = await resolveMessageRef(toolCtx?.sessionID, toolCtx?.messageID);
+            const target = selectToolRef(ref, input, toolCtx?.messageID);
+            if (!target.ok) return { content: `Goal call rejected: ${target.reason}` };
             const out = controller.reportBlocked(toolCtx?.sessionID, {
               reason: String(input?.reason ?? ""),
               evidenceRefs: input?.evidence_refs,
               externalDependency: input?.external_dependency === true,
-              goalID: ref.goalID ?? input?.goal_id,
-              generation: ref.generation ?? input?.generation,
+              goalID: target.ref.goalID,
+              generation: target.ref.generation,
             });
             if (out.rejected) return { content: `Blocker report rejected: ${out.rejected}` };
             if (!out.accepted) {
