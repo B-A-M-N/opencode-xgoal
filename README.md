@@ -204,7 +204,42 @@ All phases below are implemented and committed.
    validation, blocker auditing, progress classification, usage accounting. ✅
 4. **TUI and replacement** — RPC bridge, confirmation dialog, status indicator. ✅
 5. **Parity evaluation** — identical tasks against Codex `/goal` and this
-   controller; measure verified completion rate and premature-stop rate. ⬜
+   controller; measure verified completion rate and premature-stop rate. ✅
+   (see `scripts/parity.sh` and the results below)
+
+### Parity results vs Codex `/goal`
+
+`scripts/parity.sh` runs identical multi-requirement tasks through both
+controllers and scores success by **reading the resulting files only** — nothing
+either model says is treated as evidence.
+
+3 runs × 3 tasks = 9 runs per system:
+
+| Metric | Codex `/goal` | OpenCode-XGoal |
+| --- | --- | --- |
+| requirement completion | 33/33 (100%) | 33/33 (100%) |
+| runs with a miss | 0/9 | 0/9 |
+| mean turns/run | 2.1 | 2.0 |
+
+**Both controllers are equivalent on these tasks.** An earlier scoring pass
+reported 93.9% vs 100% with 22% premature stops for Codex; that was wrong. The
+task text said "create a summary.txt" without pinning a location, Codex wrote it
+into `data/` while this controller wrote it at the workspace root, and the
+scorer only looked at the root. Re-scoring the same artifacts
+location-agnostically gives 33/33 for both. The gap was an ambiguity in the
+harness's task spec, not a behavioural difference.
+
+Caveats, stated plainly: n=9 per system, and the tasks are small (3–4 file
+requirements). This measures multi-requirement completion and premature stop on
+short tasks. It does **not** exercise the case the design was actually aimed at —
+long-horizon goals like "find and fix all bugs in this subsystem" — where the
+unit list is not knowable up front. Treat this as "no regression vs Codex on
+short tasks", not as evidence of superiority.
+
+One asymmetry to keep in mind when reading the numbers: the harness seeds this
+controller with the acceptance criteria explicitly, because that is how the
+controller is designed to work. Codex receives only the prompt. That slightly
+favours the controller here and is worth correcting in any follow-up.
 
 Design constraints carried forward from the review (deliberate, non-obvious):
 
