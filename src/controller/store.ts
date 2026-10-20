@@ -198,6 +198,8 @@ function newID(prefix: string): string {
 
 export class GoalStore {
   readonly db: Database;
+  /** Transaction nesting depth; lets compound ops join an open transaction. */
+  private depth = 0;
 
   constructor(path: string) {
     this.db = new Database(path, { create: true });
@@ -214,8 +216,14 @@ export class GoalStore {
   /**
    * Run `fn` inside an IMMEDIATE transaction. Takes the write lock up front so
    * two concurrent writers serialise instead of deadlocking on upgrade.
+   *
+   * Reentrant: a nested call joins the enclosing transaction rather than
+   * issuing a second BEGIN (which SQLite rejects). This is what lets a compound
+   * operation compose transactional primitives atomically.
    */
   private tx<T>(fn: () => T): T {
+    if (this.depth > 0) return fn();
+    this.depth += 1;
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const out = fn();
@@ -228,6 +236,8 @@ export class GoalStore {
         /* rollback failure must not mask the original error */
       }
       throw error;
+    } finally {
+      this.depth -= 1;
     }
   }
 
@@ -834,6 +844,9 @@ export class GoalStore {
     return this.tx(() => {
       const round = this.roundByID(input.roundID);
       if (!round) throw new GoalConflictError(`unknown round ${input.roundID}`);
+      // Idempotent: a duplicate terminal-execution event must not settle the
+      // round twice or append a second event.
+      if (round.status === "settled") return round;
       this.db
         .query(
           `UPDATE goal_rounds SET status='settled', classification=?, detail=?, settled_at_ms=? WHERE id=?`,
@@ -844,6 +857,37 @@ export class GoalStore {
         detail: `${input.classification}${input.detail ? `: ${input.detail}` : ""}`,
       });
       return this.roundByID(input.roundID)!;
+    });
+  }
+
+  /**
+   * Settle a round and record its outcome in a single transaction.
+   *
+   * Split across two transactions, a crash between them leaves the round
+   * settled but uncounted (or counted but still outstanding). One writer is
+   * also what makes a duplicate terminal event harmless.
+   */
+  settleAndRecord(input: {
+    roundID: string;
+    classification: "progress" | "verifiedWait" | "noProgress" | "blocked" | "complete";
+    detail?: string;
+    tokensUsed?: number;
+  }): { round: GoalRound; goal?: Goal } {
+    return this.tx(() => {
+      const before = this.roundByID(input.roundID);
+      if (!before) throw new GoalConflictError(`unknown round ${input.roundID}`);
+      // Already settled: a duplicate terminal event must not count the round
+      // a second time.
+      if (before.status === "settled") return { round: before };
+      this.settleRound(input);
+      const goal = this.recordRound({
+        goalID: before.goalID,
+        generation: before.generation,
+        classification: input.classification,
+        detail: input.detail,
+        tokensUsed: input.tokensUsed,
+      });
+      return { round: this.roundByID(input.roundID)!, goal };
     });
   }
 }

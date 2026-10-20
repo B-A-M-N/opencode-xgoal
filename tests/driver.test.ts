@@ -182,17 +182,32 @@ describe("admission is not execution", () => {
     expect(transport.submitted).toHaveLength(1);
   });
 
-  test("reconcile does not re-submit a round that is running or settled", async () => {
+  test("reconcile does not re-submit a round that is running", async () => {
     const { transport, driver } = setup();
     await driver.drive("ses_a");
 
     transport.probeResult = "running";
     await driver.reconcile();
+    // A running round is in flight: re-sending would duplicate it.
     expect(transport.submitted).toHaveLength(1);
+  });
+
+  test("a settled round is settled, not left outstanding or re-sent", async () => {
+    const { transport, driver, goal } = setup();
+    await driver.drive("ses_a");
 
     transport.probeResult = "settled";
     await driver.reconcile();
-    expect(transport.submitted).toHaveLength(1);
+
+    // The finished round is settled and counted exactly once.
+    const original = store.roundsFor(goal.id)[0];
+    expect(original.status).toBe("settled");
+    expect(original.classification).toBe("progress");
+
+    // The same round is never re-submitted; the next continuation carries a
+    // different inbox ID.
+    expect(transport.submitted).toHaveLength(2);
+    expect(transport.submitted[1].inboxID).not.toBe(transport.submitted[0].inboxID);
   });
 
   test("an unknown probe leaves the round outstanding without re-submitting", async () => {
@@ -314,12 +329,18 @@ describe("fencing and recovery", () => {
     store = new GoalStore(dbPath);
     const transport2 = new FakeTransport();
     transport2.probeResult = "settled";
-    const driver2 = new GoalDriver(store, transport2);
+    const driver2 = new GoalDriver(store, transport2, {
+      classify: () => ({ classification: "progress" }),
+    });
     await driver2.reconcile();
 
-    // The admitted round is adopted, not re-sent.
-    expect(transport2.submitted).toHaveLength(0);
-    expect(store.roundByInboxID(round.inboxID)?.status).toBe("admitted");
+    // The admitted round is settled, never re-sent with the same ID.
+    expect(store.roundByInboxID(round.inboxID)?.status).toBe("settled");
+    for (const s of transport2.submitted) {
+      expect(s.inboxID).not.toBe(round.inboxID);
+    }
+    // The goal is still active, so the loop continues with a NEW continuation.
+    expect(transport2.submitted).toHaveLength(1);
   });
 });
 
@@ -381,5 +402,89 @@ describe("resource limits", () => {
     const out = await driver.drive("ses_a");
     expect(out.action).toBe("idle");
     expect(transport.submitted).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Audit defect 2 — the settle -> evaluate -> continue loop must actually run.
+// Before the fix, a settled round was left outstanding forever: drive() kept
+// returning `reconcile` and no second continuation was ever submitted.
+// ---------------------------------------------------------------------------
+describe("settled rounds drive the next continuation", () => {
+  test("a settled round is settled and the loop continues", async () => {
+    const transport = new FakeTransport();
+    const driver = new GoalDriver(store, transport, {
+      classify: () => ({ classification: "progress" }),
+    });
+    const goal = store.create({ sessionID: "ses_a", objective: "build the replacement" });
+
+    // First turn: reserve + submit.
+    const first = await driver.drive("ses_a");
+    expect(first.action).toBe("admitted");
+    expect(transport.submitted).toHaveLength(1);
+    expect(goal.rounds).toBe(0);
+
+    // The model stops. The round has actually finished.
+    transport.probeResult = "settled";
+    const second = await driver.drive("ses_a");
+
+    // The round was settled AND the next continuation was submitted.
+    expect(second.action).toBe("admitted");
+    expect(transport.submitted).toHaveLength(2);
+
+    const rounds = store.roundsFor(goal.id);
+    expect(rounds).toHaveLength(2);
+    expect(rounds[0].status).toBe("settled");
+    expect(rounds[0].classification).toBe("progress");
+    // The round counter was incremented exactly once for the settled round.
+    expect(store.current("ses_a")!.rounds).toBe(1);
+  });
+
+  test("a duplicate terminal event does not double-count the round", async () => {
+    const transport = new FakeTransport();
+    const driver = new GoalDriver(store, transport, {
+      classify: () => ({ classification: "progress" }),
+    });
+    const goal = store.create({ sessionID: "ses_a", objective: "x" });
+
+    await driver.drive("ses_a");
+    transport.probeResult = "settled";
+
+    // Simulate the same `session.execution.succeeded` arriving twice.
+    await driver.drive("ses_a");
+    const rounds = store.roundsFor(goal.id);
+    const settled = rounds.filter((r) => r.status === "settled");
+    expect(settled).toHaveLength(1);
+    expect(rounds[0].classification).toBe("progress");
+
+    // The counter reflects one settled round, not two.
+    expect(store.current("ses_a")!.rounds).toBe(1);
+  });
+
+  test("a no-progress classification is recorded and can stall the goal", async () => {
+    const transport = new FakeTransport();
+    const driver = new GoalDriver(store, transport, {
+      maxNoProgressRounds: 2,
+      classify: () => ({ classification: "noProgress" }),
+    });
+    store.create({ sessionID: "ses_a", objective: "x" });
+
+    await driver.drive("ses_a");
+    transport.probeResult = "settled";
+    await driver.drive("ses_a");
+    expect(store.current("ses_a")!.noProgressRounds).toBe(1);
+
+    // Second unproductive round reaches the stall threshold.
+    transport.probeResult = "settled";
+    await driver.drive("ses_a");
+    expect(store.current("ses_a")!.noProgressRounds).toBe(2);
+
+    transport.probeResult = "settled";
+    await driver.drive("ses_a");
+    expect(store.current("ses_a")!.status).toBe("stalled");
+    // Two rounds were settled and counted; the third drive stalled the goal
+    // before reserving another continuation.
+    expect(store.current("ses_a")!.rounds).toBe(2);
+    expect(store.current("ses_a")!.noProgressRounds).toBe(2);
   });
 });

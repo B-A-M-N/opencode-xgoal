@@ -26,7 +26,7 @@ import {
   type GoalRound,
   type GoalStore,
 } from "./store.ts";
-import { type Goal, isTerminal } from "./state.ts";
+import { type Goal, isNonTerminal, isTerminal } from "./state.ts";
 
 /** Result of trying to hand a continuation to the session. */
 export type SubmitResult =
@@ -61,7 +61,22 @@ export interface DriverOptions {
   maxRoundAttempts?: number;
   /** Render the continuation text for a goal. */
   renderContinuation?: (goal: Goal) => string;
+  /**
+   * Classify a settled round. Called exactly once per round, from the same
+   * transaction that settles it. Supply this from the plugin so the classifier
+   * sees real tool observations rather than a guess.
+   */
+  classify?: (input: {
+    goal: Goal;
+    round: GoalRound;
+    evidenceCount: number;
+  }) => { classification: "progress" | "verifiedWait" | "noProgress" | "blocked"; detail?: string };
 }
+
+const DEFAULT_CLASSIFY = (): { classification: "progress"; detail?: string } => ({
+  classification: "progress",
+  detail: "no classifier connected",
+});
 
 export type DriveOutcome =
   | { action: "idle"; reason: string }
@@ -104,6 +119,7 @@ export class GoalDriver {
   private readonly maxNoProgressRounds: number;
   private readonly maxRoundAttempts: number;
   private readonly render: (goal: Goal) => string;
+  private readonly classify: NonNullable<DriverOptions["classify"]>;
 
   constructor(
     store: GoalStore,
@@ -115,6 +131,7 @@ export class GoalDriver {
     this.maxNoProgressRounds = options.maxNoProgressRounds ?? 3;
     this.maxRoundAttempts = options.maxRoundAttempts ?? 5;
     this.render = options.renderContinuation ?? DEFAULT_CONTINUATION;
+    this.classify = options.classify ?? DEFAULT_CLASSIFY;
   }
 
   /**
@@ -124,6 +141,18 @@ export class GoalDriver {
    * transport call happens strictly outside it.
    */
   async drive(sessionID: string): Promise<DriveOutcome> {
+    // Reconcile any in-flight round first. If it has settled, this settles it,
+    // records its outcome, and (inside reconcileRound) submits the next
+    // continuation. Only a round left outstanding falls through to reserve().
+    const goal = this.store.current(sessionID);
+    if (goal && goal.status === "active") {
+      const outstanding = this.store.outstandingRound(goal.id);
+      if (outstanding) {
+        const outcome = await this.reconcileRound(outstanding);
+        if (outcome.action !== "reconcile") return outcome;
+      }
+    }
+
     const decision = this.reserve(sessionID);
     if (decision.action !== "dispatch") return decision.outcome;
 
@@ -267,10 +296,46 @@ export class GoalDriver {
         this.store.markRoundRunning(round.id);
         return { action: "reconcile", roundID: round.id, status: "running" };
 
-      case "settled":
-        // Settling is the evaluator's job (Phase 04); leave it outstanding for
-        // it, but do not re-submit.
-        return { action: "reconcile", roundID: round.id, status: "settled" };
+      case "settled": {
+        // The round has actually finished. Settle it exactly once, classify it,
+        // and then continue the loop if the goal still has work.
+        const evidenceCount = this.store.listEvidence(goal.id).length;
+        const verdict = this.classify({ goal, round, evidenceCount });
+        const settledGoal = this.settleRound({
+          roundID: round.id,
+          classification: verdict.classification,
+          detail: verdict.detail,
+        });
+        const settledStatus = settledGoal?.status ?? round.status;
+        // A stalled or terminal goal must not be re-driven.
+        const after = this.store.byID(goal.id);
+        if (!after || !isNonTerminal(after.status)) {
+          return { action: "reconcile", roundID: round.id, status: settledStatus };
+        }
+        // Recheck generation: the goal may have been replaced while settling.
+        if (after.generation !== round.generation) {
+          return { action: "reconcile", roundID: round.id, status: settledStatus };
+        }
+        // Apply the stall policy. The store records the round; the decision to
+        // park the goal is the controller's, so it lives here.
+        const stalled =
+          verdict.classification === "noProgress" &&
+          after.noProgressRounds >= this.maxNoProgressRounds &&
+          after.status === "active";
+        if (stalled) {
+          const parked = this.store.transition({
+            goalID: after.id,
+            generation: after.generation,
+            to: "stalled",
+            actor: "controller",
+            reason: `${after.noProgressRounds} consecutive rounds without progress`,
+          });
+          return { action: "reconcile", roundID: round.id, status: parked.status };
+        }
+        const next = this.reserve(after.sessionID);
+        if (next.action === "dispatch") return this.dispatch(next.round, after.sessionID);
+        return next.outcome;
+      }
 
       case "notDelivered": {
         // Safe to retry, and only with the original id.
@@ -304,18 +369,15 @@ export class GoalDriver {
   }): Goal | undefined {
     const round = this.store.roundByID(input.roundID);
     if (!round) throw new GoalConflictError(`unknown round ${input.roundID}`);
-    this.store.settleRound({
+    // Settle and record in ONE transaction, and idempotently. A duplicate
+    // terminal-execution event must not increment the round counter twice.
+    const { goal } = this.store.settleAndRecord({
       roundID: input.roundID,
-      classification: input.classification,
-      detail: input.detail,
-    });
-    return this.store.recordRound({
-      goalID: round.goalID,
-      generation: round.generation,
       classification: input.classification,
       detail: input.detail,
       tokensUsed: input.tokensUsed,
     });
+    return goal;
   }
 
   /** Consecutive unproductive rounds needed before a goal is stalled. */
