@@ -211,4 +211,51 @@ describe("live execution liveness", () => {
     // One release must fully clear the duplicated starts.
     expect(observer.isBusy("ses_a")).toBe(false);
   });
+
+  // Review follow-up (P3): the completion event may omit the message id even
+  // when `started` carried it. The release must still land on the slot-tied
+  // reference — and the slot must stop claiming a reference it no longer
+  // holds, so a later forget() cannot spend it against another execution.
+  test("a completion without the message id releases the slot-tied reference", () => {
+    const observer = new RoundObserver();
+    observer.observe({
+      type: "session.execution.started",
+      data: { sessionID: "ses_a", messageID: "msg_xgoal_x" },
+    });
+    observer.observe({ type: "session.execution.succeeded", data: { sessionID: "ses_a" } });
+    expect(observer.isBusy("ses_a")).toBe(false);
+    // A new execution starts; the stale slot claim must not release it.
+    observer.observe({ type: "session.execution.started", data: { sessionID: "ses_a" } });
+    observer.forget("msg_xgoal_x");
+    expect(observer.isBusy("ses_a")).toBe(true);
+  });
+
+  test("an id-carrying completion releases a direct reference whose start missed the id", () => {
+    const observer = new RoundObserver();
+    observer.observe({ type: "session.execution.started", data: { sessionID: "ses_a" } });
+    observer.observe({
+      type: "session.execution.succeeded",
+      data: { sessionID: "ses_a", messageID: "msg_xgoal_x" },
+    });
+    // Not stuck busy until the TTL: the completion is real evidence of an end.
+    expect(observer.isBusy("ses_a")).toBe(false);
+  });
+
+  test("an id-carrying completion never releases a different continuation's reference", () => {
+    const observer = new RoundObserver();
+    observer.observe({
+      type: "session.execution.started",
+      data: { sessionID: "ses_a", messageID: "msg_xgoal_y" },
+    });
+    // A completion naming a continuation that never counted must not spend
+    // msg_xgoal_y's reference: no direct reference exists to attribute it to.
+    observer.observe({
+      type: "session.execution.succeeded",
+      data: { sessionID: "ses_a", messageID: "msg_xgoal_z" },
+    });
+    expect(observer.isBusy("ses_a")).toBe(true);
+    // y's own authoritative settlement releases exactly y's reference.
+    observer.forget("msg_xgoal_y");
+    expect(observer.isBusy("ses_a")).toBe(false);
+  });
 });

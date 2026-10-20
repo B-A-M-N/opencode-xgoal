@@ -12,7 +12,7 @@ after a completed one and a generation-checked replacement.
 
 ```bash
 bun run build     # required: the package entry is ./index.js
-bun test          # 192 unit/integration tests
+bun test          # 195 unit/integration tests
 bash scripts/parity.sh   # live activation acceptance (real server + model)
 ```
 
@@ -263,7 +263,7 @@ inspection. It never touches the user's database or sessions.
 ## Verification
 
 ```bash
-bun test          # 192 unit/integration tests, 553 assertions
+bun test          # 195 unit/integration tests, 558 assertions
 bun run typecheck # clean
 bash scripts/parity.sh  # 17/17 live acceptance checks
 ```

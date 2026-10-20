@@ -20,12 +20,20 @@ interface Observed {
   running: boolean;
   finished: boolean;
   /**
-   * Whether this execution currently holds a reference in `runningBySession`.
-   * Tied to the slot so settlement can release it — a completion event that
-   * never arrives cannot leak the reference forever.
+   * Token of the busy reference this slot holds in `runningBySession`, or
+   * undefined. Releases are by token, so a reference can neither be released
+   * twice nor spent on a different execution — even when the completion event
+   * arrives without the message id that `started` carried.
    */
-  counted?: boolean;
+  counted?: number;
   sessionID?: string;
+}
+
+/** One held busy reference in a session's live set. */
+interface BusyRef {
+  startedMs: number;
+  /** Inbox ID when the reference is tied to a continuation message slot. */
+  slot?: string;
 }
 
 /**
@@ -47,8 +55,17 @@ const LIVE_WAIT_TTL_MS = 15 * 60 * 1000;
  */
 export class RoundObserver {
   private readonly seen = new Map<string, Observed>();
-  /** Running executions per session, from execution lifecycle events. */
-  private readonly runningBySession = new Map<string, { count: number; touchedMs: number }>();
+  /**
+   * Live busy references per session: token → reference. The count is the
+   * map size; the token is what makes releases safe — every release names
+   * the exact reference it ends, so a completion event whose id-shape
+   * differs from its `started` counterpart can never strand a slot flag or
+   * spend another execution's reference.
+   */
+  private readonly runningBySession = new Map<string, Map<number, BusyRef>>();
+  /** Per-session stack of held tokens, most recently started on top. */
+  private readonly recentTokens = new Map<string, number[]>();
+  private nextToken = 0;
 
   private slot(inboxID: string): Observed {
     let s = this.seen.get(inboxID);
@@ -59,22 +76,79 @@ export class RoundObserver {
     return s;
   }
 
-  private addBusy(sessionID: string): void {
-    const now = Date.now();
-    const entry = this.runningBySession.get(sessionID);
-    if (entry) {
-      entry.count += 1;
-      entry.touchedMs = now;
-    } else {
-      this.runningBySession.set(sessionID, { count: 1, touchedMs: now });
+  /** Hold one busy reference; returns its token. */
+  private addBusy(sessionID: string, slot?: string): number {
+    const token = ++this.nextToken;
+    let refs = this.runningBySession.get(sessionID);
+    if (!refs) {
+      refs = new Map();
+      this.runningBySession.set(sessionID, refs);
     }
+    const ref: BusyRef = { startedMs: Date.now() };
+    if (slot) ref.slot = slot;
+    refs.set(token, ref);
+    const stack = this.recentTokens.get(sessionID);
+    if (stack) stack.push(token);
+    else this.recentTokens.set(sessionID, [token]);
+    return token;
   }
 
-  private removeBusy(sessionID: string): void {
-    const entry = this.runningBySession.get(sessionID);
-    if (!entry) return;
-    entry.count -= 1;
-    if (entry.count <= 0) this.runningBySession.delete(sessionID);
+  /** Drop one reference by token. Already-released tokens are no-ops. */
+  private release(sessionID: string, token: number): void {
+    const refs = this.runningBySession.get(sessionID);
+    if (!refs?.delete(token)) return;
+    const stack = this.recentTokens.get(sessionID);
+    if (stack) {
+      const at = stack.indexOf(token);
+      if (at >= 0) stack.splice(at, 1);
+      if (stack.length === 0) this.recentTokens.delete(sessionID);
+    }
+    if (refs.size === 0) this.runningBySession.delete(sessionID);
+  }
+
+  /**
+   * Release a specific token, clearing the owning slot's claim when it still
+   * matches. This is the only path that releases a slot-tied reference, so a
+   * released slot can never be released again by `forget`.
+   */
+  private releaseToken(sessionID: string, token: number): void {
+    const ref = this.runningBySession.get(sessionID)?.get(token);
+    if (!ref) return;
+    if (ref.slot) {
+      const slot = this.seen.get(ref.slot);
+      if (slot?.counted === token) slot.counted = undefined;
+    }
+    this.release(sessionID, token);
+  }
+
+  /**
+   * A completion event with no message identity. Executions in a session are
+   * serialized, so the most recently started reference is the one that ended;
+   * with true concurrency the live set is anonymous anyway, and token-guarded
+   * releases keep mis-attribution harmless (no double release, no underflow).
+   */
+  private releaseMostRecent(sessionID: string): void {
+    const stack = this.recentTokens.get(sessionID);
+    const token = stack?.[stack.length - 1];
+    if (token !== undefined) this.releaseToken(sessionID, token);
+  }
+
+  /**
+   * A completion event naming a continuation whose `started` missed the id:
+   * its reference was held directly. Release a direct reference — and only a
+   * direct one, since another continuation's reference must not be spent on
+   * an execution we cannot tie to it.
+   */
+  private releaseDirect(sessionID: string): void {
+    const refs = this.runningBySession.get(sessionID);
+    const stack = this.recentTokens.get(sessionID);
+    if (!refs || !stack) return;
+    for (let i = stack.length - 1; i >= 0; i--) {
+      if (!refs.get(stack[i])?.slot) {
+        this.releaseToken(sessionID, stack[i]);
+        return;
+      }
+    }
   }
 
   /** Feed one event. Unknown shapes are ignored rather than guessed at. */
@@ -102,37 +176,36 @@ export class RoundObserver {
       ((pick("info") as { id?: string } | undefined)?.id as string | undefined);
 
     // Session-level execution liveness: a verified wait must be able to see a
-    // real running execution, not infer one from silence. For our own
-    // continuations the reference is tied to the message slot, so authoritative
-    // settlement (which knows the slot) can release it even when the completion
-    // event was never observed; duplicate `started` events are idempotent.
+    // real running execution, not infer one from silence. Every reference is
+    // held under a unique token; a completion releases by token — its own
+    // slot's when the id is known, otherwise the most recently started — so
+    // id-shape mismatches between `started` and completion events cannot
+    // double-release or release the wrong execution. Duplicate `started`
+    // events are idempotent.
     if (type.startsWith("session.execution.")) {
       const sessionID = pick("sessionID") as string | undefined;
       if (sessionID) {
         const continuation = id?.startsWith("msg_xgoal_") ? this.slot(id) : undefined;
-        if (continuation) {
-          continuation.sessionID = sessionID;
-          if (type === "session.execution.started") {
+        const completed =
+          type === "session.execution.succeeded" || type === "session.execution.failed";
+        if (continuation) continuation.sessionID = sessionID;
+        if (type === "session.execution.started") {
+          if (continuation) {
             if (!continuation.counted) {
-              continuation.counted = true;
-              this.addBusy(sessionID);
+              continuation.counted = this.addBusy(sessionID, id);
             }
-          } else if (
-            (type === "session.execution.succeeded" || type === "session.execution.failed") &&
-            continuation.counted
-          ) {
-            continuation.counted = false;
-            this.removeBusy(sessionID);
-          }
-        } else {
-          const entry = this.runningBySession.get(sessionID);
-          if (type === "session.execution.started") {
+          } else {
             this.addBusy(sessionID);
-          } else if (
-            (type === "session.execution.succeeded" || type === "session.execution.failed") &&
-            entry
-          ) {
-            this.removeBusy(sessionID);
+          }
+        } else if (completed) {
+          if (continuation?.counted !== undefined) {
+            this.releaseToken(sessionID, continuation.counted);
+          } else if (continuation) {
+            // The id is known but its slot never counted: the `started` event
+            // missed the id and held a direct reference instead.
+            this.releaseDirect(sessionID);
+          } else {
+            this.releaseMostRecent(sessionID);
           }
         }
       }
@@ -182,9 +255,13 @@ export class RoundObserver {
    * the TTL is stale and ignored rather than pinning the session busy forever.
    */
   isBusy(sessionID: string): boolean {
-    const entry = this.runningBySession.get(sessionID);
-    if (!entry || entry.count <= 0) return false;
-    return Date.now() - entry.touchedMs < LIVE_WAIT_TTL_MS;
+    const refs = this.runningBySession.get(sessionID);
+    if (!refs || refs.size === 0) return false;
+    const now = Date.now();
+    for (const ref of refs.values()) {
+      if (now - ref.startedMs < LIVE_WAIT_TTL_MS) return true;
+    }
+    return false;
   }
 
   /**
@@ -193,13 +270,13 @@ export class RoundObserver {
    * Settlement is authoritative: the transcript showed the execution end. If
    * the completion event was missed, this is what releases the slot's busy
    * reference — event loss can no longer classify every future round as a
-   * verified wait.
+   * verified wait. The release is by token, so a slot whose reference was
+   * already taken over by a shapeless completion cannot release again here.
    */
   forget(inboxID: string): void {
     const slot = this.seen.get(inboxID);
-    if (slot?.counted && slot.sessionID) {
-      slot.counted = false;
-      this.removeBusy(slot.sessionID);
+    if (slot?.counted !== undefined && slot.sessionID) {
+      this.releaseToken(slot.sessionID, slot.counted);
     }
     this.seen.delete(inboxID);
   }

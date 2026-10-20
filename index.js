@@ -1832,9 +1832,13 @@ class GoalDriver {
 }
 
 // src/controller/transport.ts
+var LIVE_WAIT_TTL_MS = 15 * 60 * 1000;
+
 class RoundObserver {
   seen = new Map;
   runningBySession = new Map;
+  recentTokens = new Map;
+  nextToken = 0;
   slot(inboxID) {
     let s = this.seen.get(inboxID);
     if (!s) {
@@ -1842,6 +1846,68 @@ class RoundObserver {
       this.seen.set(inboxID, s);
     }
     return s;
+  }
+  addBusy(sessionID, slot) {
+    const token = ++this.nextToken;
+    let refs = this.runningBySession.get(sessionID);
+    if (!refs) {
+      refs = new Map;
+      this.runningBySession.set(sessionID, refs);
+    }
+    const ref = { startedMs: Date.now() };
+    if (slot)
+      ref.slot = slot;
+    refs.set(token, ref);
+    const stack = this.recentTokens.get(sessionID);
+    if (stack)
+      stack.push(token);
+    else
+      this.recentTokens.set(sessionID, [token]);
+    return token;
+  }
+  release(sessionID, token) {
+    const refs = this.runningBySession.get(sessionID);
+    if (!refs?.delete(token))
+      return;
+    const stack = this.recentTokens.get(sessionID);
+    if (stack) {
+      const at = stack.indexOf(token);
+      if (at >= 0)
+        stack.splice(at, 1);
+      if (stack.length === 0)
+        this.recentTokens.delete(sessionID);
+    }
+    if (refs.size === 0)
+      this.runningBySession.delete(sessionID);
+  }
+  releaseToken(sessionID, token) {
+    const ref = this.runningBySession.get(sessionID)?.get(token);
+    if (!ref)
+      return;
+    if (ref.slot) {
+      const slot = this.seen.get(ref.slot);
+      if (slot?.counted === token)
+        slot.counted = undefined;
+    }
+    this.release(sessionID, token);
+  }
+  releaseMostRecent(sessionID) {
+    const stack = this.recentTokens.get(sessionID);
+    const token = stack?.[stack.length - 1];
+    if (token !== undefined)
+      this.releaseToken(sessionID, token);
+  }
+  releaseDirect(sessionID) {
+    const refs = this.runningBySession.get(sessionID);
+    const stack = this.recentTokens.get(sessionID);
+    if (!refs || !stack)
+      return;
+    for (let i = stack.length - 1;i >= 0; i--) {
+      if (!refs.get(stack[i])?.slot) {
+        this.releaseToken(sessionID, stack[i]);
+        return;
+      }
+    }
   }
   observe(event) {
     const e = event;
@@ -1851,18 +1917,33 @@ class RoundObserver {
     const d = e?.data ?? {};
     const p = e?.properties ?? {};
     const pick = (k) => d[k] ?? p[k];
+    const id = pick("messageID") ?? pick("messageId") ?? pick("message")?.id ?? pick("info")?.id;
     if (type.startsWith("session.execution.")) {
       const sessionID = pick("sessionID");
       if (sessionID) {
-        const running = this.runningBySession.get(sessionID) ?? 0;
+        const continuation = id?.startsWith("msg_xgoal_") ? this.slot(id) : undefined;
+        const completed = type === "session.execution.succeeded" || type === "session.execution.failed";
+        if (continuation)
+          continuation.sessionID = sessionID;
         if (type === "session.execution.started") {
-          this.runningBySession.set(sessionID, running + 1);
-        } else if ((type === "session.execution.succeeded" || type === "session.execution.failed") && running > 0) {
-          this.runningBySession.set(sessionID, running - 1);
+          if (continuation) {
+            if (!continuation.counted) {
+              continuation.counted = this.addBusy(sessionID, id);
+            }
+          } else {
+            this.addBusy(sessionID);
+          }
+        } else if (completed) {
+          if (continuation?.counted !== undefined) {
+            this.releaseToken(sessionID, continuation.counted);
+          } else if (continuation) {
+            this.releaseDirect(sessionID);
+          } else {
+            this.releaseMostRecent(sessionID);
+          }
         }
       }
     }
-    const id = pick("messageID") ?? pick("messageId") ?? pick("message")?.id ?? pick("info")?.id;
     if (!id || !id.startsWith("msg_xgoal_"))
       return;
     const s = this.slot(id);
@@ -1900,9 +1981,21 @@ class RoundObserver {
     return "unknown";
   }
   isBusy(sessionID) {
-    return (this.runningBySession.get(sessionID) ?? 0) > 0;
+    const refs = this.runningBySession.get(sessionID);
+    if (!refs || refs.size === 0)
+      return false;
+    const now = Date.now();
+    for (const ref of refs.values()) {
+      if (now - ref.startedMs < LIVE_WAIT_TTL_MS)
+        return true;
+    }
+    return false;
   }
   forget(inboxID) {
+    const slot = this.seen.get(inboxID);
+    if (slot?.counted !== undefined && slot.sessionID) {
+      this.releaseToken(slot.sessionID, slot.counted);
+    }
     this.seen.delete(inboxID);
   }
 }
