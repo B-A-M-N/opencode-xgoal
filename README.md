@@ -9,12 +9,16 @@ The controller itself is not implemented yet; see [Roadmap](#roadmap).
 
 ---
 
-## Phase 01 findings — verified against OpenCode 2
+## Phase 01 findings — observed on the tested environment
 
-Everything below was verified by running a real plugin against a real
-OpenCode 2 build, not by reading type signatures. Two of these findings
-contradict the obvious reading of the API, and both cost real time to discover,
-so they are recorded first.
+Everything below was observed by running a real plugin against a real OpenCode 2
+build (`opencode v2.0.31` standalone), not by reading type signatures. These are
+**observed behaviours of this environment**, not asserted universal properties of
+OpenCode 2 — later releases may differ, and each should be re-checked against a
+pinned build rather than assumed.
+
+Two of these contradict the obvious reading of the API and both cost real time
+to discover, so they are recorded first.
 
 ### 1. The V2 plugin API is `@opencode/plugin`, not `@opencode-ai/plugin`
 

@@ -1,64 +1,904 @@
 // src/index.ts
 import { appendFileSync, mkdirSync } from "node:fs";
-import { dirname } from "node:path";
-var LOG = process.env.XGOAL_HARNESS_LOG ?? "/tmp/xgoal-harness.log";
+import { dirname, join } from "node:path";
+import { homedir } from "node:os";
+
+// src/controller/store.ts
+import { Database } from "bun:sqlite";
+
+// src/controller/state.ts
+var TERMINAL_STATUSES = ["complete", "superseded"];
+var NON_TERMINAL_STATUSES = [
+  "active",
+  "paused",
+  "verifying",
+  "blocked",
+  "stalled",
+  "budgetLimited",
+  "usageLimited"
+];
+var ALL_STATUSES = [
+  ...NON_TERMINAL_STATUSES,
+  ...TERMINAL_STATUSES
+];
+var TRANSITIONS = {
+  active: {
+    paused: ["user", "controller"],
+    verifying: ["model", "controller"],
+    blocked: ["model", "controller"],
+    stalled: ["controller"],
+    budgetLimited: ["controller"],
+    usageLimited: ["controller"],
+    superseded: ["user", "controller"]
+  },
+  paused: {
+    active: ["user", "controller"],
+    superseded: ["user", "controller"]
+  },
+  verifying: {
+    active: ["controller"],
+    complete: ["controller"],
+    blocked: ["controller"],
+    superseded: ["user", "controller"]
+  },
+  blocked: {
+    active: ["user", "controller"],
+    superseded: ["user", "controller"]
+  },
+  stalled: {
+    active: ["user", "controller"],
+    superseded: ["user", "controller"]
+  },
+  budgetLimited: {
+    active: ["user"],
+    superseded: ["user", "controller"]
+  },
+  usageLimited: {
+    active: ["user"],
+    superseded: ["user", "controller"]
+  },
+  complete: {},
+  superseded: {}
+};
+function canTransition({ from, to, actor }) {
+  if (from === to) {
+    return { ok: true };
+  }
+  const targets = TRANSITIONS[from];
+  if (!targets) {
+    return { ok: false, reason: `unknown source status: ${from}` };
+  }
+  const actors = targets[to];
+  if (!actors) {
+    return { ok: false, reason: `illegal transition ${from} -> ${to}` };
+  }
+  if (!actors.includes(actor)) {
+    return {
+      ok: false,
+      reason: `transition ${from} -> ${to} is not permitted for actor "${actor}" (allowed: ${actors.join(", ")})`
+    };
+  }
+  return { ok: true };
+}
+function isTerminal(status) {
+  return TERMINAL_STATUSES.includes(status);
+}
+function isNonTerminal(status) {
+  return NON_TERMINAL_STATUSES.includes(status);
+}
+
+// src/controller/store.ts
+class GoalConflictError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "GoalConflictError";
+  }
+}
+
+class TransitionRejectedError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "TransitionRejectedError";
+  }
+}
+var SCHEMA = `
+CREATE TABLE IF NOT EXISTS goals (
+  id                       TEXT PRIMARY KEY,
+  session_id               TEXT NOT NULL,
+  generation               INTEGER NOT NULL,
+  objective                TEXT NOT NULL,
+  status                   TEXT NOT NULL,
+  reason                   TEXT,
+  rounds                   INTEGER NOT NULL DEFAULT 0,
+  no_progress_rounds       INTEGER NOT NULL DEFAULT 0,
+  repeated_blocker_rounds  INTEGER NOT NULL DEFAULT 0,
+  tokens_used              INTEGER,
+  token_budget             INTEGER,
+  version                  INTEGER NOT NULL DEFAULT 0,
+  created_at_ms            INTEGER NOT NULL,
+  updated_at_ms            INTEGER NOT NULL,
+  completed_at_ms          INTEGER,
+  superseded_by            TEXT,
+  UNIQUE (session_id, generation)
+);
+
+-- (1) At most one non-terminal goal per session. Terminal rows (complete,
+-- superseded) are excluded so history accumulates freely.
+CREATE UNIQUE INDEX IF NOT EXISTS goals_one_current_per_session
+  ON goals (session_id)
+  WHERE status NOT IN ('complete', 'superseded');
+
+CREATE TABLE IF NOT EXISTS goal_events (
+  seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+  goal_id     TEXT NOT NULL,
+  generation  INTEGER NOT NULL,
+  kind        TEXT NOT NULL,
+  from_status TEXT,
+  to_status   TEXT,
+  actor       TEXT,
+  detail      TEXT,
+  at_ms       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS goal_events_goal ON goal_events (goal_id, seq);
+
+CREATE TABLE IF NOT EXISTS goal_criteria (
+  id          TEXT PRIMARY KEY,
+  goal_id     TEXT NOT NULL,
+  generation  INTEGER NOT NULL,
+  text        TEXT NOT NULL,
+  met         INTEGER NOT NULL DEFAULT 0,
+  created_at_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS goal_criteria_goal ON goal_criteria (goal_id);
+
+CREATE TABLE IF NOT EXISTS goal_evidence (
+  id          TEXT PRIMARY KEY,
+  goal_id     TEXT NOT NULL,
+  generation  INTEGER NOT NULL,
+  criterion_id TEXT,
+  kind        TEXT NOT NULL,
+  ref         TEXT NOT NULL,
+  detail      TEXT,
+  at_ms       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS goal_evidence_goal ON goal_evidence (goal_id);
+`;
+function toGoal(row) {
+  return {
+    id: row.id,
+    sessionID: row.session_id,
+    generation: row.generation,
+    objective: row.objective,
+    status: row.status,
+    reason: row.reason ?? undefined,
+    rounds: row.rounds,
+    noProgressRounds: row.no_progress_rounds,
+    repeatedBlockerRounds: row.repeated_blocker_rounds,
+    tokensUsed: row.tokens_used ?? undefined,
+    tokenBudget: row.token_budget ?? undefined,
+    version: row.version,
+    createdAtMs: row.created_at_ms,
+    updatedAtMs: row.updated_at_ms,
+    completedAtMs: row.completed_at_ms ?? undefined,
+    supersededBy: row.superseded_by ?? undefined
+  };
+}
+var counter = 0;
+function newID(prefix) {
+  counter += 1;
+  return `${prefix}_${Date.now().toString(36)}_${counter.toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+class GoalStore {
+  db;
+  constructor(path) {
+    this.db = new Database(path, { create: true });
+    this.db.exec("PRAGMA journal_mode = WAL");
+    this.db.exec("PRAGMA foreign_keys = ON");
+    this.db.exec("PRAGMA busy_timeout = 5000");
+    this.db.exec(SCHEMA);
+  }
+  close() {
+    this.db.close();
+  }
+  tx(fn) {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const out = fn();
+      this.db.exec("COMMIT");
+      return out;
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {}
+      throw error;
+    }
+  }
+  appendEvent(goalID, generation, kind, extra = {}) {
+    this.db.query(`INSERT INTO goal_events (goal_id, generation, kind, from_status, to_status, actor, detail, at_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(goalID, generation, kind, extra.fromStatus ?? null, extra.toStatus ?? null, extra.actor ?? null, extra.detail ?? null, Date.now());
+  }
+  current(sessionID) {
+    const row = this.db.query(`SELECT * FROM goals WHERE session_id = ? AND status NOT IN ('complete','superseded') LIMIT 1`).get(sessionID);
+    return row ? toGoal(row) : undefined;
+  }
+  byID(id) {
+    const row = this.db.query(`SELECT * FROM goals WHERE id = ?`).get(id);
+    return row ? toGoal(row) : undefined;
+  }
+  history(sessionID) {
+    return this.db.query(`SELECT * FROM goals WHERE session_id = ? ORDER BY generation DESC`).all(sessionID).map(toGoal);
+  }
+  events(goalID) {
+    return this.db.query(`SELECT * FROM goal_events WHERE goal_id = ? ORDER BY seq ASC`).all(goalID).map((r) => ({
+      seq: r.seq,
+      goalID: r.goal_id,
+      generation: r.generation,
+      kind: r.kind,
+      fromStatus: r.from_status ?? undefined,
+      toStatus: r.to_status ?? undefined,
+      actor: r.actor ?? undefined,
+      detail: r.detail ?? undefined,
+      atMs: r.at_ms
+    }));
+  }
+  create(input) {
+    if (!input.objective || !input.objective.trim()) {
+      throw new TransitionRejectedError("objective must not be empty");
+    }
+    return this.tx(() => {
+      const existing = this.current(input.sessionID);
+      if (existing) {
+        throw new GoalConflictError(`session ${input.sessionID} already has a current goal (${existing.id}, generation ${existing.generation}, status ${existing.status}); use replace()`);
+      }
+      const now = Date.now();
+      const id = newID("goal");
+      const generation = 1;
+      this.db.query(`INSERT INTO goals (id, session_id, generation, objective, status, rounds,
+             no_progress_rounds, repeated_blocker_rounds, token_budget, version,
+             created_at_ms, updated_at_ms)
+           VALUES (?, ?, ?, ?, 'active', 0, 0, 0, ?, 0, ?, ?)`).run(id, input.sessionID, generation, input.objective.trim(), input.tokenBudget ?? null, now, now);
+      this.appendEvent(id, generation, "created", {
+        toStatus: "active",
+        actor: input.actor ?? "user",
+        detail: input.objective.trim().slice(0, 200)
+      });
+      return this.byID(id);
+    });
+  }
+  replace(input) {
+    if (!input.objective || !input.objective.trim()) {
+      throw new TransitionRejectedError("objective must not be empty");
+    }
+    return this.tx(() => {
+      const existing = this.current(input.sessionID);
+      if (!existing) {
+        throw new GoalConflictError(`session ${input.sessionID} has no current goal to replace`);
+      }
+      if (existing.generation !== input.expectedGeneration) {
+        throw new GoalConflictError(`stale replacement: expected generation ${input.expectedGeneration}, found ${existing.generation}`);
+      }
+      const now = Date.now();
+      const newIDValue = newID("goal");
+      const nextGeneration = existing.generation + 1;
+      this.db.query(`UPDATE goals SET status='superseded', superseded_by=?, updated_at_ms=?, version=version+1
+           WHERE id=? AND version=?`).run(newIDValue, now, existing.id, existing.version);
+      this.appendEvent(existing.id, existing.generation, "superseded", {
+        fromStatus: existing.status,
+        toStatus: "superseded",
+        actor: input.actor ?? "user",
+        detail: input.reason ?? `replaced by ${newIDValue}`
+      });
+      this.db.query(`INSERT INTO goals (id, session_id, generation, objective, status, rounds,
+             no_progress_rounds, repeated_blocker_rounds, token_budget, version,
+             created_at_ms, updated_at_ms)
+           VALUES (?, ?, ?, ?, 'active', 0, 0, 0, ?, 0, ?, ?)`).run(newIDValue, input.sessionID, nextGeneration, input.objective.trim(), input.tokenBudget ?? existing.tokenBudget ?? null, now, now);
+      this.appendEvent(newIDValue, nextGeneration, "created", {
+        toStatus: "active",
+        actor: input.actor ?? "user",
+        detail: `replaces ${existing.id} (generation ${existing.generation})`
+      });
+      return this.byID(newIDValue);
+    });
+  }
+  transition(input) {
+    return this.tx(() => {
+      const goal = this.byID(input.goalID);
+      if (!goal) {
+        throw new GoalConflictError(`unknown goal ${input.goalID}`);
+      }
+      if (goal.generation !== input.generation) {
+        throw new GoalConflictError(`stale generation: goal ${input.goalID} is generation ${goal.generation}, callback claimed ${input.generation}`);
+      }
+      if (isTerminal(goal.status)) {
+        throw new GoalConflictError(`goal ${input.goalID} is terminal (${goal.status}); refusing to drive it`);
+      }
+      if (input.expectedVersion !== undefined && goal.version !== input.expectedVersion) {
+        throw new GoalConflictError(`optimistic version conflict on ${input.goalID}: expected ${input.expectedVersion}, found ${goal.version}`);
+      }
+      const check = canTransition({ from: goal.status, to: input.to, actor: input.actor });
+      if (!check.ok) {
+        throw new TransitionRejectedError(check.reason);
+      }
+      if (goal.status === input.to) {
+        this.appendEvent(goal.id, goal.generation, "noop", {
+          fromStatus: goal.status,
+          toStatus: input.to,
+          actor: input.actor,
+          detail: input.reason
+        });
+        return goal;
+      }
+      const now = Date.now();
+      const completedAt = input.to === "complete" ? now : null;
+      const updated = this.db.query(`UPDATE goals
+             SET status=?, reason=?, updated_at_ms=?, version=version+1,
+                 completed_at_ms=COALESCE(?, completed_at_ms)
+           WHERE id=? AND version=?`).run(input.to, input.reason ?? null, now, completedAt, goal.id, goal.version);
+      if (updated.changes !== 1) {
+        throw new GoalConflictError(`compare-and-swap failed for ${goal.id}`);
+      }
+      this.appendEvent(goal.id, goal.generation, "status", {
+        fromStatus: goal.status,
+        toStatus: input.to,
+        actor: input.actor,
+        detail: input.reason
+      });
+      return this.byID(goal.id);
+    });
+  }
+  recordRound(input) {
+    return this.tx(() => {
+      const goal = this.byID(input.goalID);
+      if (!goal)
+        throw new GoalConflictError(`unknown goal ${input.goalID}`);
+      if (goal.generation !== input.generation) {
+        throw new GoalConflictError(`stale generation: ${input.goalID} is generation ${goal.generation}, round claimed ${input.generation}`);
+      }
+      if (isTerminal(goal.status)) {
+        throw new GoalConflictError(`goal ${input.goalID} is terminal (${goal.status}); refusing to record a round against it`);
+      }
+      const noProgress = input.classification === "noProgress" ? goal.noProgressRounds + 1 : 0;
+      const blocker = input.classification === "blocked" ? goal.repeatedBlockerRounds + 1 : 0;
+      const now = Date.now();
+      const tokens = input.tokensUsed === undefined ? goal.tokensUsed ?? null : (goal.tokensUsed ?? 0) + input.tokensUsed;
+      this.db.query(`UPDATE goals
+             SET rounds = rounds + 1,
+                 no_progress_rounds = ?,
+                 repeated_blocker_rounds = ?,
+                 tokens_used = ?,
+                 updated_at_ms = ?,
+                 version = version + 1
+           WHERE id = ? AND version = ?`).run(noProgress, blocker, tokens, now, goal.id, goal.version);
+      this.appendEvent(goal.id, goal.generation, "round", {
+        actor: "controller",
+        detail: `${input.classification}${input.detail ? `: ${input.detail}` : ""}`
+      });
+      return this.byID(goal.id);
+    });
+  }
+  addCriterion(goalID, text) {
+    const goal = this.byID(goalID);
+    if (!goal)
+      throw new GoalConflictError(`unknown goal ${goalID}`);
+    if (!isNonTerminal(goal.status)) {
+      throw new TransitionRejectedError(`cannot add criteria to terminal goal ${goalID}`);
+    }
+    this.tx(() => {
+      this.db.query(`INSERT INTO goal_criteria (id, goal_id, generation, text, met, created_at_ms)
+           VALUES (?, ?, ?, ?, 0, ?)`).run(newID("crit"), goalID, goal.generation, text, Date.now());
+    });
+  }
+  addEvidence(input) {
+    const goal = this.byID(input.goalID);
+    if (!goal)
+      throw new GoalConflictError(`unknown goal ${input.goalID}`);
+    this.tx(() => {
+      this.db.query(`INSERT INTO goal_evidence (id, goal_id, generation, criterion_id, kind, ref, detail, at_ms)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(newID("ev"), input.goalID, goal.generation, input.criterionID ?? null, input.kind, input.ref, input.detail ?? null, Date.now());
+    });
+  }
+  listCriteria(goalID) {
+    return this.db.query(`SELECT id, text, met FROM goal_criteria WHERE goal_id = ? ORDER BY created_at_ms ASC`).all(goalID).map((r) => ({ id: r.id, text: r.text, met: r.met === 1 }));
+  }
+  listEvidence(goalID) {
+    return this.db.query(`SELECT id, criterion_id, kind, ref FROM goal_evidence WHERE goal_id = ? ORDER BY at_ms ASC`).all(goalID).map((r) => ({
+      id: r.id,
+      criterionID: r.criterion_id ?? undefined,
+      kind: r.kind,
+      ref: r.ref
+    }));
+  }
+  reconcileAfterRestart() {
+    return this.tx(() => {
+      const stranded = this.db.query(`SELECT * FROM goals WHERE status = 'verifying'`).all().map(toGoal);
+      const repaired = [];
+      for (const goal of stranded) {
+        this.db.query(`UPDATE goals SET status='active', reason=?, updated_at_ms=?, version=version+1
+             WHERE id=? AND version=?`).run("resumed after restart: verification was interrupted", Date.now(), goal.id, goal.version);
+        this.appendEvent(goal.id, goal.generation, "restart-reconcile", {
+          fromStatus: "verifying",
+          toStatus: "active",
+          actor: "controller"
+        });
+        repaired.push(this.byID(goal.id));
+      }
+      return repaired;
+    });
+  }
+}
+
+// src/controller/controller.ts
+class GoalController {
+  store;
+  maxNoProgressRounds;
+  minBlockerConfirmations;
+  constructor(options) {
+    this.store = new GoalStore(options.dbPath);
+    this.maxNoProgressRounds = options.maxNoProgressRounds ?? 3;
+    this.minBlockerConfirmations = options.minBlockerConfirmations ?? 2;
+  }
+  close() {
+    this.store.close();
+  }
+  reconcileStartup() {
+    return this.store.reconcileAfterRestart();
+  }
+  startOrDescribe(sessionID, objective) {
+    const existing = this.store.current(sessionID);
+    if (existing)
+      return { existing };
+    return { created: this.store.create({ sessionID, objective, actor: "user" }) };
+  }
+  replace(sessionID, objective, expectedGeneration) {
+    const existing = this.store.current(sessionID);
+    if (!existing) {
+      return this.store.create({ sessionID, objective, actor: "user" });
+    }
+    return this.store.replace({
+      sessionID,
+      expectedGeneration: expectedGeneration ?? existing.generation,
+      objective,
+      actor: "user"
+    });
+  }
+  pause(sessionID) {
+    const goal = this.requireCurrent(sessionID);
+    return this.store.transition({
+      goalID: goal.id,
+      generation: goal.generation,
+      to: "paused",
+      actor: "user"
+    });
+  }
+  resume(sessionID) {
+    const goal = this.requireCurrent(sessionID);
+    return this.store.transition({
+      goalID: goal.id,
+      generation: goal.generation,
+      to: "active",
+      actor: "user",
+      reason: "resumed by user"
+    });
+  }
+  status(sessionID) {
+    return this.store.current(sessionID);
+  }
+  history(sessionID) {
+    return this.store.history(sessionID);
+  }
+  get(sessionID) {
+    return this.store.current(sessionID);
+  }
+  checkpoint(sessionID, input) {
+    const target = this.resolveTarget(sessionID, input);
+    if (!target.ok)
+      return { recorded: false, rejected: target.rejected };
+    const goal = target.goal;
+    for (const ref of input.evidenceRefs ?? []) {
+      this.store.addEvidence({ goalID: goal.id, kind: "ref", ref, detail: input.summary });
+    }
+    const updated = this.store.recordRound({
+      goalID: goal.id,
+      generation: goal.generation,
+      classification: "progress",
+      detail: input.summary.slice(0, 300)
+    });
+    return { recorded: true, goal: updated };
+  }
+  proposeComplete(sessionID, input) {
+    const target = this.resolveTarget(sessionID, input);
+    if (!target.ok)
+      return { rejected: target.rejected };
+    const goal = target.goal;
+    for (const ref of input.evidenceRefs ?? []) {
+      this.store.addEvidence({ goalID: goal.id, kind: "ref", ref, detail: input.summary });
+    }
+    const updated = this.store.transition({
+      goalID: goal.id,
+      generation: goal.generation,
+      to: "verifying",
+      actor: "model",
+      reason: input.summary.slice(0, 300)
+    });
+    return { goal: updated };
+  }
+  reportBlocked(sessionID, report) {
+    const target = this.resolveTarget(sessionID, report);
+    if (!target.ok) {
+      return { accepted: false, confirmations: 0, rejected: target.rejected };
+    }
+    const goal = target.goal;
+    for (const ref of report.evidenceRefs ?? []) {
+      this.store.addEvidence({ goalID: goal.id, kind: "blocker-ref", ref, detail: report.reason });
+    }
+    const counted = this.store.recordRound({
+      goalID: goal.id,
+      generation: goal.generation,
+      classification: "blocked",
+      detail: report.reason.slice(0, 300)
+    });
+    const confirmations = counted.repeatedBlockerRounds;
+    const genuine = report.externalDependency === true || confirmations >= this.minBlockerConfirmations;
+    if (!genuine) {
+      return { goal: counted, accepted: false, confirmations };
+    }
+    const blocked = this.store.transition({
+      goalID: goal.id,
+      generation: goal.generation,
+      to: "blocked",
+      actor: "controller",
+      reason: report.reason.slice(0, 300)
+    });
+    return { goal: blocked, accepted: true, confirmations };
+  }
+  classifyRound(sessionID, classification, detail, tokensUsed) {
+    const goal = this.store.current(sessionID);
+    if (!goal || !isNonTerminal(goal.status))
+      return goal;
+    const updated = this.store.recordRound({
+      goalID: goal.id,
+      generation: goal.generation,
+      classification,
+      detail,
+      tokensUsed
+    });
+    if (classification === "noProgress" && updated.noProgressRounds >= this.maxNoProgressRounds && updated.status === "active") {
+      return this.store.transition({
+        goalID: updated.id,
+        generation: updated.generation,
+        to: "stalled",
+        actor: "controller",
+        reason: `${updated.noProgressRounds} consecutive rounds without progress`
+      });
+    }
+    return updated;
+  }
+  enforceBudget(sessionID) {
+    const goal = this.store.current(sessionID);
+    if (!goal || goal.status !== "active")
+      return goal;
+    if (goal.tokenBudget !== undefined && (goal.tokensUsed ?? 0) >= goal.tokenBudget) {
+      return this.store.transition({
+        goalID: goal.id,
+        generation: goal.generation,
+        to: "budgetLimited",
+        actor: "controller",
+        reason: `token budget reached (${goal.tokensUsed}/${goal.tokenBudget})`
+      });
+    }
+    return goal;
+  }
+  commitComplete(goalID, generation, reason) {
+    return this.store.transition({
+      goalID,
+      generation,
+      to: "complete",
+      actor: "controller",
+      reason
+    });
+  }
+  rejectCompletion(sessionID, reason) {
+    const goal = this.store.current(sessionID);
+    if (!goal || goal.status !== "verifying")
+      return goal;
+    return this.store.transition({
+      goalID: goal.id,
+      generation: goal.generation,
+      to: "active",
+      actor: "controller",
+      reason
+    });
+  }
+  requireCurrent(sessionID) {
+    const goal = this.store.current(sessionID);
+    if (!goal)
+      throw new GoalConflictError(`session ${sessionID} has no current goal`);
+    return goal;
+  }
+  resolveTarget(sessionID, ref) {
+    const current = this.store.current(sessionID);
+    if (!current)
+      return { ok: false, rejected: "no active goal for this session" };
+    if (!isNonTerminal(current.status)) {
+      return { ok: false, rejected: `goal is ${current.status}` };
+    }
+    if (ref?.goalID !== undefined && ref.goalID !== current.id) {
+      return {
+        ok: false,
+        rejected: `stale goal reference: ${ref.goalID} is not the current goal (${current.id})`
+      };
+    }
+    if (ref?.generation !== undefined && ref.generation !== current.generation) {
+      return {
+        ok: false,
+        rejected: `stale generation: callback claimed ${ref.generation}, current is ${current.generation}`
+      };
+    }
+    return { ok: true, goal: current };
+  }
+}
+
+// src/index.ts
+var LOG = process.env.XGOAL_HARNESS_LOG ?? "";
 function record(entry) {
+  if (!LOG)
+    return;
   try {
     mkdirSync(dirname(LOG), { recursive: true });
     appendFileSync(LOG, JSON.stringify({ ts: Date.now(), ...entry }) + `
 `);
   } catch {}
 }
+function dbPath() {
+  if (process.env.XGOAL_DB)
+    return process.env.XGOAL_DB;
+  const dataHome = process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share");
+  return join(dataHome, "opencode-xgoal", "goals.db");
+}
+function obj(properties, required = []) {
+  return { type: "object", properties, required, additionalProperties: false };
+}
+var str = { type: "string" };
+var strArray = { type: "array", items: { type: "string" } };
+var num = { type: "number" };
 var src_default = {
   id: "opencode-xgoal",
   async setup(ctx) {
     const abort = new AbortController;
+    let controller;
+    let startupError;
+    try {
+      mkdirSync(dirname(dbPath()), { recursive: true });
+      controller = new GoalController({ dbPath: dbPath() });
+      const repaired = controller.reconcileStartup();
+      record({ event: "controller.ready", dbPath: dbPath(), reconciled: repaired.length });
+    } catch (error) {
+      startupError = String(error);
+      record({ event: "controller.failed", error: startupError });
+    }
     record({
       event: "setup.begin",
       pluginId: "opencode-xgoal",
-      domains: Object.keys(ctx).sort(),
-      hasSession: typeof ctx.session === "object",
-      hasTool: typeof ctx.tool === "object",
-      hasCommand: typeof ctx.command === "object",
-      hasEvent: typeof ctx.event === "object",
-      hasStorage: typeof ctx.storage === "object",
-      hasRpc: typeof ctx.rpc === "object",
-      sessionMethods: typeof ctx.session === "object" ? Object.keys(ctx.session).sort() : []
+      domains: Object.keys(ctx ?? {}).sort(),
+      sessionMethods: typeof ctx?.session === "object" ? Object.keys(ctx.session).sort() : [],
+      controllerReady: controller !== undefined
     });
     try {
-      const handle = await ctx.command.transform((editor) => {
+      await ctx.tool.transform((editor) => {
         editor.add({
-          name: "xgoal",
-          description: "OpenCode-xGoal harness probe",
-          async execute(invocation) {
-            record({
-              event: "command.execute",
-              sessionID: invocation?.sessionID,
-              delivery: invocation?.delivery
+          id: "goal_get",
+          description: "Report the current goal for this session, including status, generation, round counts and unmet criteria.",
+          input: obj({}),
+          async execute(_input, toolCtx) {
+            if (!controller)
+              return { content: `goal controller unavailable: ${startupError}` };
+            const goal = controller.get(toolCtx?.sessionID);
+            if (!goal)
+              return { content: "No active goal for this session." };
+            const criteria = controller.store.listCriteria(goal.id);
+            return {
+              content: JSON.stringify({
+                id: goal.id,
+                generation: goal.generation,
+                objective: goal.objective,
+                status: goal.status,
+                rounds: goal.rounds,
+                noProgressRounds: goal.noProgressRounds,
+                tokensUsed: goal.tokensUsed ?? null,
+                tokenBudget: goal.tokenBudget ?? null,
+                criteria
+              }, null, 2),
+              metadata: { goalID: goal.id, generation: goal.generation, status: goal.status }
+            };
+          }
+        });
+        editor.add({
+          id: "goal_checkpoint",
+          description: "Record progress toward the current goal without changing its status. Use for completed work, or for investigation that materially narrows the problem.",
+          input: obj({
+            summary: str,
+            evidence_refs: strArray,
+            goal_id: str,
+            generation: num
+          }, ["summary"]),
+          async execute(input, toolCtx) {
+            if (!controller)
+              return { content: `goal controller unavailable: ${startupError}` };
+            const out = controller.checkpoint(toolCtx?.sessionID, {
+              summary: String(input?.summary ?? ""),
+              evidenceRefs: input?.evidence_refs,
+              goalID: input?.goal_id,
+              generation: input?.generation
             });
+            if (!out.recorded)
+              return { content: `Checkpoint not recorded: ${out.rejected}` };
+            return {
+              content: `Checkpoint recorded. Goal is ${out.goal?.status}.`,
+              metadata: { status: out.goal?.status, rounds: out.goal?.rounds }
+            };
+          }
+        });
+        editor.add({
+          id: "goal_propose_complete",
+          description: "Propose that the goal's original objective has been fully achieved. This moves the goal to verification; it does not complete it. The controller decides completion.",
+          input: obj({ summary: str, evidence_refs: strArray, goal_id: str, generation: num }, [
+            "summary"
+          ]),
+          async execute(input, toolCtx) {
+            if (!controller)
+              return { content: `goal controller unavailable: ${startupError}` };
+            const out = controller.proposeComplete(toolCtx?.sessionID, {
+              summary: String(input?.summary ?? ""),
+              evidenceRefs: input?.evidence_refs,
+              goalID: input?.goal_id,
+              generation: input?.generation
+            });
+            if (out.rejected)
+              return { content: `Completion proposal rejected: ${out.rejected}` };
+            return {
+              content: "Completion proposed. The goal is now under verification; it is not yet complete. Continue only if the controller returns it to active.",
+              metadata: { status: out.goal?.status }
+            };
+          }
+        });
+        editor.add({
+          id: "goal_report_blocked",
+          description: "Report that the goal cannot proceed. Only use this for a genuine external dependency: missing credentials, permissions, or required information. A workflow preference, an optional decision, or a choice between reasonable next steps is NOT a blocker — continue working instead.",
+          input: obj({
+            reason: str,
+            evidence_refs: strArray,
+            external_dependency: { type: "boolean" },
+            goal_id: str,
+            generation: num
+          }, ["reason"]),
+          async execute(input, toolCtx) {
+            if (!controller)
+              return { content: `goal controller unavailable: ${startupError}` };
+            const out = controller.reportBlocked(toolCtx?.sessionID, {
+              reason: String(input?.reason ?? ""),
+              evidenceRefs: input?.evidence_refs,
+              externalDependency: input?.external_dependency === true,
+              goalID: input?.goal_id,
+              generation: input?.generation
+            });
+            if (out.rejected)
+              return { content: `Blocker report rejected: ${out.rejected}` };
+            if (!out.accepted) {
+              return {
+                content: "Blocker not accepted: no concrete external dependency was identified. The goal remains active — take the next useful action.",
+                metadata: { confirmations: out.confirmations, status: out.goal?.status }
+              };
+            }
+            return {
+              content: "Blocker accepted. The goal is now blocked pending user action.",
+              metadata: { status: out.goal?.status }
+            };
           }
         });
       });
-      record({ event: "command.registered", ok: true, handleType: typeof handle });
+      record({ event: "tools.registered", ok: true });
+    } catch (error) {
+      record({ event: "tools.registered", ok: false, error: String(error) });
+    }
+    try {
+      await ctx.command.transform((editor) => {
+        editor.add({
+          name: "goal",
+          description: "Set, replace, inspect or control the session goal",
+          async execute(invocation) {
+            const sessionID = invocation?.sessionID;
+            const raw = String(invocation?.prompt?.text ?? "").trim();
+            if (!controller)
+              return;
+            const [verb, ...rest] = raw.split(/\s+/);
+            const arg = rest.join(" ").trim();
+            const reply = (text) => record({ event: "command.reply", sessionID, text: text.slice(0, 200) });
+            try {
+              if (!verb) {
+                const goal = controller.status(sessionID);
+                reply(goal ? `Goal ${goal.generation}: [${goal.status}] ${goal.objective} (rounds ${goal.rounds})` : "No active goal. Use /goal <objective>.");
+                return;
+              }
+              if (verb === "status") {
+                const goal = controller.status(sessionID);
+                reply(goal ? `[${goal.status}] ${goal.objective}` : "No active goal.");
+                return;
+              }
+              if (verb === "history") {
+                const history = controller.history(sessionID);
+                reply(history.length ? history.map((g) => `gen ${g.generation} [${g.status}] ${g.objective}`).join(`
+`) : "No goal history.");
+                return;
+              }
+              if (verb === "pause") {
+                reply(`Paused: ${controller.pause(sessionID).status}`);
+                return;
+              }
+              if (verb === "resume") {
+                reply(`Resumed: ${controller.resume(sessionID).status}`);
+                return;
+              }
+              if (verb === "replace") {
+                if (!arg)
+                  return reply("Usage: /goal replace <objective>");
+                const goal = controller.replace(sessionID, arg);
+                reply(`Replaced. Generation ${goal.generation} is now active.`);
+                return;
+              }
+              const objective = raw;
+              const out = controller.startOrDescribe(sessionID, objective);
+              if ("existing" in out) {
+                reply(`A goal is already active (generation ${out.existing.generation}): ${out.existing.objective}
+Use /goal replace <objective> to supersede it.`);
+              } else {
+                reply(`Goal created (generation ${out.created.generation}).`);
+              }
+            } catch (error) {
+              reply(`Goal command failed: ${String(error)}`);
+            }
+          }
+        });
+      });
+      record({ event: "command.registered", ok: true });
     } catch (error) {
       record({ event: "command.registered", ok: false, error: String(error) });
     }
     try {
       await ctx.session.hook("context", async (event) => {
+        if (!controller)
+          return;
+        const goal = controller.status(event?.sessionID);
         record({
           event: "session.context",
           sessionID: event?.sessionID,
           agent: event?.agent,
-          systemParts: Array.isArray(event?.system) ? event.system.length : null,
-          messageCount: Array.isArray(event?.messages) ? event.messages.length : null,
-          toolCount: event?.tools ? Object.keys(event.tools).length : null
+          hasGoal: Boolean(goal),
+          status: goal?.status
         });
-        if (Array.isArray(event?.system)) {
-          event.system.push({
-            type: "text",
-            text: "[xgoal-harness] context hook is live"
-          });
-        }
+        if (!goal || goal.status !== "active")
+          return;
+        if (!Array.isArray(event?.system))
+          return;
+        const unmet = controller.store.listCriteria(goal.id).filter((c) => !c.met).map((c) => `- ${c.text}`);
+        event.system.push({
+          type: "text",
+          text: [
+            `Active goal (generation ${goal.generation}): ${goal.objective}`,
+            "",
+            "Completion contract:",
+            "- The original objective is authoritative.",
+            "- Inspect current evidence before claiming success.",
+            "- If unfinished, take the next useful action.",
+            "- A workflow preference or optional choice is not a blocker.",
+            "- Propose completion only when the objective is actually satisfied.",
+            unmet.length ? `
+Outstanding criteria:
+${unmet.join(`
+`)}` : ""
+          ].filter(Boolean).join(`
+`)
+        });
       });
       record({ event: "session.hook.context", ok: true });
     } catch (error) {
@@ -66,7 +906,10 @@ var src_default = {
     }
     try {
       await ctx.session.hook("compaction", async (event) => {
-        record({ event: "session.compaction", sessionID: event?.sessionID });
+        if (!controller)
+          return;
+        const goal = controller.status(event?.sessionID);
+        record({ event: "session.compaction", sessionID: event?.sessionID, status: goal?.status });
       });
       record({ event: "session.hook.compaction", ok: true });
     } catch (error) {
@@ -78,8 +921,7 @@ var src_default = {
           event: "tool.execute.after",
           tool: event?.tool,
           sessionID: event?.sessionID,
-          status: event?.status,
-          callID: event?.id
+          status: event?.status
         });
       });
       record({ event: "tool.hook.execute.after", ok: true });
@@ -94,25 +936,16 @@ var src_default = {
           eventsSeen.add(type);
           record({ event: "event", type, total: eventsSeen.size });
         }
-        record({ event: "event.stream.ended", total: eventsSeen.size });
       } catch (error) {
         record({ event: "event.stream.error", error: String(error) });
       }
     })();
-    try {
-      await ctx.storage.set("xgoal:harness:probe", { at: Date.now() });
-      const readBack = await ctx.storage.get("xgoal:harness:probe");
-      record({
-        event: "storage.roundtrip",
-        ok: readBack !== undefined,
-        value: readBack ?? null
-      });
-    } catch (error) {
-      record({ event: "storage.roundtrip", ok: false, error: String(error) });
-    }
     record({ event: "setup.complete" });
     return async () => {
       abort.abort();
+      try {
+        controller?.close();
+      } catch {}
       record({ event: "cleanup", eventsObserved: eventsSeen.size });
     };
   }
