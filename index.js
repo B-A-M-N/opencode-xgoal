@@ -1,5 +1,5 @@
 // src/index.ts
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 
@@ -1067,6 +1067,130 @@ class SessionTransport {
   }
 }
 
+// src/controller/verification.ts
+class EvidenceLedger {
+  store;
+  constructor(store) {
+    this.store = store;
+  }
+  capture(input) {
+    const args = input.args ?? {};
+    const now = Date.now();
+    if ((input.tool === "shell" || input.tool === "bash") && input.status === "completed") {
+      const command = String(args.command ?? args.cmd ?? "").trim();
+      if (!command)
+        return;
+      const exitCode = extractExitCode(input.result);
+      const kind = /\b(test|pytest|bun test|go test|jest|vitest|cargo test)\b/.test(command) ? "test" : "command";
+      const evidence = { kind, ref: command.slice(0, 400), exitCode, atMs: now };
+      this.store.addEvidence({
+        goalID: input.goalID,
+        kind,
+        ref: evidence.ref,
+        detail: exitCode === undefined ? undefined : `exit ${exitCode}`
+      });
+      return evidence;
+    }
+    if (input.status === "completed" && /write|edit|patch|create/.test(input.tool)) {
+      const path = String(args.filePath ?? args.file_path ?? args.path ?? "").trim();
+      if (!path)
+        return;
+      const evidence = { kind: "file", ref: path, atMs: now };
+      this.store.addEvidence({
+        goalID: input.goalID,
+        kind: "file",
+        ref: path,
+        detail: "observed write"
+      });
+      return evidence;
+    }
+    return;
+  }
+  forGoal(goalID) {
+    return this.store.listEvidence(goalID).map((e) => ({
+      kind: e.kind,
+      ref: e.ref,
+      atMs: Date.now(),
+      criterionID: e.criterionID
+    }));
+  }
+}
+function extractExitCode(result) {
+  if (!result)
+    return;
+  const r = result;
+  const direct = r.exitCode ?? r.exit_code ?? r.code;
+  if (typeof direct === "number")
+    return direct;
+  const nested = r.metadata?.exitCode;
+  if (typeof nested === "number")
+    return nested;
+  return;
+}
+
+class GoalVerifier {
+  store;
+  validator;
+  constructor(store, validator) {
+    this.store = store;
+    this.validator = validator;
+  }
+  async verify(goalID) {
+    const goal = this.store.byID(goalID);
+    if (!goal)
+      return { verdict: "incomplete", unmet: [], reason: "unknown goal" };
+    const criteria = this.store.listCriteria(goalID);
+    const evidence = this.store.listEvidence(goalID);
+    const unmet = [];
+    if (criteria.length === 0) {
+      return {
+        verdict: "incomplete",
+        unmet: ["no acceptance criteria recorded for the objective"],
+        reason: "cannot verify completion of an objective with no criteria; the controller must first establish what success means"
+      };
+    }
+    const verifiable = evidence.filter((e) => e.kind !== "ref");
+    if (verifiable.length === 0) {
+      return {
+        verdict: "incomplete",
+        unmet: ["no machine-verifiable evidence submitted"],
+        reason: "completion requires evidence the controller observed (a command that ran, a file that changed); a model statement is not evidence"
+      };
+    }
+    for (const item of verifiable) {
+      const validation = await this.validator.validate({
+        kind: item.kind,
+        ref: item.ref,
+        atMs: Date.now(),
+        criterionID: item.criterionID
+      });
+      if (!validation.valid) {
+        unmet.push(`evidence no longer valid: ${item.ref} (${validation.reason})`);
+      }
+    }
+    const validatingRefs = new Set(verifiable.filter((e) => !unmet.some((u) => u.includes(e.ref))).map((e) => e.ref));
+    for (const criterion of criteria) {
+      const bound = evidence.some((e) => e.criterionID === criterion.id && validatingRefs.has(e.ref));
+      const coveredByGeneral = validatingRefs.size > 0 && criteria.length <= validatingRefs.size;
+      if (!bound && !coveredByGeneral) {
+        unmet.push(`criterion not evidenced: ${criterion.text}`);
+      }
+    }
+    if (unmet.length > 0) {
+      return {
+        verdict: "incomplete",
+        unmet,
+        reason: `${unmet.length} condition(s) unsatisfied against current evidence`
+      };
+    }
+    return {
+      verdict: "complete",
+      unmet: [],
+      reason: `objective satisfied: ${criteria.length} criteria covered by ${validatingRefs.size} validated evidence item(s)`
+    };
+  }
+}
+
 // src/index.ts
 var LOG = process.env.XGOAL_HARNESS_LOG ?? "";
 function record(entry) {
@@ -1111,6 +1235,8 @@ var src_default = {
     }
     const observer = new RoundObserver;
     let driver;
+    let ledger;
+    let verifier;
     let sweep;
     if (controller) {
       const transport = new SessionTransport({
@@ -1126,6 +1252,22 @@ var src_default = {
         }
       });
       driver = new GoalDriver(controller.store, transport);
+      ledger = new EvidenceLedger(controller.store);
+      verifier = new GoalVerifier(controller.store, {
+        async validate(evidence) {
+          if (evidence.kind === "file") {
+            try {
+              return existsSync(evidence.ref) ? { valid: true, reason: "file present" } : { valid: false, reason: "file not found" };
+            } catch {
+              return { valid: false, reason: "file could not be checked" };
+            }
+          }
+          if (evidence.kind === "command" || evidence.kind === "test" || evidence.kind === "runtime") {
+            return { valid: true, reason: "observed to complete by the controller" };
+          }
+          return { valid: false, reason: "unverifiable reference" };
+        }
+      });
       driver.reconcile().then((outcomes) => record({ event: "driver.reconciled", count: outcomes.length })).catch((error) => record({ event: "driver.reconcile.error", error: String(error) }));
       const sweepMs = Number(process.env.XGOAL_SWEEP_MS ?? "20000");
       sweep = setInterval(() => {
@@ -1204,7 +1346,8 @@ var src_default = {
           async execute(input, toolCtx) {
             if (!controller)
               return { content: `goal controller unavailable: ${startupError}` };
-            const out = controller.proposeComplete(toolCtx?.sessionID, {
+            const sessionID = toolCtx?.sessionID;
+            const out = controller.proposeComplete(sessionID, {
               summary: String(input?.summary ?? ""),
               evidenceRefs: input?.evidence_refs,
               goalID: input?.goal_id,
@@ -1212,9 +1355,40 @@ var src_default = {
             });
             if (out.rejected)
               return { content: `Completion proposal rejected: ${out.rejected}` };
+            const goal = controller.status(sessionID);
+            if (!goal || !verifier) {
+              return {
+                content: "Completion proposed and pending verification.",
+                metadata: { status: goal?.status }
+              };
+            }
+            const result = await verifier.verify(goal.id);
+            if (result.verdict === "complete") {
+              const done = controller.commitComplete(goal.id, goal.generation, result.reason);
+              record({ event: "completion.verified", goalID: goal.id, reason: result.reason });
+              return {
+                content: `Completion verified and the goal is now complete. ${result.reason}`,
+                metadata: { status: done.status }
+              };
+            }
+            const back = controller.rejectCompletion(sessionID, result.reason);
+            record({
+              event: "completion.rejected",
+              goalID: goal.id,
+              unmet: result.unmet,
+              reason: result.reason
+            });
             return {
-              content: "Completion proposed. The goal is now under verification; it is not yet complete. Continue only if the controller returns it to active.",
-              metadata: { status: out.goal?.status }
+              content: [
+                "Completion NOT verified. The goal remains active.",
+                `Reason: ${result.reason}`,
+                result.unmet.length ? `Unsatisfied conditions:
+${result.unmet.map((u) => `- ${u}`).join(`
+`)}` : "",
+                "Address these and continue working."
+              ].filter(Boolean).join(`
+`),
+              metadata: { status: back?.status, unmet: result.unmet }
             };
           }
         });
@@ -1373,12 +1547,38 @@ ${unmet.join(`
     }
     try {
       await ctx.tool.hook("execute.after", async (event) => {
+        const sessionID = sessionIDOf(event);
         record({
           event: "tool.execute.after",
           tool: event?.tool,
-          sessionID: event?.sessionID,
+          sessionID,
           status: event?.status
         });
+        if (!controller || !ledger || !sessionID)
+          return;
+        const goal = controller.status(sessionID);
+        if (!goal || goal.status !== "active")
+          return;
+        try {
+          const captured = ledger.capture({
+            goalID: goal.id,
+            tool: String(event?.tool ?? ""),
+            status: event?.status === "completed" ? "completed" : "error",
+            args: event?.input ?? event?.args,
+            result: event?.result
+          });
+          if (captured) {
+            record({
+              event: "evidence.captured",
+              goalID: goal.id,
+              kind: captured.kind,
+              ref: captured.ref.slice(0, 120),
+              exitCode: captured.exitCode ?? null
+            });
+          }
+        } catch (error) {
+          record({ event: "evidence.capture.error", error: String(error) });
+        }
       });
       record({ event: "tool.hook.execute.after", ok: true });
     } catch (error) {

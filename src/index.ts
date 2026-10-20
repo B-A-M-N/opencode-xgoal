@@ -9,12 +9,17 @@
  *   - must not import bare specifiers (this file is bundled to ./index.js)
  *   - the entry must sit at the package root (`main: "index.js"`)
  */
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { GoalController } from "./controller/controller.ts";
 import { GoalDriver } from "./controller/driver.ts";
 import { RoundObserver, SessionTransport } from "./controller/transport.ts";
+import {
+  EvidenceLedger,
+  GoalVerifier,
+  type EvidenceValidator,
+} from "./controller/verification.ts";
 
 const LOG = process.env.XGOAL_HARNESS_LOG ?? "";
 
@@ -84,6 +89,8 @@ export default {
     // ------------------------------------------------- continuation driver
     const observer = new RoundObserver();
     let driver: GoalDriver | undefined;
+    let ledger: EvidenceLedger | undefined;
+    let verifier: GoalVerifier | undefined;
     let sweep: ReturnType<typeof setInterval> | undefined;
 
     if (controller) {
@@ -102,6 +109,34 @@ export default {
         },
       });
       driver = new GoalDriver(controller.store, transport);
+
+      // Evidence is captured from observed tool executions only. A model's
+      // prose never reaches this ledger.
+      ledger = new EvidenceLedger(controller.store);
+      verifier = new GoalVerifier(controller.store, {
+        async validate(evidence) {
+          // File evidence must still exist; command/test evidence is accepted
+          // because the controller observed the execution itself.
+          if (evidence.kind === "file") {
+            try {
+              return existsSync(evidence.ref)
+                ? { valid: true, reason: "file present" }
+                : { valid: false, reason: "file not found" };
+            } catch {
+              return { valid: false, reason: "file could not be checked" };
+            }
+          }
+          if (
+            evidence.kind === "command" ||
+            evidence.kind === "test" ||
+            evidence.kind === "runtime"
+          ) {
+            return { valid: true, reason: "observed to complete by the controller" };
+          }
+          // A bare reference is a model-provided pointer, never proof.
+          return { valid: false, reason: "unverifiable reference" };
+        },
+      } satisfies EvidenceValidator);
 
       // Startup recovery sweep: adopt or clean up whatever was in flight when
       // the previous process died. Driven by the ledger, not by events.
@@ -202,17 +237,54 @@ export default {
           ]),
           async execute(input: any, toolCtx: any) {
             if (!controller) return { content: `goal controller unavailable: ${startupError}` };
-            const out = controller.proposeComplete(toolCtx?.sessionID, {
+            const sessionID = toolCtx?.sessionID;
+            const out = controller.proposeComplete(sessionID, {
               summary: String(input?.summary ?? ""),
               evidenceRefs: input?.evidence_refs,
               goalID: input?.goal_id,
               generation: input?.generation,
             });
             if (out.rejected) return { content: `Completion proposal rejected: ${out.rejected}` };
+
+            // The model proposed; the controller decides. Verify against current
+            // evidence and only then commit completion.
+            const goal = controller.status(sessionID);
+            if (!goal || !verifier) {
+              return {
+                content: "Completion proposed and pending verification.",
+                metadata: { status: goal?.status },
+              };
+            }
+
+            const result = await verifier.verify(goal.id);
+            if (result.verdict === "complete") {
+              const done = controller.commitComplete(goal.id, goal.generation, result.reason);
+              record({ event: "completion.verified", goalID: goal.id, reason: result.reason });
+              return {
+                content: `Completion verified and the goal is now complete. ${result.reason}`,
+                metadata: { status: done.status },
+              };
+            }
+
+            // Not verified: return the goal to work with the specific gaps, so
+            // the model knows exactly what is still required.
+            const back = controller.rejectCompletion(sessionID, result.reason);
+            record({
+              event: "completion.rejected",
+              goalID: goal.id,
+              unmet: result.unmet,
+              reason: result.reason,
+            });
             return {
-              content:
-                "Completion proposed. The goal is now under verification; it is not yet complete. Continue only if the controller returns it to active.",
-              metadata: { status: out.goal?.status },
+              content: [
+                "Completion NOT verified. The goal remains active.",
+                `Reason: ${result.reason}`,
+                result.unmet.length ? `Unsatisfied conditions:\n${result.unmet.map((u) => `- ${u}`).join("\n")}` : "",
+                "Address these and continue working.",
+              ]
+                .filter(Boolean)
+                .join("\n"),
+              metadata: { status: back?.status, unmet: result.unmet },
             };
           },
         });
@@ -392,12 +464,40 @@ export default {
     // ------------------------------------------------- tool observations
     try {
       await ctx.tool.hook("execute.after", async (event: any) => {
+        const sessionID = sessionIDOf(event);
         record({
           event: "tool.execute.after",
           tool: event?.tool,
-          sessionID: event?.sessionID,
+          sessionID,
           status: event?.status,
         });
+
+        // Capture evidence only for goals that are actually active, and only
+        // from executions the controller observed. This is what makes evidence
+        // machine-verifiable rather than model-asserted.
+        if (!controller || !ledger || !sessionID) return;
+        const goal = controller.status(sessionID);
+        if (!goal || goal.status !== "active") return;
+        try {
+          const captured = ledger.capture({
+            goalID: goal.id,
+            tool: String(event?.tool ?? ""),
+            status: event?.status === "completed" ? "completed" : "error",
+            args: event?.input ?? event?.args,
+            result: event?.result,
+          });
+          if (captured) {
+            record({
+              event: "evidence.captured",
+              goalID: goal.id,
+              kind: captured.kind,
+              ref: captured.ref.slice(0, 120),
+              exitCode: captured.exitCode ?? null,
+            });
+          }
+        } catch (error) {
+          record({ event: "evidence.capture.error", error: String(error) });
+        }
       });
       record({ event: "tool.hook.execute.after", ok: true });
     } catch (error) {
