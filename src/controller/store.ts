@@ -333,7 +333,17 @@ export class GoalStore {
       }
       const now = Date.now();
       const id = newID("goal");
-      const generation = 1;
+      // Allocate monotonically from ALL historical goals in this session, not
+      // just the current one. After a completed goal, `current()` returns null,
+      // so a hardcoded 1 would collide with the finished goal's
+      // (session_id, 1) uniqueness constraint.
+      const nextGen = this.db
+        .query<{ next_generation: number }, [string]>(
+          `SELECT COALESCE(MAX(generation), 0) + 1 AS next_generation
+           FROM goals WHERE session_id = ?`,
+        )
+        .get(input.sessionID)!.next_generation;
+      const generation = nextGen;
       this.db
         .query(
           `INSERT INTO goals (id, session_id, generation, objective, status, rounds,

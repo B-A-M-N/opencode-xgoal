@@ -39,6 +39,50 @@ describe("goal creation", () => {
     expect(store.current("ses_a")?.id).toBe(goal.id);
   });
 
+  // Regression: a completed goal leaves no current goal, so a naive `create`
+  // that hardcodes generation 1 collides with the finished goal's
+  // (session_id, 1) uniqueness constraint.
+  test("a new goal after completion gets a fresh generation, not 1", () => {
+    const first = store.create({ sessionID: "ses_a", objective: "first objective" });
+    store.transition({ goalID: first.id, generation: 1, to: "verifying", actor: "model" });
+    store.transition({
+      goalID: first.id,
+      generation: 1,
+      to: "complete",
+      actor: "controller",
+      reason: "verified",
+    });
+    expect(store.current("ses_a")).toBeUndefined();
+
+    const second = store.create({ sessionID: "ses_a", objective: "second objective" });
+    expect(second.generation).toBe(2);
+    expect(second.status).toBe("active");
+    expect(store.current("ses_a")?.id).toBe(second.id);
+
+    // History preserves both generations.
+    const gens = store.history("ses_a").map((g) => g.generation).sort();
+    expect(gens).toEqual([1, 2]);
+  });
+
+  test("repeated complete-then-create cycles keep allocating fresh generations", () => {
+    let lastGeneration = 0;
+    for (let i = 0; i < 3; i++) {
+      const goal = store.create({ sessionID: "ses_a", objective: `objective ${i}` });
+      expect(goal.generation).toBe(lastGeneration + 1);
+      lastGeneration = goal.generation;
+      store.transition({ goalID: goal.id, generation: goal.generation, to: "verifying", actor: "model" });
+      store.transition({
+        goalID: goal.id,
+        generation: goal.generation,
+        to: "complete",
+        actor: "controller",
+        reason: "verified",
+      });
+    }
+    expect(lastGeneration).toBe(3);
+    expect(store.history("ses_a")).toHaveLength(3);
+  });
+
   test("rejects an empty objective", () => {
     expect(() => store.create({ sessionID: "ses_a", objective: "   " })).toThrow(
       TransitionRejectedError,
