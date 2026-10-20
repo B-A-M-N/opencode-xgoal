@@ -748,6 +748,22 @@ class GoalController {
     return goal;
   }
   commitComplete(goalID, generation, reason) {
+    const outstanding = this.store.outstandingRound(goalID);
+    if (outstanding) {
+      try {
+        this.store.settleRound({
+          roundID: outstanding.id,
+          classification: "complete",
+          detail: reason
+        });
+        this.store.recordRound({
+          goalID,
+          generation,
+          classification: "complete",
+          detail: reason
+        });
+      } catch {}
+    }
     return this.store.transition({
       goalID,
       generation,

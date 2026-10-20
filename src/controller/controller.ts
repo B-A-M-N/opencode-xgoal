@@ -271,6 +271,27 @@ export class GoalController {
 
   /** Controller-only completion, callable after verification has passed. */
   commitComplete(goalID: string, generation: number, reason: string): Goal {
+    // Settle any in-flight round as `complete` BEFORE the goal becomes terminal.
+    // Otherwise the round stays outstanding, and reconciliation later marks it
+    // failed — recording a spurious failure against a goal that succeeded.
+    const outstanding = this.store.outstandingRound(goalID);
+    if (outstanding) {
+      try {
+        this.store.settleRound({
+          roundID: outstanding.id,
+          classification: "complete",
+          detail: reason,
+        });
+        this.store.recordRound({
+          goalID,
+          generation,
+          classification: "complete",
+          detail: reason,
+        });
+      } catch {
+        // A round that cannot be settled must not block completion.
+      }
+    }
     return this.store.transition({
       goalID,
       generation,
