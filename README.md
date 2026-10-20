@@ -334,7 +334,9 @@ Rules that are deliberate, not accidental:
   pointers and never count as observations, so narrating via `goal_checkpoint`
   cannot keep a goal alive. Text-only turns are `noProgress`; a turn waiting on
   an observably running execution is `verifiedWait` and does not accumulate
-  toward a stall.
+  toward a stall. One conservative bound: a busy execution observed for longer
+  than 15 minutes is treated as stale, and the turn counts as `noProgress` —
+  the goal is asked rather than assumed to still be waiting.
 - Tool-call ownership is attributed by **transcript position**: the nearest
   preceding continuation (bound to its generation at admission) claims a
   message, and a foreign human prompt stops the walk. Timestamp attribution
