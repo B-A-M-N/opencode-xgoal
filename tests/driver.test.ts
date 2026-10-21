@@ -736,10 +736,14 @@ describe("progress classification counts only verifiable evidence", () => {
       if (store.current("ses_a")!.status === "stalled") break;
     }
     expect(store.current("ses_a")!.status).toBe("stalled");
-    // The trail is honest — but only two rows landed, because once the goal
-    // stalls the driver stops minting continuations (and the loop stops).
-    // What matters: rounds beyond the first never counted as progress.
-    expect(store.listEvidence(goal.id).length).toBeGreaterThanOrEqual(2);
+    // What pins the behavior: one progress round (the first observation),
+    // then exactly maxNoProgressRounds repeats scored noProgress — the stall
+    // fired mid-iteration, so the third (post-stall) row merely landed in the
+    // trail. No round after the first ever counted the repeat as progress.
+    const after = store.current("ses_a")!;
+    expect(after.noProgressRounds).toBe(3);
+    expect(after.rounds).toBe(4);
+    expect(store.listEvidence(goal.id).map((e) => e.ref)).toEqual(["pwd", "pwd", "pwd"]);
   });
 
   test("three investigation rounds with different facts are not stalled", async () => {

@@ -273,7 +273,7 @@ inspection. It never touches the user's database or sessions.
 ## Verification
 
 ```bash
-bun test          # 252 unit/integration tests, 751 assertions
+bun test          # 253 unit/integration tests, 761 assertions
 bun run typecheck # clean
 bash scripts/parity.sh  # 17/17 live acceptance checks
 ```

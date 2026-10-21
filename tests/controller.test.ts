@@ -209,6 +209,59 @@ describe("blockers must be genuine", () => {
     expect(out2.goal?.status).toBe("blocked");
   });
 
+  test("REGRESSION: citing a subset of seen evidence is not a new confirmation", () => {
+    // The adversarial repro from review: round 1 cites probes A and B; round 2
+    // cites A only, with NO new observation between rounds. Tuple-novelty
+    // counting would call that a second confirmation and block the goal.
+    controller.startOrDescribe("ses_a", "ship the release");
+    controller.store.addEvidence({
+      goalID: ref().goalID,
+      kind: "command",
+      ref: "probe A",
+      detail: "exit 1",
+      exitCode: 1,
+    });
+    controller.store.addEvidence({
+      goalID: ref().goalID,
+      kind: "command",
+      ref: "probe B",
+      detail: "exit 1",
+      exitCode: 1,
+    });
+    const out1 = controller.reportBlocked("ses_a", {
+      ...ref(),
+      reason: "deployment credential is unavailable",
+      externalDependency: true,
+      evidenceRefs: ["probe A", "probe B"],
+    });
+    expect(out1.accepted).toBe(false);
+    expect(out1.confirmations).toBe(1);
+    controller.classifyRound("ses_a", "noProgress");
+
+    // Round 2: a subset citation, nothing newly observed — no confirmation.
+    const out2 = controller.reportBlocked("ses_a", {
+      ...ref(),
+      reason: "deployment credential is unavailable",
+      externalDependency: true,
+      evidenceRefs: ["probe A"],
+    });
+    expect(out2.accepted).toBe(false);
+    expect(out2.confirmations).toBe(1);
+    expect(controller.status("ses_a")?.status).toBe("active");
+
+    // Round 3: same reason, still nothing new — still one confirmation.
+    controller.classifyRound("ses_a", "noProgress");
+    const out3 = controller.reportBlocked("ses_a", {
+      ...ref(),
+      reason: "deployment credential is unavailable",
+      externalDependency: true,
+      evidenceRefs: ["probe B"],
+    });
+    expect(out3.accepted).toBe(false);
+    expect(out3.confirmations).toBe(1);
+    expect(controller.status("ses_a")?.status).not.toBe("blocked");
+  });
+
   test("REGRESSION: the Phase 01 scenario cannot force blocked or stalled", () => {
     // The exact situation the legacy plugin mis-scored: a milestone is done and
     // the agent asks an optional workflow question.

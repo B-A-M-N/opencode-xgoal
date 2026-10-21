@@ -201,9 +201,11 @@ CREATE TABLE IF NOT EXISTS goal_message_generations (
 -- Blocker claims, one per reporting round. A model can call the blocker tool
 -- many times in one turn; only distinct rounds count as confirmations, so
 -- repetition inside a single execution cannot manufacture a blocker.
--- evidence_sig (audit-4 #8) is the normalized reason PLUS the evidence the
--- report brought: a confirmation only counts when it presents evidence the
--- earlier confirmations of the same dependency did not already have.
+-- evidence_sig (audit-4 #8) is the normalized reason PLUS the timestamp of the
+-- freshest observed backing evidence: a confirmation only counts when the
+-- controller has observed something NEW since every earlier confirmation of
+-- the same dependency. Repeating the same string, or citing any subset of
+-- already-seen evidence, adds nothing.
 CREATE TABLE IF NOT EXISTS goal_blocker_claims (
   id           TEXT PRIMARY KEY,
   goal_id      TEXT NOT NULL,
@@ -537,9 +539,20 @@ export class GoalStore {
       .map((row) => row.name);
     if (!claimColumns.includes("evidence_sig")) {
       this.db.exec(`ALTER TABLE goal_blocker_claims ADD COLUMN evidence_sig TEXT`);
-      this.db
-        .query(`UPDATE goal_blocker_claims SET evidence_sig = reason WHERE evidence_sig IS NULL`)
-        .run();
+      // Legacy rows predate observed-backing signatures: normalize their
+      // reason so like-for-like dedup still works among themselves. They can
+      // never pair with post-migration signatures (which carry a backing
+      // timestamp), so old and new claims never merge — conservative, an
+      // undercount, never a manufactured confirmation.
+      const claimRows = this.db
+        .query<{ id: string; reason: string }, []>(`SELECT id, reason FROM goal_blocker_claims`)
+        .all();
+      const updateClaim = this.db.query(`UPDATE goal_blocker_claims SET evidence_sig = ? WHERE id = ?`);
+      this.tx(() => {
+        for (const claim of claimRows) {
+          updateClaim.run(normalizeBlockerReason(claim.reason), claim.id);
+        }
+      });
     }
     // Durable wait state (audit-4 #4): what the goal is waiting on, since when,
     // and when the next reconciliation is due.
@@ -795,7 +808,8 @@ export class GoalStore {
 
       this.db
         .query(
-          `UPDATE goals SET status='superseded', superseded_by=?, updated_at_ms=?, version=version+1
+          `UPDATE goals SET status='superseded', superseded_by=?, updated_at_ms=?, version=version+1,
+                   wait_started_ms=NULL, wait_reason=NULL, wait_recheck_ms=NULL
            WHERE id=? AND version=?`,
         )
         .run(newIDValue, now, existing.id, existing.version);
@@ -1669,14 +1683,15 @@ export class GoalStore {
    * The round number is derived from the goal's settled-round counter, so two
    * calls in the same turn map to the same round and count once.
    *
-   * Independence is anchored to OBSERVED backing, not to string repetition:
-   * the claim's signature includes the freshest captured observation matching
-   * the claimed refs. A follow-up round that re-ran its probe has a new
-   * observation, a new signature, and counts as a confirmation. A follow-up
-   * round that merely repeats the reason (same refs, nothing newly observed)
-   * has the same signature and adds nothing. A claim with no observed backing
-   * at all records with a NULL signature and can never count as a
-   * confirmation — an assertion is not evidence.
+   * Independence is anchored to OBSERVED backing, not to strings or citation
+   * sets: the claim's signature is the normalized reason plus the timestamp of
+   * the freshest captured observation matching the claimed refs, and a claim
+   * only confirms when that observation is NEWER than every earlier counted
+   * confirmation of the same dependency. Repeating the reason, citing the
+   * same evidence, or citing a different SUBSET of already-seen evidence adds
+   * nothing — only a freshly observed probe can corroborate. A claim with no
+   * observed backing at all records with a NULL signature and can never count
+   * as a confirmation — an assertion is not evidence.
    */
   recordBlockerClaim(input: {
     goalID: string;
@@ -1703,7 +1718,7 @@ export class GoalStore {
           )
           .get(input.goalID, ...keys, ...keys);
         if (backing?.m) {
-          sig = `${normalized}::${keys.join("\u0000")}::${backing.m}`;
+          sig = `${normalized}::${backing.m}`;
         }
       }
       this.db
@@ -1718,30 +1733,45 @@ export class GoalStore {
 
   /**
    * Number of distinct independent confirmations of the same unresolved
-   * dependency: distinct reporting rounds whose claim signature (reason plus
-   * the freshest observed backing) was first-seen for this generation.
-   * Repeating the same string without a new observation is not corroboration.
+   * dependency: distinct reporting rounds whose freshest observed backing was
+   * strictly newer than every earlier counted confirmation's (audit-4 #8).
+   * Repeating strings or re-citing subsets of seen evidence is not
+   * corroboration; only a freshly observed probe confirms.
    */
   blockerConfirmations(goalID: string, generation: number, reason: string): number {
     const normalized = normalizeBlockerReason(reason);
-    const row = this.db
-      .query<{ n: number }, [string, number, string]>(
-        `SELECT COUNT(DISTINCT round_number) AS n
-           FROM goal_blocker_claims c
+    const claims = this.db
+      .query<{ round_number: number; evidence_sig: string | null }, [string, number, string]>(
+        `SELECT round_number, evidence_sig FROM goal_blocker_claims
           WHERE goal_id = ? AND generation = ? AND reason = ?
-            AND evidence_sig IS NOT NULL
-            AND NOT EXISTS (
-              SELECT 1 FROM goal_blocker_claims p
-               WHERE p.goal_id = c.goal_id
-                 AND p.generation = c.generation
-                 AND p.reason = c.reason
-                 AND p.evidence_sig = c.evidence_sig
-                 AND (p.round_number < c.round_number
-                      OR (p.round_number = c.round_number AND p.id < c.id))
-            )`,
+          ORDER BY round_number ASC, id ASC`,
       )
-      .get(goalID, generation, normalized)!;
-    return row.n;
+      .all(goalID, generation, normalized);
+    // Walk the claims in reporting order. A claim confirms the dependency only
+    // when its backing observation is strictly newer than the newest backing
+    // any earlier confirmation used. Count distinct reporting rounds.
+    let newestCounted = Number.NEGATIVE_INFINITY;
+    const countedRounds = new Set<number>();
+    let legacyCounted = false;
+    for (const claim of claims) {
+      if (!claim.evidence_sig) continue;
+      const sep = claim.evidence_sig.lastIndexOf("::");
+      const ts = sep >= 0 ? Number(claim.evidence_sig.slice(sep + 2)) : Number.NaN;
+      if (!Number.isFinite(ts)) {
+        // Legacy (pre-migration) reason-only signature: it carries no observed
+        // backing, so it counts once for its first reporting round and its
+        // repeats never confirm. It does not set the freshness bar.
+        if (!legacyCounted) {
+          legacyCounted = true;
+          countedRounds.add(claim.round_number);
+        }
+        continue;
+      }
+      if (ts <= newestCounted) continue;
+      newestCounted = ts;
+      countedRounds.add(claim.round_number);
+    }
+    return countedRounds.size;
   }
 
   /**
@@ -1866,7 +1896,7 @@ export class GoalStore {
       // not earn ten "progress" verdicts.
       const baseline = this.db
         .query<{ n: number }, [string]>(
-          `SELECT COUNT(*) AS n FROM goal_evidence WHERE goal_id = ? AND kind != 'ref'`,
+          `SELECT COUNT(*) AS n FROM goal_evidence WHERE goal_id = ? AND kind NOT IN ('ref', 'blocker-ref')`,
         )
         .get(input.goalID)!.n;
       this.db

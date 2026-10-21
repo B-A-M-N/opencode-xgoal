@@ -557,9 +557,11 @@ CREATE TABLE IF NOT EXISTS goal_message_generations (
 -- Blocker claims, one per reporting round. A model can call the blocker tool
 -- many times in one turn; only distinct rounds count as confirmations, so
 -- repetition inside a single execution cannot manufacture a blocker.
--- evidence_sig (audit-4 #8) is the normalized reason PLUS the evidence the
--- report brought: a confirmation only counts when it presents evidence the
--- earlier confirmations of the same dependency did not already have.
+-- evidence_sig (audit-4 #8) is the normalized reason PLUS the timestamp of the
+-- freshest observed backing evidence: a confirmation only counts when the
+-- controller has observed something NEW since every earlier confirmation of
+-- the same dependency. Repeating the same string, or citing any subset of
+-- already-seen evidence, adds nothing.
 CREATE TABLE IF NOT EXISTS goal_blocker_claims (
   id           TEXT PRIMARY KEY,
   goal_id      TEXT NOT NULL,
@@ -768,7 +770,13 @@ class GoalStore {
     const claimColumns = this.db.query(`PRAGMA table_info(goal_blocker_claims)`).all().map((row) => row.name);
     if (!claimColumns.includes("evidence_sig")) {
       this.db.exec(`ALTER TABLE goal_blocker_claims ADD COLUMN evidence_sig TEXT`);
-      this.db.query(`UPDATE goal_blocker_claims SET evidence_sig = reason WHERE evidence_sig IS NULL`).run();
+      const claimRows = this.db.query(`SELECT id, reason FROM goal_blocker_claims`).all();
+      const updateClaim = this.db.query(`UPDATE goal_blocker_claims SET evidence_sig = ? WHERE id = ?`);
+      this.tx(() => {
+        for (const claim of claimRows) {
+          updateClaim.run(normalizeBlockerReason(claim.reason), claim.id);
+        }
+      });
     }
     if (!goalColumns.includes("wait_started_ms")) {
       this.db.exec(`ALTER TABLE goals ADD COLUMN wait_started_ms INTEGER`);
@@ -884,7 +892,8 @@ class GoalStore {
       const now = Date.now();
       const newIDValue = newID("goal");
       const nextGeneration = existing.generation + 1;
-      this.db.query(`UPDATE goals SET status='superseded', superseded_by=?, updated_at_ms=?, version=version+1
+      this.db.query(`UPDATE goals SET status='superseded', superseded_by=?, updated_at_ms=?, version=version+1,
+                   wait_started_ms=NULL, wait_reason=NULL, wait_recheck_ms=NULL
            WHERE id=? AND version=?`).run(newIDValue, now, existing.id, existing.version);
       this.appendEvent(existing.id, existing.generation, "superseded", {
         fromStatus: existing.status,
@@ -1283,7 +1292,7 @@ class GoalStore {
               WHERE goal_id = ? AND (id IN (${placeholders}) OR ref IN (${placeholders}))
                 AND kind NOT IN ('ref', 'blocker-ref')`).get(input.goalID, ...keys, ...keys);
         if (backing?.m) {
-          sig = `${normalized}::${keys.join("\x00")}::${backing.m}`;
+          sig = `${normalized}::${backing.m}`;
         }
       }
       this.db.query(`INSERT INTO goal_blocker_claims (id, goal_id, generation, round_number, reason, evidence_sig, at_ms)
@@ -1293,20 +1302,30 @@ class GoalStore {
   }
   blockerConfirmations(goalID, generation, reason) {
     const normalized = normalizeBlockerReason(reason);
-    const row = this.db.query(`SELECT COUNT(DISTINCT round_number) AS n
-           FROM goal_blocker_claims c
+    const claims = this.db.query(`SELECT round_number, evidence_sig FROM goal_blocker_claims
           WHERE goal_id = ? AND generation = ? AND reason = ?
-            AND evidence_sig IS NOT NULL
-            AND NOT EXISTS (
-              SELECT 1 FROM goal_blocker_claims p
-               WHERE p.goal_id = c.goal_id
-                 AND p.generation = c.generation
-                 AND p.reason = c.reason
-                 AND p.evidence_sig = c.evidence_sig
-                 AND (p.round_number < c.round_number
-                      OR (p.round_number = c.round_number AND p.id < c.id))
-            )`).get(goalID, generation, normalized);
-    return row.n;
+          ORDER BY round_number ASC, id ASC`).all(goalID, generation, normalized);
+    let newestCounted = Number.NEGATIVE_INFINITY;
+    const countedRounds = new Set;
+    let legacyCounted = false;
+    for (const claim of claims) {
+      if (!claim.evidence_sig)
+        continue;
+      const sep = claim.evidence_sig.lastIndexOf("::");
+      const ts = sep >= 0 ? Number(claim.evidence_sig.slice(sep + 2)) : Number.NaN;
+      if (!Number.isFinite(ts)) {
+        if (!legacyCounted) {
+          legacyCounted = true;
+          countedRounds.add(claim.round_number);
+        }
+        continue;
+      }
+      if (ts <= newestCounted)
+        continue;
+      newestCounted = ts;
+      countedRounds.add(claim.round_number);
+    }
+    return countedRounds.size;
   }
   recordSessionUsage(sessionID, totalTokens) {
     return this.tx(() => {
@@ -1368,7 +1387,7 @@ class GoalStore {
       }
       const id = newID("round");
       const now = Date.now();
-      const baseline = this.db.query(`SELECT COUNT(*) AS n FROM goal_evidence WHERE goal_id = ? AND kind != 'ref'`).get(input.goalID).n;
+      const baseline = this.db.query(`SELECT COUNT(*) AS n FROM goal_evidence WHERE goal_id = ? AND kind NOT IN ('ref', 'blocker-ref')`).get(input.goalID).n;
       this.db.query(`INSERT INTO goal_rounds
              (id, goal_id, generation, inbox_id, status, attempts, evidence_baseline, prepared_at_ms)
            VALUES (?, ?, ?, ?, 'prepared', 1, ?, ?)`).run(id, input.goalID, input.generation, input.inboxID, baseline, now);
@@ -2500,7 +2519,7 @@ class GoalDriver {
     this.transport = transport;
     this.maxNoProgressRounds = options.maxNoProgressRounds ?? 3;
     this.maxRoundAttempts = options.maxRoundAttempts ?? 5;
-    this.maxVerifiedWaitMs = options.maxVerifiedWaitMs ?? 15 * 60000;
+    this.maxVerifiedWaitMs = options.maxVerifiedWaitMs ?? 10 * 60000;
     this.waitRecheckMs = options.waitRecheckMs ?? 30000;
     this.render = options.renderContinuation ?? DEFAULT_CONTINUATION;
     this.classify = options.classify ?? DEFAULT_CLASSIFY;
@@ -2655,8 +2674,23 @@ class GoalDriver {
         continue;
       }
       const wait = this.store.activeWait(waiting.goalID);
-      if (wait)
+      if (!wait)
+        continue;
+      if (Date.now() - wait.startedMs < wait.recheckMs) {
+        out.push({
+          action: "waiting",
+          roundID: "",
+          status: goal.status,
+          reason: wait.reason,
+          recheckMs: wait.recheckMs - (Date.now() - wait.startedMs)
+        });
+        continue;
+      }
+      try {
         out.push(await this.recheckWait(goal, wait));
+      } catch (error) {
+        out.push({ action: "idle", reason: `wait recheck deferred: ${String(error)}` });
+      }
     }
     return out;
   }

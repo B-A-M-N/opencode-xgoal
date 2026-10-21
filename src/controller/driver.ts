@@ -200,9 +200,14 @@ export class GoalDriver {
     this.transport = transport;
     this.maxNoProgressRounds = options.maxNoProgressRounds ?? 3;
     this.maxRoundAttempts = options.maxRoundAttempts ?? 5;
-    // Aligned with the transport's 15-minute liveness staleness TTL: both are
-    // safety nets against stale observations, not polling intervals.
-    this.maxVerifiedWaitMs = options.maxVerifiedWaitMs ?? 15 * 60_000;
+    // Deliberately SHORTER than the transport's 15-minute liveness staleness
+    // TTL: the transport TTL runs from when the busy reference started, which
+    // is typically before the goal's wait did. With the driver bound at 10
+    // minutes, an unconfirmable wait deterministically reaches the parked
+    // "waiting exceeded" branch instead of being woken by the TTL expiring
+    // first (which would mint continuations against a possibly stale
+    // liveness observation). Both are safety nets, not polling intervals.
+    this.maxVerifiedWaitMs = options.maxVerifiedWaitMs ?? 10 * 60_000;
     this.waitRecheckMs = options.waitRecheckMs ?? 30_000;
     this.render = options.renderContinuation ?? DEFAULT_CONTINUATION;
     this.classify = options.classify ?? DEFAULT_CLASSIFY;
@@ -434,8 +439,11 @@ export class GoalDriver {
       out.push(await this.reconcileRound(round));
     }
     // Durable waits (audit-4 #4): goals parked on a background execution have
-    // no outstanding round, so the loop above never sees them. Recheck each
-    // wait here — the awaited work may have completed, which wakes the goal.
+    // no outstanding round, so the loop above never sees them. Each wait
+    // carries its persisted next-reconciliation time: only waits that have
+    // fallen due are re-probed here, on the persisted contract rather than
+    // the sweep's own cadence. (The awaited work completing still wakes the
+    // goal early through the event-driven drive() path.)
     for (const waiting of this.store.goalsWithActiveWaits()) {
       const goal = this.store.byID(waiting.goalID);
       if (!goal || goal.status !== "active") {
@@ -443,7 +451,28 @@ export class GoalDriver {
         continue;
       }
       const wait = this.store.activeWait(waiting.goalID);
-      if (wait) out.push(await this.recheckWait(goal, wait));
+      if (!wait) continue;
+      // Recheck when the persisted next reconciliation time has fallen due.
+      // The 15-minute staleness TTL in the transport bounds how long a stale
+      // liveness observation can hold the goal, so a long sweep interval
+      // delays rechecks but cannot strand one past its own bound.
+      if (Date.now() - wait.startedMs < wait.recheckMs) {
+        out.push({
+          action: "waiting",
+          roundID: "",
+          status: goal.status,
+          reason: wait.reason,
+          recheckMs: wait.recheckMs - (Date.now() - wait.startedMs),
+        });
+        continue;
+      }
+      try {
+        out.push(await this.recheckWait(goal, wait));
+      } catch (error) {
+        // One goal's conflict (replaced/transitioned concurrently) must not
+        // abort the recheck of the others; the next sweep reconciles it.
+        out.push({ action: "idle", reason: `wait recheck deferred: ${String(error)}` });
+      }
     }
     // A terminal delivery failure is deliberately NOT cleared here. Sweeping is
     // automatic; recovering a definitively rejected goal must not be. Without
