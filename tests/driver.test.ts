@@ -684,9 +684,12 @@ describe("progress classification counts only verifiable evidence", () => {
     expect(store.current("ses_a")!.status).toBe("active");
     expect(store.current("ses_a")!.noProgressRounds).toBe(0);
 
-    // The recovery sweep also rechecks the wait without minting rounds.
+    // The recovery sweep honors the persisted next-reconciliation time: this
+    // wait is NOT yet due (recheckMs is 30s, elapsed ~0), so the sweep skips
+    // the recheck entirely and still mints nothing.
     await driver.reconcile();
     expect(transport.submitted.length).toBe(1);
+    expect(store.activeWait(goal.id)).toBeDefined();
 
     // The job finishes: the next drive clears the wait and wakes the goal
     // with a fresh continuation. The rechecks themselves spent nothing.
@@ -719,6 +722,42 @@ describe("progress classification counts only verifiable evidence", () => {
     expect(after.status).toBe("stalled");
     expect(after.reason).toContain("background execution");
     expect(store.activeWait(goal.id)).toBeUndefined();
+  });
+
+  test("the sweep rechecks a wait whose persisted recheck time has fallen due", async () => {
+    const transport = new FakeTransport();
+    // recheckMs 0: the wait is due the instant it is entered, so the sweep
+    // must actually probe it (and, with the job still running, keep parking).
+    const driver = new GoalDriver(store, transport, {
+      maxNoProgressRounds: 2,
+      waitRecheckMs: 0,
+    });
+    const goal = store.create({ sessionID: "ses_a", objective: "wait for the migration" });
+
+    transport.liveWaitResult = true;
+    await driver.drive("ses_a");
+    transport.probeResult = "settled";
+    const settleOutcome = await driver.drive("ses_a");
+    expect(settleOutcome.action).toBe("waiting");
+    expect(store.activeWait(goal.id)?.recheckMs).toBe(0);
+
+    // Sweep: the wait is due, so the sweep probes the transport (recheckWait)
+    // and, because the job is still live, re-arms the wait — no rounds minted.
+    const sweep = await driver.reconcile();
+    expect(sweep.length).toBe(1);
+    expect(sweep[0]!.action).toBe("waiting");
+    expect(transport.liveWaitResult).toBe(true);
+    expect(store.activeWait(goal.id)).toBeDefined();
+    expect(transport.submitted.length).toBe(1);
+    expect(store.roundsFor(goal.id)).toHaveLength(1);
+
+    // The job finishes: the sweep itself wakes the goal.
+    transport.liveWaitResult = false;
+    const wake = await driver.reconcile();
+    expect(wake.length).toBe(1);
+    expect(wake[0]!.action).toBe("admitted");
+    expect(store.activeWait(goal.id)).toBeUndefined();
+    expect(transport.submitted.length).toBe(2);
   });
 
   test("ten identical command rounds stall; distinct observations do not", async () => {

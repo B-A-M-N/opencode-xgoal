@@ -208,7 +208,12 @@ export class GoalDriver {
     // first (which would mint continuations against a possibly stale
     // liveness observation). Both are safety nets, not polling intervals.
     this.maxVerifiedWaitMs = options.maxVerifiedWaitMs ?? 10 * 60_000;
-    this.waitRecheckMs = options.waitRecheckMs ?? 30_000;
+    // The recheck cadence must sit INSIDE the wait bound: enterWait refreshes
+    // wait_recheck_ms on every wake-or-expiry cycle while preserving the
+    // original wait start, so a recheck horizon at or beyond the bound would
+    // let each cycle re-arm the not-due window and defer the parked state
+    // indefinitely. Clamping keeps the invariant recheckMs < maxVerifiedWaitMs.
+    this.waitRecheckMs = Math.min(options.waitRecheckMs ?? 30_000, Math.max(this.maxVerifiedWaitMs - 1, 0));
     this.render = options.renderContinuation ?? DEFAULT_CONTINUATION;
     this.classify = options.classify ?? DEFAULT_CLASSIFY;
   }

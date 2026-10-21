@@ -262,6 +262,67 @@ describe("blockers must be genuine", () => {
     expect(controller.status("ses_a")?.status).not.toBe("blocked");
   });
 
+  test("REGRESSION: growing the citation set over seen evidence is not a new confirmation", () => {
+    // The sibling repro of the shrinking-subset case: round 1 cites only the
+    // OLDER probe; round 2 grows the citation to include the fresher one.
+    // Both observations predate round 1, so nothing was observed between the
+    // claims — MAX-climbing over already-seen rows must not confirm.
+    controller.startOrDescribe("ses_a", "ship the release");
+    controller.store.addEvidence({
+      goalID: ref().goalID,
+      kind: "command",
+      ref: "probe old",
+      detail: "exit 1",
+      exitCode: 1,
+    });
+    controller.store.addEvidence({
+      goalID: ref().goalID,
+      kind: "command",
+      ref: "probe fresh",
+      detail: "exit 1",
+      exitCode: 1,
+    });
+    const out1 = controller.reportBlocked("ses_a", {
+      ...ref(),
+      reason: "deployment credential is unavailable",
+      externalDependency: true,
+      evidenceRefs: ["probe old"],
+    });
+    expect(out1.accepted).toBe(false);
+    expect(out1.confirmations).toBe(1);
+    controller.classifyRound("ses_a", "noProgress");
+
+    // Round 2: citation grows to include the fresher (but already-observed)
+    // probe. No new observation happened between the two claims.
+    const out2 = controller.reportBlocked("ses_a", {
+      ...ref(),
+      reason: "deployment credential is unavailable",
+      externalDependency: true,
+      evidenceRefs: ["probe old", "probe fresh"],
+    });
+    expect(out2.accepted).toBe(false);
+    expect(out2.confirmations).toBe(1);
+    expect(controller.status("ses_a")?.status).toBe("active");
+
+    // Round 3: a genuinely NEW observation (re-ran the probe) confirms.
+    controller.classifyRound("ses_a", "noProgress");
+    controller.store.addEvidence({
+      goalID: ref().goalID,
+      kind: "command",
+      ref: "probe fresh",
+      detail: "exit 1 again",
+      exitCode: 1,
+    });
+    const out3 = controller.reportBlocked("ses_a", {
+      ...ref(),
+      reason: "deployment credential is unavailable",
+      externalDependency: true,
+      evidenceRefs: ["probe fresh"],
+    });
+    expect(out3.confirmations).toBe(2);
+    expect(out3.goal?.status).toBe("blocked");
+  });
+
   test("REGRESSION: the Phase 01 scenario cannot force blocked or stalled", () => {
     // The exact situation the legacy plugin mis-scored: a milestone is done and
     // the agent asks an optional workflow question.

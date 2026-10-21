@@ -1686,12 +1686,13 @@ export class GoalStore {
    * Independence is anchored to OBSERVED backing, not to strings or citation
    * sets: the claim's signature is the normalized reason plus the timestamp of
    * the freshest captured observation matching the claimed refs, and a claim
-   * only confirms when that observation is NEWER than every earlier counted
-   * confirmation of the same dependency. Repeating the reason, citing the
-   * same evidence, or citing a different SUBSET of already-seen evidence adds
-   * nothing — only a freshly observed probe can corroborate. A claim with no
-   * observed backing at all records with a NULL signature and can never count
-   * as a confirmation — an assertion is not evidence.
+   * only confirms when that observation was captured AFTER the previous
+   * counted confirmation was recorded. Repeating the reason, citing the same
+   * evidence, citing a different SUBSET of already-seen evidence, or GROWING
+   * the citation set over already-observed rows adds nothing — only evidence
+   * the controller observed since the last confirmation can corroborate. A
+   * claim with no observed backing at all records with a NULL signature and
+   * can never count as a confirmation — an assertion is not evidence.
    */
   recordBlockerClaim(input: {
     goalID: string;
@@ -1733,24 +1734,30 @@ export class GoalStore {
 
   /**
    * Number of distinct independent confirmations of the same unresolved
-   * dependency: distinct reporting rounds whose freshest observed backing was
-   * strictly newer than every earlier counted confirmation's (audit-4 #8).
-   * Repeating strings or re-citing subsets of seen evidence is not
-   * corroboration; only a freshly observed probe confirms.
+   * dependency: distinct reporting rounds whose backing observation was
+   * captured AFTER the previous counted confirmation was recorded (audit-4
+   * #8). Repeating strings, re-citing subsets of seen evidence, or growing
+   * the citation set over already-observed rows is not corroboration; only
+   * evidence the controller observed since the last confirmation counts.
    */
   blockerConfirmations(goalID: string, generation: number, reason: string): number {
     const normalized = normalizeBlockerReason(reason);
     const claims = this.db
-      .query<{ round_number: number; evidence_sig: string | null }, [string, number, string]>(
-        `SELECT round_number, evidence_sig FROM goal_blocker_claims
+      .query<{ round_number: number; evidence_sig: string | null; at_ms: number }, [string, number, string]>(
+        `SELECT round_number, evidence_sig, at_ms FROM goal_blocker_claims
           WHERE goal_id = ? AND generation = ? AND reason = ?
           ORDER BY round_number ASC, id ASC`,
       )
       .all(goalID, generation, normalized);
-    // Walk the claims in reporting order. A claim confirms the dependency only
-    // when its backing observation is strictly newer than the newest backing
-    // any earlier confirmation used. Count distinct reporting rounds.
-    let newestCounted = Number.NEGATIVE_INFINITY;
+    // Walk the claims in reporting order. A claim confirms the dependency
+    // only when its backing observation is strictly newer than the moment
+    // the previous counted confirmation was RECORDED — i.e. something new
+    // was actually observed between the two confirmations. Comparing
+    // against the prior claim's recording time (not its backing timestamp)
+    // also kills the growing-citation climb: re-citing older evidence that
+    // happens to be fresher than the previous claim's backing is not a new
+    // observation. Count distinct reporting rounds.
+    let observedThrough = Number.NEGATIVE_INFINITY;
     const countedRounds = new Set<number>();
     let legacyCounted = false;
     for (const claim of claims) {
@@ -1760,15 +1767,15 @@ export class GoalStore {
       if (!Number.isFinite(ts)) {
         // Legacy (pre-migration) reason-only signature: it carries no observed
         // backing, so it counts once for its first reporting round and its
-        // repeats never confirm. It does not set the freshness bar.
+        // repeats never confirm. It does not advance the freshness bar.
         if (!legacyCounted) {
           legacyCounted = true;
           countedRounds.add(claim.round_number);
         }
         continue;
       }
-      if (ts <= newestCounted) continue;
-      newestCounted = ts;
+      if (ts <= observedThrough) continue;
+      observedThrough = claim.at_ms;
       countedRounds.add(claim.round_number);
     }
     return countedRounds.size;

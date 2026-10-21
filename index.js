@@ -1302,10 +1302,10 @@ class GoalStore {
   }
   blockerConfirmations(goalID, generation, reason) {
     const normalized = normalizeBlockerReason(reason);
-    const claims = this.db.query(`SELECT round_number, evidence_sig FROM goal_blocker_claims
+    const claims = this.db.query(`SELECT round_number, evidence_sig, at_ms FROM goal_blocker_claims
           WHERE goal_id = ? AND generation = ? AND reason = ?
           ORDER BY round_number ASC, id ASC`).all(goalID, generation, normalized);
-    let newestCounted = Number.NEGATIVE_INFINITY;
+    let observedThrough = Number.NEGATIVE_INFINITY;
     const countedRounds = new Set;
     let legacyCounted = false;
     for (const claim of claims) {
@@ -1320,9 +1320,9 @@ class GoalStore {
         }
         continue;
       }
-      if (ts <= newestCounted)
+      if (ts <= observedThrough)
         continue;
-      newestCounted = ts;
+      observedThrough = claim.at_ms;
       countedRounds.add(claim.round_number);
     }
     return countedRounds.size;
@@ -2520,7 +2520,7 @@ class GoalDriver {
     this.maxNoProgressRounds = options.maxNoProgressRounds ?? 3;
     this.maxRoundAttempts = options.maxRoundAttempts ?? 5;
     this.maxVerifiedWaitMs = options.maxVerifiedWaitMs ?? 10 * 60000;
-    this.waitRecheckMs = options.waitRecheckMs ?? 30000;
+    this.waitRecheckMs = Math.min(options.waitRecheckMs ?? 30000, Math.max(this.maxVerifiedWaitMs - 1, 0));
     this.render = options.renderContinuation ?? DEFAULT_CONTINUATION;
     this.classify = options.classify ?? DEFAULT_CLASSIFY;
   }
