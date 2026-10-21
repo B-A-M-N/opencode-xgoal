@@ -652,33 +652,161 @@ describe("progress classification counts only verifiable evidence", () => {
     expect(store.current("ses_a")!.noProgressRounds).toBe(0);
   });
 
-  test("a verified live wait does not accumulate toward a stall", async () => {
+  test("a verified live wait enters a durable wait instead of minting continuations", async () => {
     const transport = new FakeTransport();
     const driver = new GoalDriver(store, transport, { maxNoProgressRounds: 2 });
-    store.create({ sessionID: "ses_a", objective: "wait for the migration" });
+    const goal = store.create({ sessionID: "ses_a", objective: "wait for the migration" });
 
-    // Three settled rounds with no new evidence, but an execution observably
-    // running each time: waiting on a real job, not spinning.
+    // The first round runs and settles while a background execution is
+    // observably running: a verified wait.
     transport.liveWaitResult = true;
-    for (let i = 0; i < 3; i++) {
+    await driver.drive("ses_a");
+    transport.probeResult = "settled";
+    const settleOutcome = await driver.drive("ses_a");
+
+    // The settle outcome is a durable wait, not another dispatch.
+    expect(settleOutcome.action).toBe("waiting");
+    expect(store.activeWait(goal.id)).toBeDefined();
+    expect(store.activeWait(goal.id)?.recheckMs).toBeGreaterThan(0);
+    // Exactly one round was ever submitted: the settle did NOT reserve another.
+    expect(transport.submitted.length).toBe(1);
+    expect(store.outstandingRound(goal.id)).toBeUndefined();
+
+    // Further drives while the job runs stay parked on the wait — no new
+    // rounds, no token spend. This is the 60-second-background-job gate: a
+    // long wait must not produce a sequence of identical continuations.
+    for (let i = 0; i < 5; i++) {
+      const outcome = await driver.drive("ses_a");
+      expect(outcome.action).toBe("waiting");
+    }
+    expect(transport.submitted.length).toBe(1);
+    expect(store.roundsFor(goal.id)).toHaveLength(1);
+    expect(store.current("ses_a")!.status).toBe("active");
+    expect(store.current("ses_a")!.noProgressRounds).toBe(0);
+
+    // The recovery sweep also rechecks the wait without minting rounds.
+    await driver.reconcile();
+    expect(transport.submitted.length).toBe(1);
+
+    // The job finishes: the next drive clears the wait and wakes the goal
+    // with a fresh continuation. The rechecks themselves spent nothing.
+    transport.liveWaitResult = false;
+    const wake = await driver.drive("ses_a");
+    expect(wake.action).toBe("admitted");
+    expect(store.activeWait(goal.id)).toBeUndefined();
+    expect(transport.submitted.length).toBe(2);
+  });
+
+  test("a wait that exceeds its bound parks the goal with an actionable reason", async () => {
+    const transport = new FakeTransport();
+    const driver = new GoalDriver(store, transport, {
+      maxVerifiedWaitMs: 0, // any waited duration exceeds the bound
+      waitRecheckMs: 1000,
+    });
+    const goal = store.create({ sessionID: "ses_a", objective: "wait for the migration" });
+
+    transport.liveWaitResult = true;
+    await driver.drive("ses_a");
+    transport.probeResult = "settled";
+    await driver.drive("ses_a");
+    expect(store.activeWait(goal.id)).toBeDefined();
+
+    // The wait cannot be confirmed within its bound: park with a reason, and
+    // do NOT keep minting continuations.
+    const outcome = await driver.drive("ses_a");
+    expect(outcome.action).toBe("limited");
+    const after = store.current("ses_a")!;
+    expect(after.status).toBe("stalled");
+    expect(after.reason).toContain("background execution");
+    expect(store.activeWait(goal.id)).toBeUndefined();
+  });
+
+  test("ten identical command rounds stall; distinct observations do not", async () => {
+    const transport = new FakeTransport();
+    const driver = new GoalDriver(store, transport, { maxNoProgressRounds: 3 });
+    const goal = store.create({ sessionID: "ses_a", objective: "keep working" });
+
+    // Ten rounds, each running the IDENTICAL command: one observation, ten
+    // rows. Repetition must not reset the stall counter.
+    for (let i = 0; i < 10; i++) {
       await driver.drive("ses_a");
+      store.addEvidence({ goalID: goal.id, kind: "command", ref: "pwd", detail: "exit 0", exitCode: 0 });
+      transport.probeResult = "settled";
+      await driver.drive("ses_a");
+      if (store.current("ses_a")!.status === "stalled") break;
+    }
+    expect(store.current("ses_a")!.status).toBe("stalled");
+    // The trail is honest — but only two rows landed, because once the goal
+    // stalls the driver stops minting continuations (and the loop stops).
+    // What matters: rounds beyond the first never counted as progress.
+    expect(store.listEvidence(goal.id).length).toBeGreaterThanOrEqual(2);
+  });
+
+  test("three investigation rounds with different facts are not stalled", async () => {
+    const transport = new FakeTransport();
+    const driver = new GoalDriver(store, transport, { maxNoProgressRounds: 2 });
+    const goal = store.create({ sessionID: "ses_a", objective: "diagnose the flake" });
+
+    const commands = ["ls src/", "grep -rn retry src/controller", "cat src/controller/driver.ts"];
+    for (const command of commands) {
+      await driver.drive("ses_a");
+      store.addEvidence({ goalID: goal.id, kind: "command", ref: command, detail: "exit 0", exitCode: 0 });
       transport.probeResult = "settled";
       await driver.drive("ses_a");
     }
 
     expect(store.current("ses_a")!.status).toBe("active");
     expect(store.current("ses_a")!.noProgressRounds).toBe(0);
-    const settled = store
-      .roundsFor(store.current("ses_a")!.id)
-      .filter((r) => r.status === "settled");
-    expect(settled.every((r) => r.classification === "verifiedWait")).toBe(true);
+  });
 
-    // Once the job finishes (no more live wait), unproductive rounds count
-    // again — the stall policy still applies to genuine spinning.
-    transport.liveWaitResult = false;
+  test("a failed test that appears for the first time is progress; its repeat is not", async () => {
+    const transport = new FakeTransport();
+    const driver = new GoalDriver(store, transport, { maxNoProgressRounds: 1 });
+    store.create({ sessionID: "ses_a", objective: "fix the suite" });
+
+    // Round 1: the failing test is a NEW observation.
+    await driver.drive("ses_a");
+    store.addEvidence({
+      goalID: store.current("ses_a")!.id,
+      kind: "test",
+      ref: "bun test",
+      detail: "exit 1",
+      exitCode: 1,
+    });
+    transport.probeResult = "settled";
+    await driver.drive("ses_a");
+    expect(store.current("ses_a")!.noProgressRounds).toBe(0);
+
+    // Round 2: the same failing test, unchanged — no new information.
+    store.addEvidence({
+      goalID: store.current("ses_a")!.id,
+      kind: "test",
+      ref: "bun test",
+      detail: "exit 1",
+      exitCode: 1,
+    });
+    transport.probeResult = "settled";
     await driver.drive("ses_a");
     expect(store.current("ses_a")!.noProgressRounds).toBe(1);
+    // The stall policy parks the goal at threshold 1 — an explicit user (or
+    // controller) resume is the only path back to work.
+    const stalled = store.current("ses_a")!;
+    expect(stalled.status).toBe("stalled");
+    store.transition({ goalID: stalled.id, generation: stalled.generation, to: "active", actor: "user" });
+
+    // Round 3: the test now passes — a different observation, progress again.
+    // The observation must land DURING the round: dispatch first, observe,
+    // then settle.
     await driver.drive("ses_a");
-    expect(store.current("ses_a")!.status).toBe("stalled");
+    store.addEvidence({
+      goalID: store.current("ses_a")!.id,
+      kind: "test",
+      ref: "bun test",
+      detail: "exit 0",
+      exitCode: 0,
+    });
+    transport.probeResult = "settled";
+    await driver.drive("ses_a");
+    expect(store.current("ses_a")!.noProgressRounds).toBe(0);
   });
 });

@@ -217,6 +217,8 @@ function describeDrive(outcome) {
       return `dispatch abandoned: ${outcome.detail}`;
     case "limited":
       return `not dispatched: goal is ${outcome.status}`;
+    case "waiting":
+      return `waiting on a background execution: ${outcome.reason}`;
     case "idle":
       return `not dispatched: ${outcome.reason}`;
     default:

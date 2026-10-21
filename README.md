@@ -273,7 +273,7 @@ inspection. It never touches the user's database or sessions.
 ## Verification
 
 ```bash
-bun test          # 246 unit/integration tests, 699 assertions
+bun test          # 252 unit/integration tests, 751 assertions
 bun run typecheck # clean
 bash scripts/parity.sh  # 17/17 live acceptance checks
 ```
@@ -513,3 +513,33 @@ with regression tests:
     a conjunction without an obligation after it stays literal content
     ("alpha and beta"), and workflow instructions ("propose completion") are
     never treated as outcome requirements.
+
+Package 2 of the fourth audit's plan fixes the driver scheduling and
+honest-progress gaps:
+
+21. **A verified wait is a scheduling decision (P1)** — when a settled round
+    classifies as `verifiedWait`, the driver records a durable wait (what is
+    awaited, since when, next reconciliation time) instead of minting another
+    continuation. The recovery sweep rechecks the wait with a transport probe
+    — no model tokens — and wakes the goal when the awaited work completes or
+    fails. A wait that exceeds its bound parks the goal with an actionable
+    reason. A 60-second background job can no longer cause a sequence of
+    identical continuations.
+22. **Blocker classification precedes counting (P1)** — a workflow question
+    (push or continue, optional decisions, choices between reasonable next
+    steps) is never a blocker, no matter how many rounds it is repeated in:
+    the report is rejected with a continuation instruction and accrues no
+    confirmations. A genuine blocker requires a claimed external dependency
+    AND backing evidence the controller actually observed; independent
+    confirmations are counted by claim signature (reason plus freshest
+    observed backing), so repeating the same string without a new observation
+    adds nothing.
+23. **Observation fingerprints for round progress (P1)** — captured evidence
+    carries a stable fingerprint (kind + normalized observation + result
+    status, from persisted fields only so existing rows backfill). A round
+    counts as progress only when it contains a fingerprint never seen before:
+    ten identical `pwd` rounds add rows but no new observations, so the stall
+    threshold still fires, while a first-time failing test or a different
+    investigation command is genuinely new information. Blocker reports are
+    also excluded from the verifiable-evidence count, closing a route by
+    which reporting a blocker could register as progress.

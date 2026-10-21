@@ -43,6 +43,8 @@ function describeDrive(outcome: any): string {
       return `dispatch abandoned: ${outcome.detail}.`;
     case "limited":
       return `not dispatched: goal is ${outcome.status}.`;
+    case "waiting":
+      return `waiting on a background execution (recheck in ${Math.round((outcome.recheckMs ?? 30000) / 1000)}s): ${outcome.reason}.`;
     case "idle":
       return `not dispatched: ${outcome.reason}.`;
     default:
@@ -758,11 +760,16 @@ export default {
               goalID: target.ref.goalID,
               generation: target.ref.generation,
             });
-            if (out.rejected) return { content: `Blocker report rejected: ${out.rejected}` };
+            if (out.rejected) {
+              const content = out.instruction
+                ? `Blocker report rejected: ${out.instruction}`
+                : `Blocker report rejected: ${out.rejected}`;
+              return { content, metadata: { confirmations: out.confirmations, status: out.goal?.status } };
+            }
             if (!out.accepted) {
               return {
                 content:
-                  "Blocker not accepted: no concrete external dependency was identified. The goal remains active — take the next useful action.",
+                  "Blocker not accepted. The goal remains active — take the next useful action.",
                 metadata: { confirmations: out.confirmations, status: out.goal?.status },
               };
             }

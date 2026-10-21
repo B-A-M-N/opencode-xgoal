@@ -80,57 +80,133 @@ describe("model cannot commit its own completion", () => {
 });
 
 describe("blockers must be genuine", () => {
-  test("a single blocker report does not park the goal", () => {
+  test("a workflow question is rejected as a blocker, not counted", () => {
     controller.startOrDescribe("ses_a", "build the replacement");
     const out = controller.reportBlocked("ses_a", {
       ...ref(),
       reason: "I finished phase 01 and asked the user whether to push or continue",
     });
     expect(out.accepted).toBe(false);
-    expect(out.confirmations).toBe(1);
+    // Classification precedes counting: a workflow question accrues nothing.
+    expect(out.confirmations).toBe(0);
+    expect(out.rejected).toContain("workflow question");
     // The goal is still drivable.
     expect(controller.status("ses_a")?.status).toBe("active");
   });
 
-  test("repeated calls in one round count once; a later round confirms", () => {
-    controller.startOrDescribe("ses_a", "x");
-    const first = controller.reportBlocked("ses_a", { ...ref(), reason: "waiting on vendor API key" });
-    expect(first.accepted).toBe(false);
-    // A second call in the same turn must NOT be a second confirmation.
-    const sameRound = controller.reportBlocked("ses_a", {
-      ...ref(),
-      reason: "waiting on vendor API key",
-    });
-    expect(sameRound.accepted).toBe(false);
-    expect(sameRound.confirmations).toBe(1);
-
-    // Settle the round, then report again in the next independently evaluated round.
-    controller.classifyRound("ses_a", "blocked", "round ended with the same unresolved blocker");
-    const second = controller.reportBlocked("ses_a", { ...ref(), reason: "waiting on vendor API key" });
-    expect(second.accepted).toBe(true);
-    expect(second.confirmations).toBe(2);
-    expect(second.goal?.status).toBe("blocked");
+  test("REGRESSION: a workflow question never blocks, even across five rounds", () => {
+    controller.startOrDescribe("ses_a", "deliver the migration");
+    const question = "Should I push phase 1 or continue phase 2?";
+    for (let round = 1; round <= 5; round++) {
+      const out = controller.reportBlocked("ses_a", {
+        ...ref(),
+        reason: question,
+        externalDependency: true, // even asserted as one
+        evidenceRefs: [`probe output ${round}`],
+      });
+      expect(out.accepted).toBe(false);
+      expect(out.confirmations).toBe(0);
+      expect(out.rejected).toContain("workflow question");
+      // A new round between reports does not change the class. The idle rounds
+      // may eventually trip the STALL policy (that is its job), but a blocker
+      // must never be manufactured from repetition.
+      controller.classifyRound("ses_a", "noProgress");
+      expect(controller.status("ses_a")?.status).not.toBe("blocked");
+    }
+    expect(controller.status("ses_a")?.status).not.toBe("blocked");
   });
 
-  test("a claimed external dependency is not self-authenticating", () => {
+  test("a claim without backing evidence cannot confirm, even repeated", () => {
     controller.startOrDescribe("ses_a", "x");
-    const out = controller.reportBlocked("ses_a", {
+    const first = controller.reportBlocked("ses_a", {
       ...ref(),
-      reason: "cannot proceed without the production API credential",
+      reason: "waiting on vendor API key",
+      externalDependency: true, // asserted, but nothing cited
+    });
+    expect(first.accepted).toBe(false);
+    // The same assertion in a later round is still just an assertion.
+    controller.classifyRound("ses_a", "noProgress");
+    const second = controller.reportBlocked("ses_a", {
+      ...ref(),
+      reason: "waiting on vendor API key",
       externalDependency: true,
     });
-    // The claim alone does not park the goal.
-    expect(out.accepted).toBe(false);
+    expect(second.accepted).toBe(false);
+    expect(second.confirmations).toBe(0);
     expect(controller.status("ses_a")?.status).toBe("active");
+  });
 
-    controller.classifyRound("ses_a", "blocked");
-    const again = controller.reportBlocked("ses_a", {
+  test("repeating the same claim without a new observation adds no confirmation", () => {
+    controller.startOrDescribe("ses_a", "x");
+    // Round 1: the controller observed the failed auth probe; the claim cites it.
+    controller.store.addEvidence({
+      goalID: ref().goalID,
+      kind: "command",
+      ref: "auth --check",
+      detail: "exit 1",
+      exitCode: 1,
+    });
+    const out1 = controller.reportBlocked("ses_a", {
       ...ref(),
       reason: "cannot proceed without the production API credential",
       externalDependency: true,
+      evidenceRefs: ["auth --check"],
     });
-    expect(again.accepted).toBe(true);
-    expect(again.goal?.status).toBe("blocked");
+    expect(out1.accepted).toBe(false);
+    expect(out1.confirmations).toBe(1);
+
+    // Round 2: same reason, same evidence, nothing newly observed — a
+    // repetition, not an independent confirmation.
+    controller.classifyRound("ses_a", "noProgress");
+    const out2 = controller.reportBlocked("ses_a", {
+      ...ref(),
+      reason: "cannot proceed without the production API credential",
+      externalDependency: true,
+      evidenceRefs: ["auth --check"],
+    });
+    expect(out2.accepted).toBe(false);
+    expect(out2.confirmations).toBe(1);
+    expect(controller.status("ses_a")?.status).toBe("active");
+  });
+
+  test("REGRESSION: an unavailable credential with a fresh observation blocks", () => {
+    controller.startOrDescribe("ses_a", "deploy the release");
+    // Round 1: the controller observed the failed auth probe; the claim cites it.
+    controller.store.addEvidence({
+      goalID: ref().goalID,
+      kind: "command",
+      ref: "auth --check",
+      detail: "exit 1",
+      exitCode: 1,
+    });
+    const out1 = controller.reportBlocked("ses_a", {
+      ...ref(),
+      reason: "cannot proceed without the production API credential",
+      externalDependency: true,
+      evidenceRefs: ["auth --check"],
+    });
+    expect(out1.accepted).toBe(false);
+    expect(out1.confirmations).toBe(1);
+    controller.classifyRound("ses_a", "noProgress");
+
+    // Round 2: the model re-ran the probe and the controller observed it — a
+    // NEW observation of the same unresolved dependency.
+    controller.store.addEvidence({
+      goalID: ref().goalID,
+      kind: "command",
+      ref: "auth --check --verbose",
+      detail: "exit 1",
+      exitCode: 1,
+    });
+    const out2 = controller.reportBlocked("ses_a", {
+      ...ref(),
+      reason: "cannot proceed without the production API credential",
+      externalDependency: true,
+      evidenceRefs: ["auth --check --verbose"],
+    });
+    expect(out2.accepted).toBe(true);
+    expect(out2.confirmations).toBe(2);
+    expect(out2.goal?.status).toBe("blocked");
   });
 
   test("REGRESSION: the Phase 01 scenario cannot force blocked or stalled", () => {

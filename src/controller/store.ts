@@ -88,6 +88,12 @@ CREATE TABLE IF NOT EXISTS goals (
   -- driver refuses to dispatch until recovery clears it, so a terminal
   -- delivery failure cannot be circumvented by minting a fresh continuation.
   delivery_failed          INTEGER NOT NULL DEFAULT 0,
+  -- Durable wait state (audit-4 #4): set when a settled round classified
+  -- verifiedWait. While set, the driver reconciles the wait without model
+  -- tokens instead of minting another continuation.
+  wait_started_ms          INTEGER,
+  wait_reason              TEXT,
+  wait_recheck_ms          INTEGER,
   UNIQUE (session_id, generation)
 );
 
@@ -155,7 +161,11 @@ CREATE TABLE IF NOT EXISTS goal_evidence (
   exit_code   INTEGER,
   hash        TEXT,
   workspace   TEXT,
-  at_ms       INTEGER NOT NULL
+  at_ms       INTEGER NOT NULL,
+  -- Stable fingerprint of the observation (audit-4 #9): kind + normalized
+  -- observation + result status. Identical observations share a fingerprint,
+  -- so repeating the same command cannot manufacture round progress.
+  fingerprint TEXT
 );
 CREATE INDEX IF NOT EXISTS goal_evidence_goal ON goal_evidence (goal_id);
 CREATE INDEX IF NOT EXISTS goal_evidence_criterion ON goal_evidence (criterion_id);
@@ -191,12 +201,16 @@ CREATE TABLE IF NOT EXISTS goal_message_generations (
 -- Blocker claims, one per reporting round. A model can call the blocker tool
 -- many times in one turn; only distinct rounds count as confirmations, so
 -- repetition inside a single execution cannot manufacture a blocker.
+-- evidence_sig (audit-4 #8) is the normalized reason PLUS the evidence the
+-- report brought: a confirmation only counts when it presents evidence the
+-- earlier confirmations of the same dependency did not already have.
 CREATE TABLE IF NOT EXISTS goal_blocker_claims (
   id           TEXT PRIMARY KEY,
   goal_id      TEXT NOT NULL,
   generation   INTEGER NOT NULL,
   round_number INTEGER NOT NULL,
   reason       TEXT NOT NULL,
+  evidence_sig TEXT,
   at_ms        INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS goal_blocker_goal ON goal_blocker_claims (goal_id);
@@ -344,6 +358,34 @@ function normalizeBlockerReason(reason: string): string {
   return reason.trim().toLowerCase().replace(/\s+/g, " ").replace(/[.!]+$/g, "");
 }
 
+/**
+ * Stable fingerprint of a machine-observed piece of evidence (audit-4 #9).
+ *
+ * Two observations with the same fingerprint carry the same information: the
+ * same command run again with the same exit status, or the same file content
+ * written again. Only a NEW fingerprint can count as round progress, so a
+ * model cannot stall-proof a goal by repeating `pwd`.
+ *
+ * Deliberately computed from persisted fields only (kind, ref, exitCode, hash)
+ * so existing rows are backfillable in the migration. The observation is
+ * normalized the same way command identity is normalized for verification.
+ * Model-annotated pointers (`ref`, `blocker-ref`) get no fingerprint — they
+ * are never observations and never progress.
+ */
+export function evidenceFingerprint(input: {
+  kind: string;
+  ref: string;
+  exitCode?: number;
+  hash?: string;
+}): string | undefined {
+  if (input.kind === "ref" || input.kind === "blocker-ref") return undefined;
+  const observation = input.ref.trim().toLowerCase().replace(/\s+/g, " ");
+  // File evidence: same path with different content is a different observation;
+  // the content hash IS the result. Command-like evidence: the result status.
+  const result = input.hash !== undefined ? String(input.hash) : String(input.exitCode ?? "");
+  return `${input.kind}::${observation}::${result}`;
+}
+
 let counter = 0;
 function newID(prefix: string): string {
   counter += 1;
@@ -457,6 +499,59 @@ export class GoalStore {
     this.db
       .query(`UPDATE goal_criteria SET source = 'user' WHERE source = 'derived'`)
       .run();
+    // Evidence fingerprints (audit-4 #9). Backfill existing rows from the
+    // persisted fields the fingerprint is defined over, so historical
+    // repetitions still deduplicate.
+    const evidenceColumns = this.db
+      .query<{ name: string }, []>(`PRAGMA table_info(goal_evidence)`)
+      .all()
+      .map((row) => row.name);
+    if (!evidenceColumns.includes("fingerprint")) {
+      this.db.exec(`ALTER TABLE goal_evidence ADD COLUMN fingerprint TEXT`);
+      const rows = this.db
+        .query<{ id: string; kind: string; ref: string; exit_code: number | null; hash: string | null }, []>(
+          `SELECT id, kind, ref, exit_code, hash FROM goal_evidence`,
+        )
+        .all();
+      const update = this.db.query(`UPDATE goal_evidence SET fingerprint = ? WHERE id = ?`);
+      this.tx(() => {
+        for (const row of rows) {
+          update.run(
+            evidenceFingerprint({
+              kind: row.kind,
+              ref: row.ref,
+              exitCode: row.exit_code ?? undefined,
+              hash: row.hash ?? undefined,
+            }) ?? null,
+            row.id,
+          );
+        }
+      });
+    }
+    // Blocker-claim independence signatures (audit-4 #8). Older rows recorded
+    // the reason alone; their signature is the normalized reason, which keeps
+    // their confirmation counting consistent with the new rule.
+    const claimColumns = this.db
+      .query<{ name: string }, []>(`PRAGMA table_info(goal_blocker_claims)`)
+      .all()
+      .map((row) => row.name);
+    if (!claimColumns.includes("evidence_sig")) {
+      this.db.exec(`ALTER TABLE goal_blocker_claims ADD COLUMN evidence_sig TEXT`);
+      this.db
+        .query(`UPDATE goal_blocker_claims SET evidence_sig = reason WHERE evidence_sig IS NULL`)
+        .run();
+    }
+    // Durable wait state (audit-4 #4): what the goal is waiting on, since when,
+    // and when the next reconciliation is due.
+    if (!goalColumns.includes("wait_started_ms")) {
+      this.db.exec(`ALTER TABLE goals ADD COLUMN wait_started_ms INTEGER`);
+    }
+    if (!goalColumns.includes("wait_reason")) {
+      this.db.exec(`ALTER TABLE goals ADD COLUMN wait_reason TEXT`);
+    }
+    if (!goalColumns.includes("wait_recheck_ms")) {
+      this.db.exec(`ALTER TABLE goals ADD COLUMN wait_recheck_ms INTEGER`);
+    }
   }
 
   close(): void {
@@ -814,7 +909,10 @@ export class GoalStore {
         .query(
           `UPDATE goals
              SET status=?, reason=?, updated_at_ms=?, version=version+1,
-                 completed_at_ms=COALESCE(?, completed_at_ms)
+                 completed_at_ms=COALESCE(?, completed_at_ms),
+                 -- A status change retires any durable wait: waiting belongs
+                 -- to the active scheduling state, not to the goal's history.
+                 wait_started_ms=NULL, wait_reason=NULL, wait_recheck_ms=NULL
            WHERE id=? AND version=?`,
         )
         .run(input.to, input.reason ?? null, now, completedAt, goal.id, goal.version);
@@ -832,6 +930,71 @@ export class GoalStore {
 
       return this.byID(goal.id)!;
     });
+  }
+
+  /**
+   * Enter a durable wait (audit-4 #4): a settled round was classified
+   * `verifiedWait`, so the goal is parked on a real, observable background
+   * execution. The driver rechecks the wait without model tokens and wakes the
+   * goal when the awaited work is no longer running.
+   *
+   * Generation-fenced and idempotent: re-entering while waiting refreshes the
+   * record. Only an active goal can wait.
+   */
+  enterWait(input: {
+    goalID: string;
+    generation: number;
+    reason: string;
+    recheckMs: number;
+  }): void {
+    this.tx(() => {
+      const goal = this.byID(input.goalID);
+      if (!goal || goal.generation !== input.generation) return;
+      if (goal.status !== "active") return;
+      this.db
+        .query(
+          `UPDATE goals SET wait_started_ms = COALESCE(wait_started_ms, ?), wait_reason = ?, wait_recheck_ms = ?, updated_at_ms = ?
+            WHERE id = ? AND generation = ? AND status = 'active'`,
+        )
+        .run(Date.now(), input.reason.slice(0, 300), input.recheckMs, Date.now(), input.goalID, input.generation);
+    });
+  }
+
+  /** Clear a durable wait. Idempotent. */
+  clearWait(goalID: string): void {
+    this.tx(() => {
+      this.db
+        .query(
+          `UPDATE goals SET wait_started_ms = NULL, wait_reason = NULL, wait_recheck_ms = NULL, updated_at_ms = ?
+            WHERE id = ? AND wait_started_ms IS NOT NULL`,
+        )
+        .run(Date.now(), goalID);
+    });
+  }
+
+  /** The goal's durable wait, if one is set. */
+  activeWait(goalID: string): { reason: string; startedMs: number; recheckMs: number } | undefined {
+    const row = this.db
+      .query<{ wait_started_ms: number | null; wait_reason: string | null; wait_recheck_ms: number | null }, [string]>(
+        `SELECT wait_started_ms, wait_reason, wait_recheck_ms FROM goals WHERE id = ?`,
+      )
+      .get(goalID);
+    if (!row || row.wait_started_ms === null) return undefined;
+    return {
+      reason: row.wait_reason ?? "background execution still running",
+      startedMs: row.wait_started_ms,
+      recheckMs: row.wait_recheck_ms ?? 30_000,
+    };
+  }
+
+  /** Goals with a durable wait set, for the recovery sweep. */
+  goalsWithActiveWaits(): { goalID: string; sessionID: string }[] {
+    return this.db
+      .query<{ id: string; session_id: string }, []>(
+        `SELECT id, session_id FROM goals WHERE wait_started_ms IS NOT NULL AND status = 'active'`,
+      )
+      .all()
+      .map((r) => ({ goalID: r.id, sessionID: r.session_id }));
   }
 
   /** Record a settled round's outcome. */
@@ -1172,8 +1335,8 @@ export class GoalStore {
     this.tx(() => {
       this.db
         .query(
-          `INSERT INTO goal_evidence (id, goal_id, generation, criterion_id, kind, ref, detail, exit_code, hash, workspace, at_ms)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO goal_evidence (id, goal_id, generation, criterion_id, kind, ref, detail, exit_code, hash, workspace, at_ms, fingerprint)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           newID("ev"),
@@ -1187,6 +1350,12 @@ export class GoalStore {
           input.hash ?? null,
           input.workspace ?? null,
           Date.now(),
+          evidenceFingerprint({
+            kind: input.kind,
+            ref: input.ref,
+            exitCode: input.exitCode,
+            hash: input.hash,
+          }) ?? null,
         );
     });
   }
@@ -1255,6 +1424,41 @@ export class GoalStore {
         hash: r.hash ?? undefined,
         workspace: r.workspace ?? undefined,
       }));
+  }
+
+  /**
+   * How many observations captured since `sinceMs` are genuinely NEW (audit-4
+   * #9): their fingerprint does not appear on any strictly earlier evidence
+   * row for the goal, and they are not model-annotated pointers.
+   *
+   * This is the round-level progress signal: ten identical `pwd` rows count as
+   * ONE observation (the first), while three different investigation commands
+   * count as three. Within a single round, the second occurrence of an
+   * observation is also not new — repetition inside one turn cannot buy
+   * progress either.
+   */
+  countNewFingerprintEvidence(
+    goalID: string,
+    sinceMs: number,
+    excludeKinds: readonly string[] = ["ref", "blocker-ref"],
+  ): number {
+    const placeholders = excludeKinds.map(() => "?").join(", ");
+    const row = this.db
+      .query<{ n: number }, [string, number, ...string[]]>(
+        `SELECT COUNT(*) AS n FROM goal_evidence e
+          WHERE e.goal_id = ? AND e.at_ms >= ?
+            AND e.fingerprint IS NOT NULL
+            AND e.kind NOT IN (${placeholders})
+            AND NOT EXISTS (
+              SELECT 1 FROM goal_evidence p
+               WHERE p.goal_id = e.goal_id
+                 AND p.fingerprint = e.fingerprint
+                 AND p.kind NOT IN (${placeholders})
+                 AND (p.at_ms < e.at_ms OR (p.at_ms = e.at_ms AND p.id < e.id))
+            )`,
+      )
+      .get(goalID, sinceMs, ...excludeKinds, ...excludeKinds)!;
+    return row.n;
   }
 
   /**
@@ -1459,47 +1663,84 @@ export class GoalStore {
   }
 
   /**
-   * Record a blocker claim for the reporting round and return how many distinct
-   * rounds have reported an equivalent blocker.
+   * Record a blocker claim for the reporting round and return how many
+   * independent confirmations the claim has (audit-4 #8).
    *
    * The round number is derived from the goal's settled-round counter, so two
-   * calls in the same turn map to the same round and count once. Only a later,
-   * independently evaluated round can raise the confirmation count.
+   * calls in the same turn map to the same round and count once.
+   *
+   * Independence is anchored to OBSERVED backing, not to string repetition:
+   * the claim's signature includes the freshest captured observation matching
+   * the claimed refs. A follow-up round that re-ran its probe has a new
+   * observation, a new signature, and counts as a confirmation. A follow-up
+   * round that merely repeats the reason (same refs, nothing newly observed)
+   * has the same signature and adds nothing. A claim with no observed backing
+   * at all records with a NULL signature and can never count as a
+   * confirmation — an assertion is not evidence.
    */
   recordBlockerClaim(input: {
     goalID: string;
     generation: number;
     roundNumber: number;
     reason: string;
+    /** Evidence refs the claim is backed by, as claimed. */
+    evidenceKeys?: string[];
   }): number {
     return this.tx(() => {
       const normalized = normalizeBlockerReason(input.reason);
+      const keys = [...new Set(input.evidenceKeys ?? []).values()].map((k) => k.trim()).filter(Boolean).sort();
+      let sig: string | null = null;
+      if (keys.length > 0) {
+        // Freshest machine-observed backing for the claimed refs. Refs may be
+        // evidence row ids or the observed command/path text; either way only
+        // real observations count, and the claim's own blocker-ref rows do not.
+        const placeholders = keys.map(() => "?").join(", ");
+        const backing = this.db
+          .query<{ m: number | null }, [string, ...string[]]>(
+            `SELECT MAX(at_ms) AS m FROM goal_evidence
+              WHERE goal_id = ? AND (id IN (${placeholders}) OR ref IN (${placeholders}))
+                AND kind NOT IN ('ref', 'blocker-ref')`,
+          )
+          .get(input.goalID, ...keys, ...keys);
+        if (backing?.m) {
+          sig = `${normalized}::${keys.join("\u0000")}::${backing.m}`;
+        }
+      }
       this.db
         .query(
-          `INSERT INTO goal_blocker_claims (id, goal_id, generation, round_number, reason, at_ms)
-           VALUES (?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO goal_blocker_claims (id, goal_id, generation, round_number, reason, evidence_sig, at_ms)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
         )
-        .run(newID("blk"), input.goalID, input.generation, input.roundNumber, normalized, Date.now());
-      const row = this.db
-        .query<{ n: number }, [string, number, string]>(
-          `SELECT COUNT(DISTINCT round_number) AS n
-             FROM goal_blocker_claims
-            WHERE goal_id = ? AND generation = ? AND reason = ?`,
-        )
-        .get(input.goalID, input.generation, normalized)!;
-      return row.n;
+        .run(newID("blk"), input.goalID, input.generation, input.roundNumber, normalized, sig, Date.now());
+      return this.blockerConfirmations(input.goalID, input.generation, input.reason);
     });
   }
 
-  /** Number of distinct rounds that reported the same blocker. */
+  /**
+   * Number of distinct independent confirmations of the same unresolved
+   * dependency: distinct reporting rounds whose claim signature (reason plus
+   * the freshest observed backing) was first-seen for this generation.
+   * Repeating the same string without a new observation is not corroboration.
+   */
   blockerConfirmations(goalID: string, generation: number, reason: string): number {
+    const normalized = normalizeBlockerReason(reason);
     const row = this.db
       .query<{ n: number }, [string, number, string]>(
         `SELECT COUNT(DISTINCT round_number) AS n
-           FROM goal_blocker_claims
-          WHERE goal_id = ? AND generation = ? AND reason = ?`,
+           FROM goal_blocker_claims c
+          WHERE goal_id = ? AND generation = ? AND reason = ?
+            AND evidence_sig IS NOT NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM goal_blocker_claims p
+               WHERE p.goal_id = c.goal_id
+                 AND p.generation = c.generation
+                 AND p.reason = c.reason
+                 AND p.evidence_sig = c.evidence_sig
+                 AND (p.round_number < c.round_number
+                      OR (p.round_number = c.round_number AND p.id < c.id))
+            )`,
       )
-      .get(goalID, generation, normalizeBlockerReason(reason))!;
+      .get(goalID, generation, normalized)!;
     return row.n;
   }
 

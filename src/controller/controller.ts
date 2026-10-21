@@ -18,6 +18,7 @@ import {
   type CriterionInput,
   type CriterionSpec,
 } from "./criteria.ts";
+import { looksLikeWorkflowQuestion } from "./verification.ts";
 
 export interface ControllerOptions {
   /** Path to the SQLite database. */
@@ -469,23 +470,60 @@ export class GoalController {
   /**
    * `goal_report_blocked` — a claim of blockage, not an accepted blocker.
    *
-   * A single report does not park the goal, and a model asserting
-   * `externalDependency: true` is not self-authenticating. The controller counts
-   * *distinct reporting rounds* with an equivalent unresolved blocker, so
-   * repeating the tool call inside one turn cannot manufacture a blocker.
+   * Classification precedes counting (audit-4 #8):
+   *
+   * 1. A workflow question — an optional decision, a choice between reasonable
+   *    next steps, a push-or-continue ask — is NEVER a blocker, no matter how
+   *    many rounds it is repeated in. The reply is a continuation instruction.
+   * 2. A genuine blocker needs an actual external dependency AND backing
+   *    evidence. `externalDependency: true` is a claim, not proof.
+   * 3. Only independent confirmations count: a later round confirms the
+   *    dependency when it brings a NEW observation (it re-ran its probe), not
+   *    when it repeats the same string.
    */
   reportBlocked(
     sessionID: string,
     report: BlockedReport,
-  ): { goal?: Goal; accepted: boolean; confirmations: number; rejected?: string } {
+  ): { goal?: Goal; accepted: boolean; confirmations: number; instruction?: string; rejected?: string } {
     const target = this.resolveTarget(sessionID, report);
     if (!target.ok) {
       return { accepted: false, confirmations: 0, rejected: target.rejected };
     }
     const goal = target.goal;
 
+    // 1. Workflow-question guard. Classification happens BEFORE any
+    //    confirmation counting, and repetition does not change the class.
+    if (looksLikeWorkflowQuestion(report.reason)) {
+      return {
+        goal: this.store.byID(goal.id),
+        accepted: false,
+        confirmations: 0,
+        instruction:
+          "This is a workflow question, not a blocker. Select the reasonable nonblocking path and continue working; do not ask again.",
+        rejected:
+          "workflow question — not a blocker. Select the reasonable nonblocking path and continue working; do not ask again.",
+      };
+    }
+
     for (const ref of report.evidenceRefs ?? []) {
       this.store.addEvidence({ goalID: goal.id, kind: "blocker-ref", ref, detail: report.reason });
+    }
+
+    // 2. A genuine blocker requires a claimed external dependency AND backing
+    //    evidence explaining why the goal cannot proceed. A bare assertion
+    //    (no refs, no dependency claim) is recorded for the trail but cannot
+    //    ever confirm.
+    const claimedDependency = report.externalDependency === true;
+    const hasBacking = (report.evidenceRefs?.length ?? 0) > 0;
+    if (!claimedDependency || !hasBacking) {
+      return {
+        goal: this.store.byID(goal.id),
+        accepted: false,
+        confirmations: this.store.blockerConfirmations(goal.id, goal.generation, report.reason),
+        rejected: !claimedDependency
+          ? "no concrete external dependency was identified"
+          : "no supporting evidence was cited; cite the observed failure the dependency causes",
+      };
     }
 
     // The reporting round is the next unsettled round. Multiple calls in this
@@ -496,9 +534,12 @@ export class GoalController {
       generation: goal.generation,
       roundNumber,
       reason: report.reason,
+      evidenceKeys: report.evidenceRefs,
     });
 
-    // `externalDependency` is recorded as a claim but never trusted as proof.
+    // 3. Independent confirmations only — recordBlockerClaim dedupes by
+    // (reason + freshest observed backing), so repeated strings without a new
+    // observation do not accumulate.
     const genuine = confirmations >= this.minBlockerConfirmations;
     if (!genuine) {
       // Stay active; the goal keeps making progress rather than parking.

@@ -444,6 +444,12 @@ CREATE TABLE IF NOT EXISTS goals (
   -- driver refuses to dispatch until recovery clears it, so a terminal
   -- delivery failure cannot be circumvented by minting a fresh continuation.
   delivery_failed          INTEGER NOT NULL DEFAULT 0,
+  -- Durable wait state (audit-4 #4): set when a settled round classified
+  -- verifiedWait. While set, the driver reconciles the wait without model
+  -- tokens instead of minting another continuation.
+  wait_started_ms          INTEGER,
+  wait_reason              TEXT,
+  wait_recheck_ms          INTEGER,
   UNIQUE (session_id, generation)
 );
 
@@ -511,7 +517,11 @@ CREATE TABLE IF NOT EXISTS goal_evidence (
   exit_code   INTEGER,
   hash        TEXT,
   workspace   TEXT,
-  at_ms       INTEGER NOT NULL
+  at_ms       INTEGER NOT NULL,
+  -- Stable fingerprint of the observation (audit-4 #9): kind + normalized
+  -- observation + result status. Identical observations share a fingerprint,
+  -- so repeating the same command cannot manufacture round progress.
+  fingerprint TEXT
 );
 CREATE INDEX IF NOT EXISTS goal_evidence_goal ON goal_evidence (goal_id);
 CREATE INDEX IF NOT EXISTS goal_evidence_criterion ON goal_evidence (criterion_id);
@@ -547,12 +557,16 @@ CREATE TABLE IF NOT EXISTS goal_message_generations (
 -- Blocker claims, one per reporting round. A model can call the blocker tool
 -- many times in one turn; only distinct rounds count as confirmations, so
 -- repetition inside a single execution cannot manufacture a blocker.
+-- evidence_sig (audit-4 #8) is the normalized reason PLUS the evidence the
+-- report brought: a confirmation only counts when it presents evidence the
+-- earlier confirmations of the same dependency did not already have.
 CREATE TABLE IF NOT EXISTS goal_blocker_claims (
   id           TEXT PRIMARY KEY,
   goal_id      TEXT NOT NULL,
   generation   INTEGER NOT NULL,
   round_number INTEGER NOT NULL,
   reason       TEXT NOT NULL,
+  evidence_sig TEXT,
   at_ms        INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS goal_blocker_goal ON goal_blocker_claims (goal_id);
@@ -672,6 +686,13 @@ function toGoal(row) {
 function normalizeBlockerReason(reason) {
   return reason.trim().toLowerCase().replace(/\s+/g, " ").replace(/[.!]+$/g, "");
 }
+function evidenceFingerprint(input) {
+  if (input.kind === "ref" || input.kind === "blocker-ref")
+    return;
+  const observation = input.ref.trim().toLowerCase().replace(/\s+/g, " ");
+  const result = input.hash !== undefined ? String(input.hash) : String(input.exitCode ?? "");
+  return `${input.kind}::${observation}::${result}`;
+}
 var counter = 0;
 function newID(prefix) {
   counter += 1;
@@ -728,6 +749,36 @@ class GoalStore {
                  AND (c.spec IS NULL OR json_extract(c.spec, '$.type') = 'objective')
             )`).run();
     this.db.query(`UPDATE goal_criteria SET source = 'user' WHERE source = 'derived'`).run();
+    const evidenceColumns = this.db.query(`PRAGMA table_info(goal_evidence)`).all().map((row) => row.name);
+    if (!evidenceColumns.includes("fingerprint")) {
+      this.db.exec(`ALTER TABLE goal_evidence ADD COLUMN fingerprint TEXT`);
+      const rows = this.db.query(`SELECT id, kind, ref, exit_code, hash FROM goal_evidence`).all();
+      const update = this.db.query(`UPDATE goal_evidence SET fingerprint = ? WHERE id = ?`);
+      this.tx(() => {
+        for (const row of rows) {
+          update.run(evidenceFingerprint({
+            kind: row.kind,
+            ref: row.ref,
+            exitCode: row.exit_code ?? undefined,
+            hash: row.hash ?? undefined
+          }) ?? null, row.id);
+        }
+      });
+    }
+    const claimColumns = this.db.query(`PRAGMA table_info(goal_blocker_claims)`).all().map((row) => row.name);
+    if (!claimColumns.includes("evidence_sig")) {
+      this.db.exec(`ALTER TABLE goal_blocker_claims ADD COLUMN evidence_sig TEXT`);
+      this.db.query(`UPDATE goal_blocker_claims SET evidence_sig = reason WHERE evidence_sig IS NULL`).run();
+    }
+    if (!goalColumns.includes("wait_started_ms")) {
+      this.db.exec(`ALTER TABLE goals ADD COLUMN wait_started_ms INTEGER`);
+    }
+    if (!goalColumns.includes("wait_reason")) {
+      this.db.exec(`ALTER TABLE goals ADD COLUMN wait_reason TEXT`);
+    }
+    if (!goalColumns.includes("wait_recheck_ms")) {
+      this.db.exec(`ALTER TABLE goals ADD COLUMN wait_recheck_ms INTEGER`);
+    }
   }
   close() {
     this.db.close();
@@ -892,7 +943,10 @@ class GoalStore {
       const completedAt = input.to === "complete" ? now : null;
       const updated = this.db.query(`UPDATE goals
              SET status=?, reason=?, updated_at_ms=?, version=version+1,
-                 completed_at_ms=COALESCE(?, completed_at_ms)
+                 completed_at_ms=COALESCE(?, completed_at_ms),
+                 -- A status change retires any durable wait: waiting belongs
+                 -- to the active scheduling state, not to the goal's history.
+                 wait_started_ms=NULL, wait_reason=NULL, wait_recheck_ms=NULL
            WHERE id=? AND version=?`).run(input.to, input.reason ?? null, now, completedAt, goal.id, goal.version);
       if (updated.changes !== 1) {
         throw new GoalConflictError(`compare-and-swap failed for ${goal.id}`);
@@ -905,6 +959,36 @@ class GoalStore {
       });
       return this.byID(goal.id);
     });
+  }
+  enterWait(input) {
+    this.tx(() => {
+      const goal = this.byID(input.goalID);
+      if (!goal || goal.generation !== input.generation)
+        return;
+      if (goal.status !== "active")
+        return;
+      this.db.query(`UPDATE goals SET wait_started_ms = COALESCE(wait_started_ms, ?), wait_reason = ?, wait_recheck_ms = ?, updated_at_ms = ?
+            WHERE id = ? AND generation = ? AND status = 'active'`).run(Date.now(), input.reason.slice(0, 300), input.recheckMs, Date.now(), input.goalID, input.generation);
+    });
+  }
+  clearWait(goalID) {
+    this.tx(() => {
+      this.db.query(`UPDATE goals SET wait_started_ms = NULL, wait_reason = NULL, wait_recheck_ms = NULL, updated_at_ms = ?
+            WHERE id = ? AND wait_started_ms IS NOT NULL`).run(Date.now(), goalID);
+    });
+  }
+  activeWait(goalID) {
+    const row = this.db.query(`SELECT wait_started_ms, wait_reason, wait_recheck_ms FROM goals WHERE id = ?`).get(goalID);
+    if (!row || row.wait_started_ms === null)
+      return;
+    return {
+      reason: row.wait_reason ?? "background execution still running",
+      startedMs: row.wait_started_ms,
+      recheckMs: row.wait_recheck_ms ?? 30000
+    };
+  }
+  goalsWithActiveWaits() {
+    return this.db.query(`SELECT id, session_id FROM goals WHERE wait_started_ms IS NOT NULL AND status = 'active'`).all().map((r) => ({ goalID: r.id, sessionID: r.session_id }));
   }
   recordRound(input) {
     return this.tx(() => {
@@ -1066,8 +1150,13 @@ class GoalStore {
     if (!goal)
       throw new GoalConflictError(`unknown goal ${input.goalID}`);
     this.tx(() => {
-      this.db.query(`INSERT INTO goal_evidence (id, goal_id, generation, criterion_id, kind, ref, detail, exit_code, hash, workspace, at_ms)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(newID("ev"), input.goalID, goal.generation, input.criterionID ?? null, input.kind, input.ref, input.detail ?? null, input.exitCode ?? null, input.hash ?? null, input.workspace ?? null, Date.now());
+      this.db.query(`INSERT INTO goal_evidence (id, goal_id, generation, criterion_id, kind, ref, detail, exit_code, hash, workspace, at_ms, fingerprint)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(newID("ev"), input.goalID, goal.generation, input.criterionID ?? null, input.kind, input.ref, input.detail ?? null, input.exitCode ?? null, input.hash ?? null, input.workspace ?? null, Date.now(), evidenceFingerprint({
+        kind: input.kind,
+        ref: input.ref,
+        exitCode: input.exitCode,
+        hash: input.hash
+      }) ?? null);
     });
   }
   listCriteria(goalID) {
@@ -1092,6 +1181,21 @@ class GoalStore {
       hash: r.hash ?? undefined,
       workspace: r.workspace ?? undefined
     }));
+  }
+  countNewFingerprintEvidence(goalID, sinceMs, excludeKinds = ["ref", "blocker-ref"]) {
+    const placeholders = excludeKinds.map(() => "?").join(", ");
+    const row = this.db.query(`SELECT COUNT(*) AS n FROM goal_evidence e
+          WHERE e.goal_id = ? AND e.at_ms >= ?
+            AND e.fingerprint IS NOT NULL
+            AND e.kind NOT IN (${placeholders})
+            AND NOT EXISTS (
+              SELECT 1 FROM goal_evidence p
+               WHERE p.goal_id = e.goal_id
+                 AND p.fingerprint = e.fingerprint
+                 AND p.kind NOT IN (${placeholders})
+                 AND (p.at_ms < e.at_ms OR (p.at_ms = e.at_ms AND p.id < e.id))
+            )`).get(goalID, sinceMs, ...excludeKinds, ...excludeKinds);
+    return row.n;
   }
   bindEvidence(criterionID, evidenceIDs) {
     return this.tx(() => {
@@ -1171,18 +1275,37 @@ class GoalStore {
   recordBlockerClaim(input) {
     return this.tx(() => {
       const normalized = normalizeBlockerReason(input.reason);
-      this.db.query(`INSERT INTO goal_blocker_claims (id, goal_id, generation, round_number, reason, at_ms)
-           VALUES (?, ?, ?, ?, ?, ?)`).run(newID("blk"), input.goalID, input.generation, input.roundNumber, normalized, Date.now());
-      const row = this.db.query(`SELECT COUNT(DISTINCT round_number) AS n
-             FROM goal_blocker_claims
-            WHERE goal_id = ? AND generation = ? AND reason = ?`).get(input.goalID, input.generation, normalized);
-      return row.n;
+      const keys = [...new Set(input.evidenceKeys ?? []).values()].map((k) => k.trim()).filter(Boolean).sort();
+      let sig = null;
+      if (keys.length > 0) {
+        const placeholders = keys.map(() => "?").join(", ");
+        const backing = this.db.query(`SELECT MAX(at_ms) AS m FROM goal_evidence
+              WHERE goal_id = ? AND (id IN (${placeholders}) OR ref IN (${placeholders}))
+                AND kind NOT IN ('ref', 'blocker-ref')`).get(input.goalID, ...keys, ...keys);
+        if (backing?.m) {
+          sig = `${normalized}::${keys.join("\x00")}::${backing.m}`;
+        }
+      }
+      this.db.query(`INSERT INTO goal_blocker_claims (id, goal_id, generation, round_number, reason, evidence_sig, at_ms)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`).run(newID("blk"), input.goalID, input.generation, input.roundNumber, normalized, sig, Date.now());
+      return this.blockerConfirmations(input.goalID, input.generation, input.reason);
     });
   }
   blockerConfirmations(goalID, generation, reason) {
+    const normalized = normalizeBlockerReason(reason);
     const row = this.db.query(`SELECT COUNT(DISTINCT round_number) AS n
-           FROM goal_blocker_claims
-          WHERE goal_id = ? AND generation = ? AND reason = ?`).get(goalID, generation, normalizeBlockerReason(reason));
+           FROM goal_blocker_claims c
+          WHERE goal_id = ? AND generation = ? AND reason = ?
+            AND evidence_sig IS NOT NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM goal_blocker_claims p
+               WHERE p.goal_id = c.goal_id
+                 AND p.generation = c.generation
+                 AND p.reason = c.reason
+                 AND p.evidence_sig = c.evidence_sig
+                 AND (p.round_number < c.round_number
+                      OR (p.round_number = c.round_number AND p.id < c.id))
+            )`).get(goalID, generation, normalized);
     return row.n;
   }
   recordSessionUsage(sessionID, totalTokens) {
@@ -1455,969 +1578,6 @@ function toRound(r) {
     admittedAtMs: r.admitted_at_ms ?? undefined,
     settledAtMs: r.settled_at_ms ?? undefined
   };
-}
-
-// src/controller/controller.ts
-class GoalController {
-  store;
-  maxNoProgressRounds;
-  minBlockerConfirmations;
-  deriveCriteria;
-  constructor(options) {
-    this.store = new GoalStore(options.dbPath);
-    this.maxNoProgressRounds = options.maxNoProgressRounds ?? 3;
-    this.minBlockerConfirmations = options.minBlockerConfirmations ?? 2;
-    this.deriveCriteria = options.deriveCriteria ?? deriveCriteria;
-  }
-  close() {
-    this.store.close();
-  }
-  reconcileStartup() {
-    return this.store.reconcileAfterRestart();
-  }
-  criteriaFor(objective) {
-    return this.deriveCriteria(objective);
-  }
-  policyFor(objective, criteria) {
-    return completionPolicyFor(objective, criteria.map((c) => ({
-      text: c.text,
-      spec: c.spec ?? { type: "objective" },
-      source: c.source ?? "user"
-    })));
-  }
-  startOrDescribe(sessionID, objective) {
-    const existing = this.store.current(sessionID);
-    if (existing)
-      return { existing };
-    const criteria = this.criteriaFor(objective);
-    const goal = this.store.create({
-      sessionID,
-      objective,
-      actor: "user",
-      criteria,
-      completionPolicy: this.policyFor(objective, criteria)
-    });
-    return { created: goal };
-  }
-  replace(sessionID, objective, expectedGeneration) {
-    const existing = this.store.current(sessionID);
-    const criteria = this.criteriaFor(objective);
-    const completionPolicy = this.policyFor(objective, criteria);
-    if (!existing) {
-      return this.store.create({ sessionID, objective, actor: "user", criteria, completionPolicy });
-    }
-    return this.store.replace({
-      sessionID,
-      expectedGeneration: expectedGeneration ?? existing.generation,
-      objective,
-      actor: "user",
-      criteria,
-      completionPolicy
-    });
-  }
-  pause(sessionID) {
-    const goal = this.requireCurrent(sessionID);
-    return this.store.transition({
-      goalID: goal.id,
-      generation: goal.generation,
-      to: "paused",
-      actor: "user"
-    });
-  }
-  resume(sessionID) {
-    const goal = this.requireCurrent(sessionID);
-    const resumed = this.store.transition({
-      goalID: goal.id,
-      generation: goal.generation,
-      to: "active",
-      actor: "user",
-      reason: "resumed by user"
-    });
-    if (resumed.deliveryFailed)
-      this.store.clearDeliveryFailure(resumed.id);
-    return this.store.byID(resumed.id) ?? resumed;
-  }
-  acceptObjective(sessionID, note) {
-    const goal = this.requireCurrent(sessionID);
-    this.store.recordUserAcceptance(goal.id, goal.generation, note);
-    return this.store.byID(goal.id) ?? goal;
-  }
-  status(sessionID) {
-    return this.store.current(sessionID);
-  }
-  latest(sessionID) {
-    return this.store.latest(sessionID);
-  }
-  recordUsage(sessionID, totalTokens) {
-    return this.store.recordSessionUsage(sessionID, totalTokens).goal;
-  }
-  setBudget(sessionID, budget) {
-    const goal = this.requireCurrent(sessionID);
-    return this.store.setTokenBudget(goal.id, budget);
-  }
-  health(sessionID) {
-    const goal = this.store.latest(sessionID);
-    if (!goal)
-      return { ok: true, goal: null };
-    const criteria = this.store.listCriteria(goal.id);
-    const evidence = this.store.listEvidence(goal.id);
-    const round = this.store.outstandingRound(goal.id);
-    const rounds = this.store.roundsFor(goal.id);
-    const last = rounds[rounds.length - 1];
-    const stuckMs = round ? Date.now() - round.preparedAtMs : 0;
-    const problems = [];
-    if (goal.status === "active" && !round) {
-      problems.push("active goal has no outstanding round: nothing is driving it");
-    }
-    if (goal.deliveryFailed) {
-      problems.push("continuation delivery failed; automatic dispatch is halted");
-    }
-    if (round && round.attempts > 3) {
-      problems.push(`round ${round.id} has ${round.attempts} submission attempts`);
-    }
-    if (round && stuckMs > 5 * 60000) {
-      problems.push(`round ${round.id} has been outstanding for ${Math.round(stuckMs / 1000)}s`);
-    }
-    if (goal.status === "verifying") {
-      const unmet = criteria.filter((criterion) => !criterion.met);
-      if (unmet.length)
-        problems.push(`${unmet.length} unmet criterion/criteria during verification`);
-    }
-    return {
-      ok: problems.length === 0,
-      goal: {
-        id: goal.id,
-        generation: goal.generation,
-        status: goal.status,
-        objective: goal.objective
-      },
-      drive: {
-        outstandingRound: round ? { id: round.id, status: round.status, attempts: round.attempts, ageMs: stuckMs } : null,
-        lastRound: last ? { id: last.id, status: last.status, classification: last.classification ?? null } : null,
-        deliveryFailed: goal.deliveryFailed,
-        rounds: goal.rounds,
-        noProgressRounds: goal.noProgressRounds
-      },
-      usage: {
-        tokensUsed: goal.tokensUsed ?? 0,
-        tokenBudget: goal.tokenBudget ?? null
-      },
-      verification: {
-        criteria: criteria.map((criterion) => ({
-          id: criterion.id,
-          text: criterion.text,
-          met: criterion.met,
-          source: criterion.source
-        })),
-        evidenceCount: evidence.length,
-        verificationRevision: goal.verificationRevision
-      },
-      problems
-    };
-  }
-  history(sessionID) {
-    return this.store.history(sessionID);
-  }
-  get(sessionID) {
-    return this.store.current(sessionID);
-  }
-  bindCriterionEvidence(goalID, criterionID, refs) {
-    const evidence = this.store.listEvidence(goalID);
-    const chosen = new Set;
-    for (const ref of refs) {
-      const byID = evidence.find((e) => e.id === ref);
-      if (byID) {
-        chosen.add(byID.id);
-        continue;
-      }
-      const exact = evidence.filter((e) => e.ref === ref);
-      if (exact.length > 0) {
-        for (const e of exact)
-          chosen.add(e.id);
-        continue;
-      }
-      const candidate = ref.includes("/") || ref.includes("\\") ? evidence.filter((e) => e.ref.endsWith(ref) || e.ref.endsWith(`/${ref}`)) : evidence.filter((e) => e.kind === "file" && e.ref.split("/").pop() === ref);
-      if (candidate.length > 0 && new Set(candidate.map((e) => e.ref)).size === 1) {
-        for (const e of candidate)
-          chosen.add(e.id);
-      }
-    }
-    if (chosen.size === 0)
-      return 0;
-    return this.store.bindEvidence(criterionID, [...chosen]);
-  }
-  resolveCriterion(goalID, identifier) {
-    const criteria = this.store.listCriteria(goalID);
-    if (criteria.some((criterion) => criterion.id === identifier))
-      return identifier;
-    const byText = criteria.filter((criterion) => criterion.text === identifier);
-    return byText.length === 1 ? byText[0].id : undefined;
-  }
-  checkpoint(sessionID, input) {
-    const target = this.resolveTarget(sessionID, input);
-    if (!target.ok)
-      return { recorded: false, rejected: target.rejected };
-    const goal = target.goal;
-    for (const ref of input.evidenceRefs ?? []) {
-      this.store.addEvidence({
-        goalID: goal.id,
-        criterionID: input.criterionID,
-        kind: "ref",
-        ref,
-        detail: input.summary
-      });
-    }
-    return { recorded: true, goal: this.store.byID(goal.id) };
-  }
-  addCriterion(sessionID, input) {
-    const target = this.resolveTarget(sessionID, input);
-    if (!target.ok)
-      return { rejected: target.rejected };
-    try {
-      const criterionID = this.store.addCriterion(target.goal.id, input.text, input.spec, "model", input.covers);
-      return { criterionID };
-    } catch (error) {
-      return { rejected: String(error) };
-    }
-  }
-  supersedeCriterion(sessionID, input) {
-    const target = this.resolveTarget(sessionID, input);
-    if (!target.ok)
-      return { rejected: target.rejected };
-    if (input.replacement && !input.replacement.text.trim()) {
-      return { rejected: "a replacement proposal requires non-empty text" };
-    }
-    const criterionID = this.resolveCriterion(target.goal.id, input.criterion_id);
-    if (!criterionID) {
-      return { rejected: `criterion ${input.criterion_id} does not exist on this goal` };
-    }
-    try {
-      this.store.supersedeCriterion(criterionID, input.reason, input.replacement);
-      return { superseded: true };
-    } catch (error) {
-      return { rejected: String(error) };
-    }
-  }
-  proposeComplete(sessionID, input) {
-    const target = this.resolveTarget(sessionID, input);
-    if (!target.ok)
-      return { rejected: target.rejected };
-    const goal = target.goal;
-    for (const ref of input.evidenceRefs ?? []) {
-      this.store.addEvidence({ goalID: goal.id, kind: "ref", ref, detail: input.summary });
-    }
-    for (const binding of input.criteria ?? []) {
-      const criterionID = this.resolveCriterion(goal.id, binding.criterionID);
-      if (criterionID)
-        this.bindCriterionEvidence(goal.id, criterionID, binding.evidenceRefs);
-    }
-    const updated = this.store.transition({
-      goalID: goal.id,
-      generation: goal.generation,
-      to: "verifying",
-      actor: "model",
-      reason: input.summary.slice(0, 300)
-    });
-    return { goal: updated };
-  }
-  reportBlocked(sessionID, report) {
-    const target = this.resolveTarget(sessionID, report);
-    if (!target.ok) {
-      return { accepted: false, confirmations: 0, rejected: target.rejected };
-    }
-    const goal = target.goal;
-    for (const ref of report.evidenceRefs ?? []) {
-      this.store.addEvidence({ goalID: goal.id, kind: "blocker-ref", ref, detail: report.reason });
-    }
-    const roundNumber = goal.rounds + 1;
-    const confirmations = this.store.recordBlockerClaim({
-      goalID: goal.id,
-      generation: goal.generation,
-      roundNumber,
-      reason: report.reason
-    });
-    const genuine = confirmations >= this.minBlockerConfirmations;
-    if (!genuine) {
-      return {
-        goal: this.store.byID(goal.id),
-        accepted: false,
-        confirmations
-      };
-    }
-    const blocked = this.store.transition({
-      goalID: goal.id,
-      generation: goal.generation,
-      to: "blocked",
-      actor: "controller",
-      reason: report.reason.slice(0, 300)
-    });
-    return { goal: blocked, accepted: true, confirmations };
-  }
-  classifyRound(sessionID, classification, detail, tokensUsed) {
-    const goal = this.store.current(sessionID);
-    if (!goal || !isNonTerminal(goal.status))
-      return goal;
-    const updated = this.store.recordRound({
-      goalID: goal.id,
-      generation: goal.generation,
-      classification,
-      detail,
-      tokensUsed
-    });
-    if (classification === "noProgress" && updated.noProgressRounds >= this.maxNoProgressRounds && updated.status === "active") {
-      return this.store.transition({
-        goalID: updated.id,
-        generation: updated.generation,
-        to: "stalled",
-        actor: "controller",
-        reason: `${updated.noProgressRounds} consecutive rounds without progress`
-      });
-    }
-    return updated;
-  }
-  enforceBudget(sessionID) {
-    const goal = this.store.current(sessionID);
-    if (!goal || goal.status !== "active")
-      return goal;
-    if (goal.tokenBudget !== undefined && (goal.tokensUsed ?? 0) >= goal.tokenBudget) {
-      return this.store.transition({
-        goalID: goal.id,
-        generation: goal.generation,
-        to: "budgetLimited",
-        actor: "controller",
-        reason: `token budget reached (${goal.tokensUsed}/${goal.tokenBudget})`
-      });
-    }
-    return goal;
-  }
-  commitComplete(goalID, generation, reason, snapshot) {
-    return this.store.completeGoal({
-      goalID,
-      generation,
-      reason,
-      snapshot,
-      settleClassification: "complete"
-    });
-  }
-  rejectCompletion(goalID, generation, reason) {
-    const goal = this.store.byID(goalID);
-    if (!goal || goal.status !== "verifying")
-      return goal;
-    if (goal.generation !== generation)
-      return goal;
-    return this.store.transition({
-      goalID: goal.id,
-      generation: goal.generation,
-      to: "active",
-      actor: "controller",
-      reason
-    });
-  }
-  requireCurrent(sessionID) {
-    const goal = this.store.current(sessionID);
-    if (!goal)
-      throw new GoalConflictError(`session ${sessionID} has no current goal`);
-    return goal;
-  }
-  resolveTarget(sessionID, ref) {
-    const current = this.store.current(sessionID);
-    if (!current)
-      return { ok: false, rejected: "no active goal for this session" };
-    if (!isNonTerminal(current.status)) {
-      return { ok: false, rejected: `goal is ${current.status}` };
-    }
-    if (!ref?.goalID) {
-      return {
-        ok: false,
-        rejected: `unresolved goal reference: the tool call must name the current goal (${current.id})`
-      };
-    }
-    if (ref.goalID !== current.id) {
-      return {
-        ok: false,
-        rejected: `stale goal reference: ${ref.goalID} is not the current goal (${current.id})`
-      };
-    }
-    if (ref.generation === undefined) {
-      return {
-        ok: false,
-        rejected: `unresolved generation: the tool call must name generation ${current.generation}`
-      };
-    }
-    if (ref.generation !== current.generation) {
-      return {
-        ok: false,
-        rejected: `stale generation: callback claimed ${ref.generation}, current is ${current.generation}`
-      };
-    }
-    return { ok: true, goal: current };
-  }
-}
-
-// src/controller/calls.ts
-function selectToolRef(resolved, input, messageID) {
-  if (resolved.goalID && resolved.generation !== undefined) {
-    return { ok: true, ref: resolved };
-  }
-  if (messageID) {
-    return {
-      ok: false,
-      reason: "this call could not be attributed to a goal generation from its message; call goal_get and retry from the current turn"
-    };
-  }
-  if (input?.goal_id && input.generation !== undefined) {
-    return { ok: true, ref: { goalID: input.goal_id, generation: input.generation } };
-  }
-  return {
-    ok: false,
-    reason: "this call carries neither a resolvable message identity nor a complete goal reference (goal_id and generation); call goal_get and retry"
-  };
-}
-function attributeMessageGeneration(messages, messageID, generationOf) {
-  const index = messages.findIndex((m) => m?.id === messageID);
-  if (index === -1)
-    return;
-  for (let i = index - 1;i >= 0; i--) {
-    const message = messages[i];
-    if (!message)
-      continue;
-    const generation = generationOf(message);
-    if (generation !== undefined)
-      return generation;
-    if (message.type === "user")
-      return;
-  }
-  return;
-}
-
-// src/controller/coordinator.ts
-class GoalCoordinator {
-  controller;
-  dispatcher;
-  hooks;
-  constructor(controller, dispatcher, hooks = {}) {
-    this.controller = controller;
-    this.dispatcher = dispatcher;
-    this.hooks = hooks;
-  }
-  async start(sessionID, objective) {
-    const out = this.controller.startOrDescribe(sessionID, objective);
-    if ("existing" in out)
-      return { existing: out.existing };
-    const drive = await this.drive(sessionID);
-    return { created: out.created, drive };
-  }
-  async replace(sessionID, objective, expectedGeneration) {
-    const goal = this.controller.replace(sessionID, objective, expectedGeneration);
-    const drive = await this.drive(sessionID);
-    return { goal, drive };
-  }
-  async resume(sessionID) {
-    const goal = this.controller.resume(sessionID);
-    const drive = await this.drive(sessionID);
-    return { goal, drive };
-  }
-  pause(sessionID) {
-    return this.controller.pause(sessionID);
-  }
-  async drive(sessionID) {
-    const dispatcher = this.dispatcher();
-    if (!dispatcher)
-      return;
-    try {
-      return await dispatcher.drive(sessionID);
-    } catch (error) {
-      this.hooks.onDriveError?.(sessionID, error);
-      return;
-    }
-  }
-}
-
-// src/controller/driver.ts
-var DEFAULT_CLASSIFY = ({
-  evidenceDelta,
-  liveWait
-}) => {
-  if (evidenceDelta > 0) {
-    return { classification: "progress", detail: `${evidenceDelta} new evidence item(s)` };
-  }
-  if (liveWait) {
-    return {
-      classification: "verifiedWait",
-      detail: "no new evidence, but a background execution is still running"
-    };
-  }
-  return { classification: "noProgress", detail: "no new evidence captured this round" };
-};
-var seq = 0;
-function newInboxID() {
-  seq += 1;
-  const rand = Math.random().toString(36).slice(2, 10);
-  return `msg_xgoal_${Date.now().toString(36)}${seq.toString(36)}${rand}`;
-}
-var DEFAULT_CONTINUATION = (goal) => [
-  "Continue working toward the active goal.",
-  "",
-  `Objective: ${goal.objective}`,
-  "",
-  "Inspect the current state before acting. Take the next useful action.",
-  "A workflow preference, an optional decision, or a choice between reasonable",
-  "next steps is not a blocker — choose and continue. If the objective is",
-  "genuinely satisfied, propose completion with evidence."
-].join(`
-`);
-
-class GoalDriver {
-  store;
-  transport;
-  maxNoProgressRounds;
-  maxRoundAttempts;
-  render;
-  classify;
-  constructor(store, transport, options = {}) {
-    this.store = store;
-    this.transport = transport;
-    this.maxNoProgressRounds = options.maxNoProgressRounds ?? 3;
-    this.maxRoundAttempts = options.maxRoundAttempts ?? 5;
-    this.render = options.renderContinuation ?? DEFAULT_CONTINUATION;
-    this.classify = options.classify ?? DEFAULT_CLASSIFY;
-  }
-  async drive(sessionID) {
-    const goal = this.store.current(sessionID);
-    if (goal && goal.status === "active") {
-      const outstanding = this.store.outstandingRound(goal.id);
-      if (outstanding) {
-        const outcome = await this.reconcileRound(outstanding);
-        if (outcome.action !== "reconcile")
-          return outcome;
-      }
-    }
-    const decision = this.reserve(sessionID);
-    if (decision.action !== "dispatch")
-      return decision.outcome;
-    return this.dispatch(decision.round, sessionID);
-  }
-  reserve(sessionID) {
-    const goal = this.store.current(sessionID);
-    if (!goal)
-      return { action: "done", outcome: { action: "idle", reason: "no goal" } };
-    if (goal.status !== "active") {
-      return {
-        action: "done",
-        outcome: { action: "idle", reason: `goal status is ${goal.status}` }
-      };
-    }
-    const outstanding = this.store.outstandingRound(goal.id);
-    if (outstanding) {
-      return {
-        action: "done",
-        outcome: { action: "reconcile", roundID: outstanding.id, status: outstanding.status }
-      };
-    }
-    if (goal.deliveryFailed) {
-      return {
-        action: "done",
-        outcome: { action: "idle", reason: "delivery failed; awaiting recovery" }
-      };
-    }
-    if (goal.tokenBudget !== undefined && (goal.tokensUsed ?? 0) >= goal.tokenBudget) {
-      const limited = this.store.transition({
-        goalID: goal.id,
-        generation: goal.generation,
-        to: "budgetLimited",
-        actor: "controller",
-        reason: `token budget reached (${goal.tokensUsed}/${goal.tokenBudget})`
-      });
-      return { action: "done", outcome: { action: "limited", status: limited.status } };
-    }
-    const inboxID = newInboxID();
-    const round = this.store.prepareRound({
-      goalID: goal.id,
-      generation: goal.generation,
-      inboxID
-    });
-    return { action: "dispatch", round };
-  }
-  async dispatch(round, sessionID) {
-    const goal = this.store.byID(round.goalID);
-    if (!goal || goal.generation !== round.generation || goal.status !== "active") {
-      const detail = goal ? `goal moved to generation ${goal.generation} / status ${goal.status}` : "goal no longer exists";
-      this.store.markRoundFailed(round.id, `abandoned before admission: ${detail}`, {
-        parkGoal: false
-      });
-      return { action: "abandoned", roundID: round.id, detail };
-    }
-    try {
-      const result = await this.transport.submit({
-        sessionID,
-        inboxID: round.inboxID,
-        text: this.render(goal),
-        metadata: {
-          goalID: goal.id,
-          generation: goal.generation,
-          roundID: round.id,
-          inboxID: round.inboxID
-        }
-      });
-      if (result.ok) {
-        this.store.markRoundAdmitted(round.id);
-        this.store.rememberMessageGeneration(sessionID, round.inboxID, round.generation, Date.now());
-        return { action: "admitted", roundID: round.id, inboxID: round.inboxID };
-      }
-      if (result.retryable) {
-        this.store.markRoundUnknown(round.id, result.error);
-        return {
-          action: "unknown",
-          roundID: round.id,
-          inboxID: round.inboxID,
-          detail: result.error
-        };
-      }
-      this.store.markRoundFailed(round.id, result.error);
-      return {
-        action: "failed",
-        roundID: round.id,
-        inboxID: round.inboxID,
-        detail: result.error
-      };
-    } catch (error) {
-      const detail = String(error);
-      this.store.markRoundUnknown(round.id, detail);
-      return { action: "unknown", roundID: round.id, inboxID: round.inboxID, detail };
-    }
-  }
-  async reconcile() {
-    const out = [];
-    for (const round of this.store.outstandingRounds()) {
-      out.push(await this.reconcileRound(round));
-    }
-    return out;
-  }
-  async reconcileRound(round) {
-    const goal = this.store.byID(round.goalID);
-    if (!goal) {
-      this.store.markRoundFailed(round.id, "goal vanished");
-      return { action: "failed", roundID: round.id, inboxID: round.inboxID, detail: "goal vanished" };
-    }
-    if (goal.generation !== round.generation || isTerminal(goal.status)) {
-      const detail = `superseded (generation ${goal.generation}, status ${goal.status})`;
-      this.store.markRoundFailed(round.id, detail, { parkGoal: false });
-      return { action: "failed", roundID: round.id, inboxID: round.inboxID, detail };
-    }
-    if (round.attempts > this.maxRoundAttempts) {
-      const detail = `exceeded ${this.maxRoundAttempts} submission attempts`;
-      this.store.markRoundFailed(round.id, detail);
-      return { action: "failed", roundID: round.id, inboxID: round.inboxID, detail };
-    }
-    const probe = await this.transport.probe({ sessionID: goal.sessionID, round });
-    switch (probe) {
-      case "running":
-        this.store.markRoundRunning(round.id);
-        return { action: "reconcile", roundID: round.id, status: "running" };
-      case "settled": {
-        const verifiable = this.store.listEvidence(goal.id).filter((e) => e.kind !== "ref");
-        const evidenceCount = verifiable.length;
-        const evidenceDelta = Math.max(0, evidenceCount - round.evidenceBaseline);
-        const liveWait = this.transport.liveWait?.({ sessionID: goal.sessionID }) ?? false;
-        const verdict = this.classify({ goal, round, evidenceCount, evidenceDelta, liveWait });
-        const settledGoal = this.settleRound({
-          roundID: round.id,
-          classification: verdict.classification,
-          detail: verdict.detail
-        });
-        const settledStatus = settledGoal?.status ?? round.status;
-        const after = this.store.byID(goal.id);
-        if (!after || !isNonTerminal(after.status)) {
-          return { action: "reconcile", roundID: round.id, status: settledStatus };
-        }
-        if (after.generation !== round.generation) {
-          return { action: "reconcile", roundID: round.id, status: settledStatus };
-        }
-        const stalled = verdict.classification === "noProgress" && after.noProgressRounds >= this.maxNoProgressRounds && after.status === "active";
-        if (stalled) {
-          const parked = this.store.transition({
-            goalID: after.id,
-            generation: after.generation,
-            to: "stalled",
-            actor: "controller",
-            reason: `${after.noProgressRounds} consecutive rounds without progress`
-          });
-          return { action: "reconcile", roundID: round.id, status: parked.status };
-        }
-        const next = this.reserve(after.sessionID);
-        if (next.action === "dispatch")
-          return this.dispatch(next.round, after.sessionID);
-        return next.outcome;
-      }
-      case "notDelivered": {
-        try {
-          this.store.markRoundUnknown(round.id, "not delivered; retrying with original id");
-        } catch {}
-        const retry = this.store.roundByID(round.id);
-        return this.dispatch(retry, goal.sessionID);
-      }
-      case "unknown":
-      default:
-        return { action: "reconcile", roundID: round.id, status: round.status };
-    }
-  }
-  settleRound(input) {
-    const round = this.store.roundByID(input.roundID);
-    if (!round)
-      throw new GoalConflictError(`unknown round ${input.roundID}`);
-    const { goal } = this.store.settleAndRecord({
-      roundID: input.roundID,
-      classification: input.classification,
-      detail: input.detail,
-      tokensUsed: input.tokensUsed
-    });
-    return goal;
-  }
-  get stallThreshold() {
-    return this.maxNoProgressRounds;
-  }
-}
-
-// src/controller/transport.ts
-var LIVE_WAIT_TTL_MS = 15 * 60 * 1000;
-
-class RoundObserver {
-  seen = new Map;
-  runningBySession = new Map;
-  recentTokens = new Map;
-  nextToken = 0;
-  slot(inboxID) {
-    let s = this.seen.get(inboxID);
-    if (!s) {
-      s = { enqueued: false, delivered: false, running: false, finished: false };
-      this.seen.set(inboxID, s);
-    }
-    return s;
-  }
-  addBusy(sessionID, slot) {
-    const token = ++this.nextToken;
-    let refs = this.runningBySession.get(sessionID);
-    if (!refs) {
-      refs = new Map;
-      this.runningBySession.set(sessionID, refs);
-    }
-    const ref = { startedMs: Date.now() };
-    if (slot)
-      ref.slot = slot;
-    refs.set(token, ref);
-    const stack = this.recentTokens.get(sessionID);
-    if (stack)
-      stack.push(token);
-    else
-      this.recentTokens.set(sessionID, [token]);
-    return token;
-  }
-  release(sessionID, token) {
-    const refs = this.runningBySession.get(sessionID);
-    if (!refs?.delete(token))
-      return;
-    const stack = this.recentTokens.get(sessionID);
-    if (stack) {
-      const at = stack.indexOf(token);
-      if (at >= 0)
-        stack.splice(at, 1);
-      if (stack.length === 0)
-        this.recentTokens.delete(sessionID);
-    }
-    if (refs.size === 0)
-      this.runningBySession.delete(sessionID);
-  }
-  releaseToken(sessionID, token) {
-    const ref = this.runningBySession.get(sessionID)?.get(token);
-    if (!ref)
-      return;
-    if (ref.slot) {
-      const slot = this.seen.get(ref.slot);
-      if (slot?.counted === token)
-        slot.counted = undefined;
-    }
-    this.release(sessionID, token);
-  }
-  releaseMostRecent(sessionID) {
-    const stack = this.recentTokens.get(sessionID);
-    const token = stack?.[stack.length - 1];
-    if (token !== undefined)
-      this.releaseToken(sessionID, token);
-  }
-  releaseDirect(sessionID) {
-    const refs = this.runningBySession.get(sessionID);
-    const stack = this.recentTokens.get(sessionID);
-    if (!refs || !stack)
-      return;
-    for (let i = stack.length - 1;i >= 0; i--) {
-      if (!refs.get(stack[i])?.slot) {
-        this.releaseToken(sessionID, stack[i]);
-        return;
-      }
-    }
-  }
-  observe(event) {
-    const e = event;
-    const type = e?.type;
-    if (!type)
-      return;
-    const d = e?.data ?? {};
-    const p = e?.properties ?? {};
-    const pick = (k) => d[k] ?? p[k];
-    const id = pick("messageID") ?? pick("messageId") ?? pick("message")?.id ?? pick("info")?.id;
-    if (type.startsWith("session.execution.")) {
-      const sessionID = pick("sessionID");
-      if (sessionID) {
-        const continuation = id?.startsWith("msg_xgoal_") ? this.slot(id) : undefined;
-        const completed = type === "session.execution.succeeded" || type === "session.execution.failed";
-        if (continuation)
-          continuation.sessionID = sessionID;
-        if (type === "session.execution.started") {
-          if (continuation) {
-            if (!continuation.counted) {
-              continuation.counted = this.addBusy(sessionID, id);
-            }
-          } else {
-            this.addBusy(sessionID);
-          }
-        } else if (completed) {
-          if (continuation?.counted !== undefined) {
-            this.releaseToken(sessionID, continuation.counted);
-          } else if (continuation) {
-            this.releaseDirect(sessionID);
-          } else {
-            this.releaseMostRecent(sessionID);
-          }
-        }
-      }
-    }
-    if (!id || !id.startsWith("msg_xgoal_"))
-      return;
-    const s = this.slot(id);
-    switch (type) {
-      case "session.inbox.enqueued":
-        s.enqueued = true;
-        break;
-      case "session.inbox.delivered":
-        s.enqueued = true;
-        s.delivered = true;
-        break;
-      case "session.execution.started":
-        s.delivered = true;
-        s.running = true;
-        break;
-      case "session.execution.succeeded":
-      case "session.execution.failed":
-        s.finished = true;
-        s.running = false;
-        break;
-      default:
-        break;
-    }
-  }
-  probe(inboxID) {
-    const s = this.seen.get(inboxID);
-    if (!s)
-      return "unknown";
-    if (s.finished)
-      return "settled";
-    if (s.running)
-      return "running";
-    if (s.enqueued || s.delivered)
-      return "running";
-    return "unknown";
-  }
-  isBusy(sessionID) {
-    const refs = this.runningBySession.get(sessionID);
-    if (!refs || refs.size === 0)
-      return false;
-    const now = Date.now();
-    for (const ref of refs.values()) {
-      if (now - ref.startedMs < LIVE_WAIT_TTL_MS)
-        return true;
-    }
-    return false;
-  }
-  forget(inboxID) {
-    const slot = this.seen.get(inboxID);
-    if (slot?.counted !== undefined && slot.sessionID) {
-      this.releaseToken(slot.sessionID, slot.counted);
-    }
-    this.seen.delete(inboxID);
-  }
-}
-function classify(error) {
-  const message = error instanceof Error ? error.message : String(error);
-  const status = error;
-  const code = status?.status ?? status?.statusCode;
-  if (typeof code === "number" && code >= 400 && code < 500 && code !== 408 && code !== 429) {
-    return { ok: false, retryable: false, error: message };
-  }
-  if (typeof code === "number" && code === 404) {
-    return { ok: false, retryable: false, error: message };
-  }
-  return { ok: false, retryable: true, error: message };
-}
-
-class SessionTransport {
-  observer;
-  send;
-  fetchState;
-  constructor(options) {
-    this.observer = options.observer;
-    this.send = options.send;
-    this.fetchState = options.fetchState;
-  }
-  async submit(input) {
-    try {
-      await this.send(input);
-      return { ok: true };
-    } catch (error) {
-      return classify(error);
-    }
-  }
-  liveWait(input) {
-    return this.observer.isBusy(input.sessionID);
-  }
-  async probe(input) {
-    const cached = this.observer.probe(input.round.inboxID);
-    if (cached === "settled") {
-      this.observer.forget(input.round.inboxID);
-      return "settled";
-    }
-    if (!this.fetchState)
-      return cached;
-    let state;
-    try {
-      state = await this.fetchState({ sessionID: input.sessionID });
-    } catch {
-      return cached;
-    }
-    const queued = state.inbox.some((item) => item.id === input.round.inboxID);
-    const isOwn = (message) => message.id === input.round.inboxID || message.metadata?.inboxID === input.round.inboxID || message.metadata?.roundID === input.round.id;
-    const index = state.messages.findIndex(isOwn);
-    if (index === -1) {
-      if (queued)
-        return "running";
-      return cached === "unknown" ? "unknown" : cached;
-    }
-    for (let i = index + 1;i < state.messages.length; i++) {
-      const message = state.messages[i];
-      const foreign = message.type === "user" && message.id !== input.round.inboxID && !isOwn(message);
-      if (foreign) {
-        return cached === "running" ? "running" : "unknown";
-      }
-      if (message.type === "idle") {
-        this.observer.forget(input.round.inboxID);
-        return "settled";
-      }
-      if (message.type === "assistant" && (message.finish === "stop" || message.finish === "length" || message.finish === "content-filter" || message.finish === "error")) {
-        this.observer.forget(input.round.inboxID);
-        return "settled";
-      }
-    }
-    return "running";
-  }
 }
 
 // src/controller/workspace.ts
@@ -2775,6 +1935,1075 @@ class GoalVerifier {
     };
   }
 }
+function looksLikeWorkflowQuestion(text) {
+  const t = text.toLowerCase();
+  const patterns = [
+    /should i (push|proceed|continue|publish|commit)/,
+    /whether to (push|proceed|continue|publish|commit)/,
+    /waiting for (the )?(user|you)('s)? (decision|confirmation|approval|input)/,
+    /do you want me to/,
+    /would you like me to/,
+    /let me know (if|whether)/,
+    /awaiting (your|user) (decision|direction|input)/
+  ];
+  return patterns.some((p) => p.test(t));
+}
+
+// src/controller/controller.ts
+class GoalController {
+  store;
+  maxNoProgressRounds;
+  minBlockerConfirmations;
+  deriveCriteria;
+  constructor(options) {
+    this.store = new GoalStore(options.dbPath);
+    this.maxNoProgressRounds = options.maxNoProgressRounds ?? 3;
+    this.minBlockerConfirmations = options.minBlockerConfirmations ?? 2;
+    this.deriveCriteria = options.deriveCriteria ?? deriveCriteria;
+  }
+  close() {
+    this.store.close();
+  }
+  reconcileStartup() {
+    return this.store.reconcileAfterRestart();
+  }
+  criteriaFor(objective) {
+    return this.deriveCriteria(objective);
+  }
+  policyFor(objective, criteria) {
+    return completionPolicyFor(objective, criteria.map((c) => ({
+      text: c.text,
+      spec: c.spec ?? { type: "objective" },
+      source: c.source ?? "user"
+    })));
+  }
+  startOrDescribe(sessionID, objective) {
+    const existing = this.store.current(sessionID);
+    if (existing)
+      return { existing };
+    const criteria = this.criteriaFor(objective);
+    const goal = this.store.create({
+      sessionID,
+      objective,
+      actor: "user",
+      criteria,
+      completionPolicy: this.policyFor(objective, criteria)
+    });
+    return { created: goal };
+  }
+  replace(sessionID, objective, expectedGeneration) {
+    const existing = this.store.current(sessionID);
+    const criteria = this.criteriaFor(objective);
+    const completionPolicy = this.policyFor(objective, criteria);
+    if (!existing) {
+      return this.store.create({ sessionID, objective, actor: "user", criteria, completionPolicy });
+    }
+    return this.store.replace({
+      sessionID,
+      expectedGeneration: expectedGeneration ?? existing.generation,
+      objective,
+      actor: "user",
+      criteria,
+      completionPolicy
+    });
+  }
+  pause(sessionID) {
+    const goal = this.requireCurrent(sessionID);
+    return this.store.transition({
+      goalID: goal.id,
+      generation: goal.generation,
+      to: "paused",
+      actor: "user"
+    });
+  }
+  resume(sessionID) {
+    const goal = this.requireCurrent(sessionID);
+    const resumed = this.store.transition({
+      goalID: goal.id,
+      generation: goal.generation,
+      to: "active",
+      actor: "user",
+      reason: "resumed by user"
+    });
+    if (resumed.deliveryFailed)
+      this.store.clearDeliveryFailure(resumed.id);
+    return this.store.byID(resumed.id) ?? resumed;
+  }
+  acceptObjective(sessionID, note) {
+    const goal = this.requireCurrent(sessionID);
+    this.store.recordUserAcceptance(goal.id, goal.generation, note);
+    return this.store.byID(goal.id) ?? goal;
+  }
+  status(sessionID) {
+    return this.store.current(sessionID);
+  }
+  latest(sessionID) {
+    return this.store.latest(sessionID);
+  }
+  recordUsage(sessionID, totalTokens) {
+    return this.store.recordSessionUsage(sessionID, totalTokens).goal;
+  }
+  setBudget(sessionID, budget) {
+    const goal = this.requireCurrent(sessionID);
+    return this.store.setTokenBudget(goal.id, budget);
+  }
+  health(sessionID) {
+    const goal = this.store.latest(sessionID);
+    if (!goal)
+      return { ok: true, goal: null };
+    const criteria = this.store.listCriteria(goal.id);
+    const evidence = this.store.listEvidence(goal.id);
+    const round = this.store.outstandingRound(goal.id);
+    const rounds = this.store.roundsFor(goal.id);
+    const last = rounds[rounds.length - 1];
+    const stuckMs = round ? Date.now() - round.preparedAtMs : 0;
+    const problems = [];
+    if (goal.status === "active" && !round) {
+      problems.push("active goal has no outstanding round: nothing is driving it");
+    }
+    if (goal.deliveryFailed) {
+      problems.push("continuation delivery failed; automatic dispatch is halted");
+    }
+    if (round && round.attempts > 3) {
+      problems.push(`round ${round.id} has ${round.attempts} submission attempts`);
+    }
+    if (round && stuckMs > 5 * 60000) {
+      problems.push(`round ${round.id} has been outstanding for ${Math.round(stuckMs / 1000)}s`);
+    }
+    if (goal.status === "verifying") {
+      const unmet = criteria.filter((criterion) => !criterion.met);
+      if (unmet.length)
+        problems.push(`${unmet.length} unmet criterion/criteria during verification`);
+    }
+    return {
+      ok: problems.length === 0,
+      goal: {
+        id: goal.id,
+        generation: goal.generation,
+        status: goal.status,
+        objective: goal.objective
+      },
+      drive: {
+        outstandingRound: round ? { id: round.id, status: round.status, attempts: round.attempts, ageMs: stuckMs } : null,
+        lastRound: last ? { id: last.id, status: last.status, classification: last.classification ?? null } : null,
+        deliveryFailed: goal.deliveryFailed,
+        rounds: goal.rounds,
+        noProgressRounds: goal.noProgressRounds
+      },
+      usage: {
+        tokensUsed: goal.tokensUsed ?? 0,
+        tokenBudget: goal.tokenBudget ?? null
+      },
+      verification: {
+        criteria: criteria.map((criterion) => ({
+          id: criterion.id,
+          text: criterion.text,
+          met: criterion.met,
+          source: criterion.source
+        })),
+        evidenceCount: evidence.length,
+        verificationRevision: goal.verificationRevision
+      },
+      problems
+    };
+  }
+  history(sessionID) {
+    return this.store.history(sessionID);
+  }
+  get(sessionID) {
+    return this.store.current(sessionID);
+  }
+  bindCriterionEvidence(goalID, criterionID, refs) {
+    const evidence = this.store.listEvidence(goalID);
+    const chosen = new Set;
+    for (const ref of refs) {
+      const byID = evidence.find((e) => e.id === ref);
+      if (byID) {
+        chosen.add(byID.id);
+        continue;
+      }
+      const exact = evidence.filter((e) => e.ref === ref);
+      if (exact.length > 0) {
+        for (const e of exact)
+          chosen.add(e.id);
+        continue;
+      }
+      const candidate = ref.includes("/") || ref.includes("\\") ? evidence.filter((e) => e.ref.endsWith(ref) || e.ref.endsWith(`/${ref}`)) : evidence.filter((e) => e.kind === "file" && e.ref.split("/").pop() === ref);
+      if (candidate.length > 0 && new Set(candidate.map((e) => e.ref)).size === 1) {
+        for (const e of candidate)
+          chosen.add(e.id);
+      }
+    }
+    if (chosen.size === 0)
+      return 0;
+    return this.store.bindEvidence(criterionID, [...chosen]);
+  }
+  resolveCriterion(goalID, identifier) {
+    const criteria = this.store.listCriteria(goalID);
+    if (criteria.some((criterion) => criterion.id === identifier))
+      return identifier;
+    const byText = criteria.filter((criterion) => criterion.text === identifier);
+    return byText.length === 1 ? byText[0].id : undefined;
+  }
+  checkpoint(sessionID, input) {
+    const target = this.resolveTarget(sessionID, input);
+    if (!target.ok)
+      return { recorded: false, rejected: target.rejected };
+    const goal = target.goal;
+    for (const ref of input.evidenceRefs ?? []) {
+      this.store.addEvidence({
+        goalID: goal.id,
+        criterionID: input.criterionID,
+        kind: "ref",
+        ref,
+        detail: input.summary
+      });
+    }
+    return { recorded: true, goal: this.store.byID(goal.id) };
+  }
+  addCriterion(sessionID, input) {
+    const target = this.resolveTarget(sessionID, input);
+    if (!target.ok)
+      return { rejected: target.rejected };
+    try {
+      const criterionID = this.store.addCriterion(target.goal.id, input.text, input.spec, "model", input.covers);
+      return { criterionID };
+    } catch (error) {
+      return { rejected: String(error) };
+    }
+  }
+  supersedeCriterion(sessionID, input) {
+    const target = this.resolveTarget(sessionID, input);
+    if (!target.ok)
+      return { rejected: target.rejected };
+    if (input.replacement && !input.replacement.text.trim()) {
+      return { rejected: "a replacement proposal requires non-empty text" };
+    }
+    const criterionID = this.resolveCriterion(target.goal.id, input.criterion_id);
+    if (!criterionID) {
+      return { rejected: `criterion ${input.criterion_id} does not exist on this goal` };
+    }
+    try {
+      this.store.supersedeCriterion(criterionID, input.reason, input.replacement);
+      return { superseded: true };
+    } catch (error) {
+      return { rejected: String(error) };
+    }
+  }
+  proposeComplete(sessionID, input) {
+    const target = this.resolveTarget(sessionID, input);
+    if (!target.ok)
+      return { rejected: target.rejected };
+    const goal = target.goal;
+    for (const ref of input.evidenceRefs ?? []) {
+      this.store.addEvidence({ goalID: goal.id, kind: "ref", ref, detail: input.summary });
+    }
+    for (const binding of input.criteria ?? []) {
+      const criterionID = this.resolveCriterion(goal.id, binding.criterionID);
+      if (criterionID)
+        this.bindCriterionEvidence(goal.id, criterionID, binding.evidenceRefs);
+    }
+    const updated = this.store.transition({
+      goalID: goal.id,
+      generation: goal.generation,
+      to: "verifying",
+      actor: "model",
+      reason: input.summary.slice(0, 300)
+    });
+    return { goal: updated };
+  }
+  reportBlocked(sessionID, report) {
+    const target = this.resolveTarget(sessionID, report);
+    if (!target.ok) {
+      return { accepted: false, confirmations: 0, rejected: target.rejected };
+    }
+    const goal = target.goal;
+    if (looksLikeWorkflowQuestion(report.reason)) {
+      return {
+        goal: this.store.byID(goal.id),
+        accepted: false,
+        confirmations: 0,
+        instruction: "This is a workflow question, not a blocker. Select the reasonable nonblocking path and continue working; do not ask again.",
+        rejected: "workflow question — not a blocker. Select the reasonable nonblocking path and continue working; do not ask again."
+      };
+    }
+    for (const ref of report.evidenceRefs ?? []) {
+      this.store.addEvidence({ goalID: goal.id, kind: "blocker-ref", ref, detail: report.reason });
+    }
+    const claimedDependency = report.externalDependency === true;
+    const hasBacking = (report.evidenceRefs?.length ?? 0) > 0;
+    if (!claimedDependency || !hasBacking) {
+      return {
+        goal: this.store.byID(goal.id),
+        accepted: false,
+        confirmations: this.store.blockerConfirmations(goal.id, goal.generation, report.reason),
+        rejected: !claimedDependency ? "no concrete external dependency was identified" : "no supporting evidence was cited; cite the observed failure the dependency causes"
+      };
+    }
+    const roundNumber = goal.rounds + 1;
+    const confirmations = this.store.recordBlockerClaim({
+      goalID: goal.id,
+      generation: goal.generation,
+      roundNumber,
+      reason: report.reason,
+      evidenceKeys: report.evidenceRefs
+    });
+    const genuine = confirmations >= this.minBlockerConfirmations;
+    if (!genuine) {
+      return {
+        goal: this.store.byID(goal.id),
+        accepted: false,
+        confirmations
+      };
+    }
+    const blocked = this.store.transition({
+      goalID: goal.id,
+      generation: goal.generation,
+      to: "blocked",
+      actor: "controller",
+      reason: report.reason.slice(0, 300)
+    });
+    return { goal: blocked, accepted: true, confirmations };
+  }
+  classifyRound(sessionID, classification, detail, tokensUsed) {
+    const goal = this.store.current(sessionID);
+    if (!goal || !isNonTerminal(goal.status))
+      return goal;
+    const updated = this.store.recordRound({
+      goalID: goal.id,
+      generation: goal.generation,
+      classification,
+      detail,
+      tokensUsed
+    });
+    if (classification === "noProgress" && updated.noProgressRounds >= this.maxNoProgressRounds && updated.status === "active") {
+      return this.store.transition({
+        goalID: updated.id,
+        generation: updated.generation,
+        to: "stalled",
+        actor: "controller",
+        reason: `${updated.noProgressRounds} consecutive rounds without progress`
+      });
+    }
+    return updated;
+  }
+  enforceBudget(sessionID) {
+    const goal = this.store.current(sessionID);
+    if (!goal || goal.status !== "active")
+      return goal;
+    if (goal.tokenBudget !== undefined && (goal.tokensUsed ?? 0) >= goal.tokenBudget) {
+      return this.store.transition({
+        goalID: goal.id,
+        generation: goal.generation,
+        to: "budgetLimited",
+        actor: "controller",
+        reason: `token budget reached (${goal.tokensUsed}/${goal.tokenBudget})`
+      });
+    }
+    return goal;
+  }
+  commitComplete(goalID, generation, reason, snapshot) {
+    return this.store.completeGoal({
+      goalID,
+      generation,
+      reason,
+      snapshot,
+      settleClassification: "complete"
+    });
+  }
+  rejectCompletion(goalID, generation, reason) {
+    const goal = this.store.byID(goalID);
+    if (!goal || goal.status !== "verifying")
+      return goal;
+    if (goal.generation !== generation)
+      return goal;
+    return this.store.transition({
+      goalID: goal.id,
+      generation: goal.generation,
+      to: "active",
+      actor: "controller",
+      reason
+    });
+  }
+  requireCurrent(sessionID) {
+    const goal = this.store.current(sessionID);
+    if (!goal)
+      throw new GoalConflictError(`session ${sessionID} has no current goal`);
+    return goal;
+  }
+  resolveTarget(sessionID, ref) {
+    const current = this.store.current(sessionID);
+    if (!current)
+      return { ok: false, rejected: "no active goal for this session" };
+    if (!isNonTerminal(current.status)) {
+      return { ok: false, rejected: `goal is ${current.status}` };
+    }
+    if (!ref?.goalID) {
+      return {
+        ok: false,
+        rejected: `unresolved goal reference: the tool call must name the current goal (${current.id})`
+      };
+    }
+    if (ref.goalID !== current.id) {
+      return {
+        ok: false,
+        rejected: `stale goal reference: ${ref.goalID} is not the current goal (${current.id})`
+      };
+    }
+    if (ref.generation === undefined) {
+      return {
+        ok: false,
+        rejected: `unresolved generation: the tool call must name generation ${current.generation}`
+      };
+    }
+    if (ref.generation !== current.generation) {
+      return {
+        ok: false,
+        rejected: `stale generation: callback claimed ${ref.generation}, current is ${current.generation}`
+      };
+    }
+    return { ok: true, goal: current };
+  }
+}
+
+// src/controller/calls.ts
+function selectToolRef(resolved, input, messageID) {
+  if (resolved.goalID && resolved.generation !== undefined) {
+    return { ok: true, ref: resolved };
+  }
+  if (messageID) {
+    return {
+      ok: false,
+      reason: "this call could not be attributed to a goal generation from its message; call goal_get and retry from the current turn"
+    };
+  }
+  if (input?.goal_id && input.generation !== undefined) {
+    return { ok: true, ref: { goalID: input.goal_id, generation: input.generation } };
+  }
+  return {
+    ok: false,
+    reason: "this call carries neither a resolvable message identity nor a complete goal reference (goal_id and generation); call goal_get and retry"
+  };
+}
+function attributeMessageGeneration(messages, messageID, generationOf) {
+  const index = messages.findIndex((m) => m?.id === messageID);
+  if (index === -1)
+    return;
+  for (let i = index - 1;i >= 0; i--) {
+    const message = messages[i];
+    if (!message)
+      continue;
+    const generation = generationOf(message);
+    if (generation !== undefined)
+      return generation;
+    if (message.type === "user")
+      return;
+  }
+  return;
+}
+
+// src/controller/coordinator.ts
+class GoalCoordinator {
+  controller;
+  dispatcher;
+  hooks;
+  constructor(controller, dispatcher, hooks = {}) {
+    this.controller = controller;
+    this.dispatcher = dispatcher;
+    this.hooks = hooks;
+  }
+  async start(sessionID, objective) {
+    const out = this.controller.startOrDescribe(sessionID, objective);
+    if ("existing" in out)
+      return { existing: out.existing };
+    const drive = await this.drive(sessionID);
+    return { created: out.created, drive };
+  }
+  async replace(sessionID, objective, expectedGeneration) {
+    const goal = this.controller.replace(sessionID, objective, expectedGeneration);
+    const drive = await this.drive(sessionID);
+    return { goal, drive };
+  }
+  async resume(sessionID) {
+    const goal = this.controller.resume(sessionID);
+    const drive = await this.drive(sessionID);
+    return { goal, drive };
+  }
+  pause(sessionID) {
+    return this.controller.pause(sessionID);
+  }
+  async drive(sessionID) {
+    const dispatcher = this.dispatcher();
+    if (!dispatcher)
+      return;
+    try {
+      return await dispatcher.drive(sessionID);
+    } catch (error) {
+      this.hooks.onDriveError?.(sessionID, error);
+      return;
+    }
+  }
+}
+
+// src/controller/driver.ts
+var DEFAULT_CLASSIFY = ({
+  evidenceDelta,
+  newObservations,
+  liveWait
+}) => {
+  if (newObservations > 0) {
+    return { classification: "progress", detail: `${newObservations} new observation(s)` };
+  }
+  if (evidenceDelta > 0) {
+    return {
+      classification: "noProgress",
+      detail: `${evidenceDelta} evidence row(s), all repeats of known observations`
+    };
+  }
+  if (liveWait) {
+    return {
+      classification: "verifiedWait",
+      detail: "no new evidence, but a background execution is still running"
+    };
+  }
+  return { classification: "noProgress", detail: "no new evidence captured this round" };
+};
+var seq = 0;
+function newInboxID() {
+  seq += 1;
+  const rand = Math.random().toString(36).slice(2, 10);
+  return `msg_xgoal_${Date.now().toString(36)}${seq.toString(36)}${rand}`;
+}
+var DEFAULT_CONTINUATION = (goal) => [
+  "Continue working toward the active goal.",
+  "",
+  `Objective: ${goal.objective}`,
+  "",
+  "Inspect the current state before acting. Take the next useful action.",
+  "A workflow preference, an optional decision, or a choice between reasonable",
+  "next steps is not a blocker — choose and continue. If the objective is",
+  "genuinely satisfied, propose completion with evidence."
+].join(`
+`);
+
+class GoalDriver {
+  store;
+  transport;
+  maxNoProgressRounds;
+  maxRoundAttempts;
+  maxVerifiedWaitMs;
+  waitRecheckMs;
+  render;
+  classify;
+  constructor(store, transport, options = {}) {
+    this.store = store;
+    this.transport = transport;
+    this.maxNoProgressRounds = options.maxNoProgressRounds ?? 3;
+    this.maxRoundAttempts = options.maxRoundAttempts ?? 5;
+    this.maxVerifiedWaitMs = options.maxVerifiedWaitMs ?? 15 * 60000;
+    this.waitRecheckMs = options.waitRecheckMs ?? 30000;
+    this.render = options.renderContinuation ?? DEFAULT_CONTINUATION;
+    this.classify = options.classify ?? DEFAULT_CLASSIFY;
+  }
+  async drive(sessionID) {
+    const goal = this.store.current(sessionID);
+    if (goal && goal.status === "active") {
+      const outstanding = this.store.outstandingRound(goal.id);
+      if (outstanding) {
+        const outcome = await this.reconcileRound(outstanding);
+        if (outcome.action !== "reconcile")
+          return outcome;
+      }
+      const wait = this.store.activeWait(goal.id);
+      if (wait) {
+        const outcome = await this.recheckWait(goal, wait);
+        if (outcome.action !== "reconcile")
+          return outcome;
+      }
+    }
+    const decision = this.reserve(sessionID);
+    if (decision.action !== "dispatch")
+      return decision.outcome;
+    return this.dispatch(decision.round, sessionID);
+  }
+  async recheckWait(goal, wait) {
+    const running = this.transport.liveWait?.({ sessionID: goal.sessionID }) ?? false;
+    const waitedMs = Math.max(0, Date.now() - wait.startedMs);
+    if (running && waitedMs < this.maxVerifiedWaitMs) {
+      return {
+        action: "waiting",
+        roundID: "",
+        status: goal.status,
+        reason: wait.reason,
+        recheckMs: wait.recheckMs
+      };
+    }
+    this.store.clearWait(goal.id);
+    if (running) {
+      const parked = this.store.transition({
+        goalID: goal.id,
+        generation: goal.generation,
+        to: "stalled",
+        actor: "controller",
+        reason: `waiting on background execution exceeded ${Math.round(this.maxVerifiedWaitMs / 1000)}s: ${wait.reason}`
+      });
+      return { action: "limited", status: parked.status };
+    }
+    const decision = this.reserve(goal.sessionID);
+    if (decision.action !== "dispatch")
+      return decision.outcome;
+    return this.dispatch(decision.round, goal.sessionID);
+  }
+  reserve(sessionID) {
+    const goal = this.store.current(sessionID);
+    if (!goal)
+      return { action: "done", outcome: { action: "idle", reason: "no goal" } };
+    if (goal.status !== "active") {
+      return {
+        action: "done",
+        outcome: { action: "idle", reason: `goal status is ${goal.status}` }
+      };
+    }
+    const outstanding = this.store.outstandingRound(goal.id);
+    if (outstanding) {
+      return {
+        action: "done",
+        outcome: { action: "reconcile", roundID: outstanding.id, status: outstanding.status }
+      };
+    }
+    if (goal.deliveryFailed) {
+      return {
+        action: "done",
+        outcome: { action: "idle", reason: "delivery failed; awaiting recovery" }
+      };
+    }
+    if (goal.tokenBudget !== undefined && (goal.tokensUsed ?? 0) >= goal.tokenBudget) {
+      const limited = this.store.transition({
+        goalID: goal.id,
+        generation: goal.generation,
+        to: "budgetLimited",
+        actor: "controller",
+        reason: `token budget reached (${goal.tokensUsed}/${goal.tokenBudget})`
+      });
+      return { action: "done", outcome: { action: "limited", status: limited.status } };
+    }
+    const inboxID = newInboxID();
+    const round = this.store.prepareRound({
+      goalID: goal.id,
+      generation: goal.generation,
+      inboxID
+    });
+    return { action: "dispatch", round };
+  }
+  async dispatch(round, sessionID) {
+    const goal = this.store.byID(round.goalID);
+    if (!goal || goal.generation !== round.generation || goal.status !== "active") {
+      const detail = goal ? `goal moved to generation ${goal.generation} / status ${goal.status}` : "goal no longer exists";
+      this.store.markRoundFailed(round.id, `abandoned before admission: ${detail}`, {
+        parkGoal: false
+      });
+      return { action: "abandoned", roundID: round.id, detail };
+    }
+    try {
+      const result = await this.transport.submit({
+        sessionID,
+        inboxID: round.inboxID,
+        text: this.render(goal),
+        metadata: {
+          goalID: goal.id,
+          generation: goal.generation,
+          roundID: round.id,
+          inboxID: round.inboxID
+        }
+      });
+      if (result.ok) {
+        this.store.markRoundAdmitted(round.id);
+        this.store.rememberMessageGeneration(sessionID, round.inboxID, round.generation, Date.now());
+        return { action: "admitted", roundID: round.id, inboxID: round.inboxID };
+      }
+      if (result.retryable) {
+        this.store.markRoundUnknown(round.id, result.error);
+        return {
+          action: "unknown",
+          roundID: round.id,
+          inboxID: round.inboxID,
+          detail: result.error
+        };
+      }
+      this.store.markRoundFailed(round.id, result.error);
+      return {
+        action: "failed",
+        roundID: round.id,
+        inboxID: round.inboxID,
+        detail: result.error
+      };
+    } catch (error) {
+      const detail = String(error);
+      this.store.markRoundUnknown(round.id, detail);
+      return { action: "unknown", roundID: round.id, inboxID: round.inboxID, detail };
+    }
+  }
+  async reconcile() {
+    const out = [];
+    for (const round of this.store.outstandingRounds()) {
+      out.push(await this.reconcileRound(round));
+    }
+    for (const waiting of this.store.goalsWithActiveWaits()) {
+      const goal = this.store.byID(waiting.goalID);
+      if (!goal || goal.status !== "active") {
+        this.store.clearWait(waiting.goalID);
+        continue;
+      }
+      const wait = this.store.activeWait(waiting.goalID);
+      if (wait)
+        out.push(await this.recheckWait(goal, wait));
+    }
+    return out;
+  }
+  async reconcileRound(round) {
+    const goal = this.store.byID(round.goalID);
+    if (!goal) {
+      this.store.markRoundFailed(round.id, "goal vanished");
+      return { action: "failed", roundID: round.id, inboxID: round.inboxID, detail: "goal vanished" };
+    }
+    if (goal.generation !== round.generation || isTerminal(goal.status)) {
+      const detail = `superseded (generation ${goal.generation}, status ${goal.status})`;
+      this.store.markRoundFailed(round.id, detail, { parkGoal: false });
+      return { action: "failed", roundID: round.id, inboxID: round.inboxID, detail };
+    }
+    if (round.attempts > this.maxRoundAttempts) {
+      const detail = `exceeded ${this.maxRoundAttempts} submission attempts`;
+      this.store.markRoundFailed(round.id, detail);
+      return { action: "failed", roundID: round.id, inboxID: round.inboxID, detail };
+    }
+    const probe = await this.transport.probe({ sessionID: goal.sessionID, round });
+    switch (probe) {
+      case "running":
+        this.store.markRoundRunning(round.id);
+        return { action: "reconcile", roundID: round.id, status: "running" };
+      case "settled": {
+        const verifiable = this.store.listEvidence(goal.id).filter((e) => e.kind !== "ref" && e.kind !== "blocker-ref");
+        const evidenceCount = verifiable.length;
+        const evidenceDelta = Math.max(0, evidenceCount - round.evidenceBaseline);
+        const newObservations = this.store.countNewFingerprintEvidence(goal.id, round.preparedAtMs);
+        const liveWait = this.transport.liveWait?.({ sessionID: goal.sessionID }) ?? false;
+        const verdict = this.classify({ goal, round, evidenceCount, evidenceDelta, newObservations, liveWait });
+        const settledGoal = this.settleRound({
+          roundID: round.id,
+          classification: verdict.classification,
+          detail: verdict.detail
+        });
+        const settledStatus = settledGoal?.status ?? round.status;
+        const after = this.store.byID(goal.id);
+        if (!after || !isNonTerminal(after.status)) {
+          return { action: "reconcile", roundID: round.id, status: settledStatus };
+        }
+        if (after.generation !== round.generation) {
+          return { action: "reconcile", roundID: round.id, status: settledStatus };
+        }
+        const stalled = verdict.classification === "noProgress" && after.noProgressRounds >= this.maxNoProgressRounds && after.status === "active";
+        if (stalled) {
+          const parked = this.store.transition({
+            goalID: after.id,
+            generation: after.generation,
+            to: "stalled",
+            actor: "controller",
+            reason: `${after.noProgressRounds} consecutive rounds without progress`
+          });
+          return { action: "reconcile", roundID: round.id, status: parked.status };
+        }
+        if (verdict.classification === "verifiedWait") {
+          const reason = verdict.detail ?? "background execution still running";
+          this.store.enterWait({
+            goalID: after.id,
+            generation: after.generation,
+            reason,
+            recheckMs: this.waitRecheckMs
+          });
+          return {
+            action: "waiting",
+            roundID: round.id,
+            status: after.status,
+            reason,
+            recheckMs: this.waitRecheckMs
+          };
+        }
+        this.store.clearWait(after.id);
+        const next = this.reserve(after.sessionID);
+        if (next.action === "dispatch")
+          return this.dispatch(next.round, after.sessionID);
+        return next.outcome;
+      }
+      case "notDelivered": {
+        try {
+          this.store.markRoundUnknown(round.id, "not delivered; retrying with original id");
+        } catch {}
+        const retry = this.store.roundByID(round.id);
+        return this.dispatch(retry, goal.sessionID);
+      }
+      case "unknown":
+      default:
+        return { action: "reconcile", roundID: round.id, status: round.status };
+    }
+  }
+  settleRound(input) {
+    const round = this.store.roundByID(input.roundID);
+    if (!round)
+      throw new GoalConflictError(`unknown round ${input.roundID}`);
+    const { goal } = this.store.settleAndRecord({
+      roundID: input.roundID,
+      classification: input.classification,
+      detail: input.detail,
+      tokensUsed: input.tokensUsed
+    });
+    return goal;
+  }
+  get stallThreshold() {
+    return this.maxNoProgressRounds;
+  }
+}
+
+// src/controller/transport.ts
+var LIVE_WAIT_TTL_MS = 15 * 60 * 1000;
+
+class RoundObserver {
+  seen = new Map;
+  runningBySession = new Map;
+  recentTokens = new Map;
+  nextToken = 0;
+  slot(inboxID) {
+    let s = this.seen.get(inboxID);
+    if (!s) {
+      s = { enqueued: false, delivered: false, running: false, finished: false };
+      this.seen.set(inboxID, s);
+    }
+    return s;
+  }
+  addBusy(sessionID, slot) {
+    const token = ++this.nextToken;
+    let refs = this.runningBySession.get(sessionID);
+    if (!refs) {
+      refs = new Map;
+      this.runningBySession.set(sessionID, refs);
+    }
+    const ref = { startedMs: Date.now() };
+    if (slot)
+      ref.slot = slot;
+    refs.set(token, ref);
+    const stack = this.recentTokens.get(sessionID);
+    if (stack)
+      stack.push(token);
+    else
+      this.recentTokens.set(sessionID, [token]);
+    return token;
+  }
+  release(sessionID, token) {
+    const refs = this.runningBySession.get(sessionID);
+    if (!refs?.delete(token))
+      return;
+    const stack = this.recentTokens.get(sessionID);
+    if (stack) {
+      const at = stack.indexOf(token);
+      if (at >= 0)
+        stack.splice(at, 1);
+      if (stack.length === 0)
+        this.recentTokens.delete(sessionID);
+    }
+    if (refs.size === 0)
+      this.runningBySession.delete(sessionID);
+  }
+  releaseToken(sessionID, token) {
+    const ref = this.runningBySession.get(sessionID)?.get(token);
+    if (!ref)
+      return;
+    if (ref.slot) {
+      const slot = this.seen.get(ref.slot);
+      if (slot?.counted === token)
+        slot.counted = undefined;
+    }
+    this.release(sessionID, token);
+  }
+  releaseMostRecent(sessionID) {
+    const stack = this.recentTokens.get(sessionID);
+    const token = stack?.[stack.length - 1];
+    if (token !== undefined)
+      this.releaseToken(sessionID, token);
+  }
+  releaseDirect(sessionID) {
+    const refs = this.runningBySession.get(sessionID);
+    const stack = this.recentTokens.get(sessionID);
+    if (!refs || !stack)
+      return;
+    for (let i = stack.length - 1;i >= 0; i--) {
+      if (!refs.get(stack[i])?.slot) {
+        this.releaseToken(sessionID, stack[i]);
+        return;
+      }
+    }
+  }
+  observe(event) {
+    const e = event;
+    const type = e?.type;
+    if (!type)
+      return;
+    const d = e?.data ?? {};
+    const p = e?.properties ?? {};
+    const pick = (k) => d[k] ?? p[k];
+    const id = pick("messageID") ?? pick("messageId") ?? pick("message")?.id ?? pick("info")?.id;
+    if (type.startsWith("session.execution.")) {
+      const sessionID = pick("sessionID");
+      if (sessionID) {
+        const continuation = id?.startsWith("msg_xgoal_") ? this.slot(id) : undefined;
+        const completed = type === "session.execution.succeeded" || type === "session.execution.failed";
+        if (continuation)
+          continuation.sessionID = sessionID;
+        if (type === "session.execution.started") {
+          if (continuation) {
+            if (!continuation.counted) {
+              continuation.counted = this.addBusy(sessionID, id);
+            }
+          } else {
+            this.addBusy(sessionID);
+          }
+        } else if (completed) {
+          if (continuation?.counted !== undefined) {
+            this.releaseToken(sessionID, continuation.counted);
+          } else if (continuation) {
+            this.releaseDirect(sessionID);
+          } else {
+            this.releaseMostRecent(sessionID);
+          }
+        }
+      }
+    }
+    if (!id || !id.startsWith("msg_xgoal_"))
+      return;
+    const s = this.slot(id);
+    switch (type) {
+      case "session.inbox.enqueued":
+        s.enqueued = true;
+        break;
+      case "session.inbox.delivered":
+        s.enqueued = true;
+        s.delivered = true;
+        break;
+      case "session.execution.started":
+        s.delivered = true;
+        s.running = true;
+        break;
+      case "session.execution.succeeded":
+      case "session.execution.failed":
+        s.finished = true;
+        s.running = false;
+        break;
+      default:
+        break;
+    }
+  }
+  probe(inboxID) {
+    const s = this.seen.get(inboxID);
+    if (!s)
+      return "unknown";
+    if (s.finished)
+      return "settled";
+    if (s.running)
+      return "running";
+    if (s.enqueued || s.delivered)
+      return "running";
+    return "unknown";
+  }
+  isBusy(sessionID) {
+    const refs = this.runningBySession.get(sessionID);
+    if (!refs || refs.size === 0)
+      return false;
+    const now = Date.now();
+    for (const ref of refs.values()) {
+      if (now - ref.startedMs < LIVE_WAIT_TTL_MS)
+        return true;
+    }
+    return false;
+  }
+  forget(inboxID) {
+    const slot = this.seen.get(inboxID);
+    if (slot?.counted !== undefined && slot.sessionID) {
+      this.releaseToken(slot.sessionID, slot.counted);
+    }
+    this.seen.delete(inboxID);
+  }
+}
+function classify(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  const status = error;
+  const code = status?.status ?? status?.statusCode;
+  if (typeof code === "number" && code >= 400 && code < 500 && code !== 408 && code !== 429) {
+    return { ok: false, retryable: false, error: message };
+  }
+  if (typeof code === "number" && code === 404) {
+    return { ok: false, retryable: false, error: message };
+  }
+  return { ok: false, retryable: true, error: message };
+}
+
+class SessionTransport {
+  observer;
+  send;
+  fetchState;
+  constructor(options) {
+    this.observer = options.observer;
+    this.send = options.send;
+    this.fetchState = options.fetchState;
+  }
+  async submit(input) {
+    try {
+      await this.send(input);
+      return { ok: true };
+    } catch (error) {
+      return classify(error);
+    }
+  }
+  liveWait(input) {
+    return this.observer.isBusy(input.sessionID);
+  }
+  async probe(input) {
+    const cached = this.observer.probe(input.round.inboxID);
+    if (cached === "settled") {
+      this.observer.forget(input.round.inboxID);
+      return "settled";
+    }
+    if (!this.fetchState)
+      return cached;
+    let state;
+    try {
+      state = await this.fetchState({ sessionID: input.sessionID });
+    } catch {
+      return cached;
+    }
+    const queued = state.inbox.some((item) => item.id === input.round.inboxID);
+    const isOwn = (message) => message.id === input.round.inboxID || message.metadata?.inboxID === input.round.inboxID || message.metadata?.roundID === input.round.id;
+    const index = state.messages.findIndex(isOwn);
+    if (index === -1) {
+      if (queued)
+        return "running";
+      return cached === "unknown" ? "unknown" : cached;
+    }
+    for (let i = index + 1;i < state.messages.length; i++) {
+      const message = state.messages[i];
+      const foreign = message.type === "user" && message.id !== input.round.inboxID && !isOwn(message);
+      if (foreign) {
+        return cached === "running" ? "running" : "unknown";
+      }
+      if (message.type === "idle") {
+        this.observer.forget(input.round.inboxID);
+        return "settled";
+      }
+      if (message.type === "assistant" && (message.finish === "stop" || message.finish === "length" || message.finish === "content-filter" || message.finish === "error")) {
+        this.observer.forget(input.round.inboxID);
+        return "settled";
+      }
+    }
+    return "running";
+  }
+}
 
 // src/rpc.ts
 var RPC_ID = "local.opencode-xgoal";
@@ -3023,6 +3252,8 @@ function describeDrive(outcome) {
       return `dispatch abandoned: ${outcome.detail}.`;
     case "limited":
       return `not dispatched: goal is ${outcome.status}.`;
+    case "waiting":
+      return `waiting on a background execution (recheck in ${Math.round((outcome.recheckMs ?? 30000) / 1000)}s): ${outcome.reason}.`;
     case "idle":
       return `not dispatched: ${outcome.reason}.`;
     default:
@@ -3580,11 +3811,13 @@ ${result.unmet.map((u) => `- ${u}`).join(`
               goalID: target.ref.goalID,
               generation: target.ref.generation
             });
-            if (out.rejected)
-              return { content: `Blocker report rejected: ${out.rejected}` };
+            if (out.rejected) {
+              const content = out.instruction ? `Blocker report rejected: ${out.instruction}` : `Blocker report rejected: ${out.rejected}`;
+              return { content, metadata: { confirmations: out.confirmations, status: out.goal?.status } };
+            }
             if (!out.accepted) {
               return {
-                content: "Blocker not accepted: no concrete external dependency was identified. The goal remains active — take the next useful action.",
+                content: "Blocker not accepted. The goal remains active — take the next useful action.",
                 metadata: { confirmations: out.confirmations, status: out.goal?.status }
               };
             }

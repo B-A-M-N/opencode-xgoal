@@ -79,23 +79,54 @@ export interface DriverOptions {
     evidenceCount: number;
     /** Verifiable evidence captured during this round specifically. */
     evidenceDelta: number;
+    /**
+     * Observations captured this round whose fingerprint was never seen
+     * before (audit-4 #9). Repetition of an earlier observation — the same
+     * command, same result — does not count. This, not `evidenceDelta`, is
+     * the honest progress signal.
+     */
+    newObservations: number;
     /** Is a background execution for this session still running? */
     liveWait: boolean;
   }) => { classification: "progress" | "verifiedWait" | "noProgress" | "blocked"; detail?: string };
+  /**
+   * How long a durable wait on a still-running background execution may last
+   * before the goal is re-evaluated and parked with an actionable reason
+   * (audit-4 #4). A safety net for stale liveness observations, mirroring the
+   * transport's staleness TTL — not a polling interval.
+   */
+  maxVerifiedWaitMs?: number;
+  /**
+   * Next-reconciliation interval persisted with a durable wait. The sweep,
+   * not this value, drives actual rechecks; this is the scheduling contract.
+   */
+  waitRecheckMs?: number;
 }
 
 const DEFAULT_CLASSIFY = ({
   evidenceDelta,
+  newObservations,
   liveWait,
 }: {
   evidenceDelta: number;
+  newObservations: number;
   liveWait: boolean;
 }): { classification: "progress" | "verifiedWait" | "noProgress"; detail?: string } => {
-  // A turn that produced no new machine-verifiable evidence is not progress,
-  // even if the model wrote a paragraph. This is what makes the stall policy
-  // meaningful instead of letting an active model reset the counter forever.
+  // Progress requires a NEW observation, not merely another evidence row
+  // (audit-4 #9): running `pwd` every round adds rows that all share one
+  // fingerprint and must never reset the stall counter. A failed test that
+  // appears for the first time, or a different investigation command, IS a
+  // new observation and counts.
+  if (newObservations > 0) {
+    return { classification: "progress", detail: `${newObservations} new observation(s)` };
+  }
+  // Rows were added, but every one of them repeats a known observation:
+  // bookkeeping noise, not progress.
   if (evidenceDelta > 0) {
-    return { classification: "progress", detail: `${evidenceDelta} new evidence item(s)` };
+    return {
+      classification: "noProgress",
+      detail: `${evidenceDelta} evidence row(s), all repeats of known observations`,
+    };
   }
   // No new evidence, but an execution is observably still running: waiting on
   // it is a verified wait, not an unproductive turn, so it must not accumulate
@@ -116,7 +147,13 @@ export type DriveOutcome =
   | { action: "unknown"; roundID: string; inboxID: string; detail: string }
   | { action: "failed"; roundID: string; inboxID: string; detail: string }
   | { action: "abandoned"; roundID: string; detail: string }
-  | { action: "reconcile"; roundID: string; status: string };
+  | { action: "reconcile"; roundID: string; status: string }
+  /**
+   * Durable wait (audit-4 #4): the goal is parked on an observable background
+   * execution. No continuation is minted; the sweep rechecks without tokens
+   * and wakes the goal when the awaited work is no longer running.
+   */
+  | { action: "waiting"; roundID: string; status: string; reason: string; recheckMs: number };
 
 let seq = 0;
 
@@ -149,6 +186,8 @@ export class GoalDriver {
   private readonly transport: ContinuationTransport;
   private readonly maxNoProgressRounds: number;
   private readonly maxRoundAttempts: number;
+  private readonly maxVerifiedWaitMs: number;
+  private readonly waitRecheckMs: number;
   private readonly render: (goal: Goal) => string;
   private readonly classify: NonNullable<DriverOptions["classify"]>;
 
@@ -161,6 +200,10 @@ export class GoalDriver {
     this.transport = transport;
     this.maxNoProgressRounds = options.maxNoProgressRounds ?? 3;
     this.maxRoundAttempts = options.maxRoundAttempts ?? 5;
+    // Aligned with the transport's 15-minute liveness staleness TTL: both are
+    // safety nets against stale observations, not polling intervals.
+    this.maxVerifiedWaitMs = options.maxVerifiedWaitMs ?? 15 * 60_000;
+    this.waitRecheckMs = options.waitRecheckMs ?? 30_000;
     this.render = options.renderContinuation ?? DEFAULT_CONTINUATION;
     this.classify = options.classify ?? DEFAULT_CLASSIFY;
   }
@@ -182,12 +225,74 @@ export class GoalDriver {
         const outcome = await this.reconcileRound(outstanding);
         if (outcome.action !== "reconcile") return outcome;
       }
+      // Durable wait (audit-4 #4): a wait is a scheduling decision, not a
+      // continuation. Recheck the awaited work here — a transport probe, no
+      // model tokens — and only wake the goal when the wait is over.
+      const wait = this.store.activeWait(goal.id);
+      if (wait) {
+        const outcome = await this.recheckWait(goal, wait);
+        if (outcome.action !== "reconcile") return outcome;
+      }
     }
 
     const decision = this.reserve(sessionID);
     if (decision.action !== "dispatch") return decision.outcome;
 
     return this.dispatch(decision.round, sessionID);
+  }
+
+  /**
+   * Recheck a durable wait (audit-4 #4) without consuming model tokens.
+   *
+   * While the awaited execution is observably still running and the wait is
+   * within its bound, the goal is left alone — no continuation is minted. When
+   * the work completes or fails, the wait clears and the goal wakes with a
+   * fresh continuation. When the wait exceeds its bound, the goal is parked
+   * with an actionable reason instead of being re-driven blindly.
+   */
+  private async recheckWait(
+    goal: Goal,
+    wait: { reason: string; startedMs: number; recheckMs: number },
+  ): Promise<DriveOutcome> {
+    const running = this.transport.liveWait?.({ sessionID: goal.sessionID }) ?? false;
+    const waitedMs = Math.max(0, Date.now() - wait.startedMs);
+
+    if (running && waitedMs < this.maxVerifiedWaitMs) {
+      return {
+        action: "waiting",
+        roundID: "",
+        status: goal.status,
+        reason: wait.reason,
+        recheckMs: wait.recheckMs,
+      };
+    }
+
+    // Either the awaited work is no longer running, or the wait exceeded its
+    // bound. Both retire the wait.
+    this.store.clearWait(goal.id);
+
+    if (running) {
+      // Still running beyond the bound: the liveness observation may be stale,
+      // or the job is very long. Either way, more blind waiting is wrong.
+      // Park the goal with an actionable reason; the user decides.
+      const parked = this.store.transition({
+        goalID: goal.id,
+        generation: goal.generation,
+        to: "stalled",
+        actor: "controller",
+        reason: `waiting on background execution exceeded ${Math.round(
+          this.maxVerifiedWaitMs / 1000,
+        )}s: ${wait.reason}`,
+      });
+      return { action: "limited", status: parked.status };
+    }
+
+    // The awaited work completed, failed, or is no longer observable. Wake the
+    // goal: the recheck itself consumed no tokens, the wake is a normal
+    // continuation.
+    const decision = this.reserve(goal.sessionID);
+    if (decision.action !== "dispatch") return decision.outcome;
+    return this.dispatch(decision.round, goal.sessionID);
   }
 
   /** Reserve phase. Pure store work; no I/O. */
@@ -328,6 +433,18 @@ export class GoalDriver {
     for (const round of this.store.outstandingRounds()) {
       out.push(await this.reconcileRound(round));
     }
+    // Durable waits (audit-4 #4): goals parked on a background execution have
+    // no outstanding round, so the loop above never sees them. Recheck each
+    // wait here — the awaited work may have completed, which wakes the goal.
+    for (const waiting of this.store.goalsWithActiveWaits()) {
+      const goal = this.store.byID(waiting.goalID);
+      if (!goal || goal.status !== "active") {
+        this.store.clearWait(waiting.goalID);
+        continue;
+      }
+      const wait = this.store.activeWait(waiting.goalID);
+      if (wait) out.push(await this.recheckWait(goal, wait));
+    }
     // A terminal delivery failure is deliberately NOT cleared here. Sweeping is
     // automatic; recovering a definitively rejected goal must not be. Without
     // this, every periodic sweep would erase the block the retry limit set and
@@ -371,12 +488,16 @@ export class GoalDriver {
         // and then continue the loop if the goal still has work.
         // Verifiable evidence only: checkpoint refs are model-annotated
         // pointers, and counting them would let a model manufacture "progress"
-        // by narrating instead of working.
-        const verifiable = this.store.listEvidence(goal.id).filter((e) => e.kind !== "ref");
+        // by narrating instead of working. Blocker reports are model-annotated
+        // claims for the same reason.
+        const verifiable = this.store
+          .listEvidence(goal.id)
+          .filter((e) => e.kind !== "ref" && e.kind !== "blocker-ref");
         const evidenceCount = verifiable.length;
         const evidenceDelta = Math.max(0, evidenceCount - round.evidenceBaseline);
+        const newObservations = this.store.countNewFingerprintEvidence(goal.id, round.preparedAtMs);
         const liveWait = this.transport.liveWait?.({ sessionID: goal.sessionID }) ?? false;
-        const verdict = this.classify({ goal, round, evidenceCount, evidenceDelta, liveWait });
+        const verdict = this.classify({ goal, round, evidenceCount, evidenceDelta, newObservations, liveWait });
         const settledGoal = this.settleRound({
           roundID: round.id,
           classification: verdict.classification,
@@ -408,6 +529,29 @@ export class GoalDriver {
           });
           return { action: "reconcile", roundID: round.id, status: parked.status };
         }
+        // Audit-4 #4: a verified wait is a scheduling decision, not a
+        // continuation trigger. Record what is awaited and when it will be
+        // rechecked, and stop spending model turns — the sweep rechecks the
+        // wait without tokens and wakes the goal when the work completes.
+        if (verdict.classification === "verifiedWait") {
+          const reason = verdict.detail ?? "background execution still running";
+          this.store.enterWait({
+            goalID: after.id,
+            generation: after.generation,
+            reason,
+            recheckMs: this.waitRecheckMs,
+          });
+          return {
+            action: "waiting",
+            roundID: round.id,
+            status: after.status,
+            reason,
+            recheckMs: this.waitRecheckMs,
+          };
+        }
+        // A productive round retires any lingering wait: whatever was awaited
+        // is no longer the scheduling question.
+        this.store.clearWait(after.id);
         const next = this.reserve(after.sessionID);
         if (next.action === "dispatch") return this.dispatch(next.round, after.sessionID);
         return next.outcome;
