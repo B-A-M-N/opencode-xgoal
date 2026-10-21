@@ -13,7 +13,7 @@
  */
 import type { GoalStore, GoalRound } from "./store.ts";
 import type { Goal } from "./state.ts";
-import type { CriterionSpec } from "./criteria.ts";
+import { normalizedCommand, type CriterionSpec } from "./criteria.ts";
 import { existsSync } from "node:fs";
 import { snapshotHash } from "./store.ts";
 import { hashFile, resolveWorkspacePath, sessionWorkspace } from "./workspace.ts";
@@ -265,8 +265,19 @@ export class GoalVerifier {
 
     // 2. Only machine-verifiable evidence counts. A "ref" is a model-provided
     //    pointer and is never sufficient on its own.
+    //
+    //    The gate is per criterion, not global: a goal with criteria that have
+    //    an independent proof path (a file spec re-checked against the world,
+    //    or an objective resolvable by user acceptance) is evaluated
+    //    criterion-by-criterion even when nothing was captured — user
+    //    acceptance of an otherwise-unresolved objective must not be refused
+    //    wholesale for lack of command rows. The early refusal remains for
+    //    goals whose criteria all depend on bound evidence.
     const verifiable = evidence.filter((e) => e.kind !== "ref");
-    if (verifiable.length === 0) {
+    const hasIndependentProofPath = criteria.some(
+      (c) => c.spec?.type === "file" || c.spec?.type === "objective",
+    );
+    if (verifiable.length === 0 && !hasIndependentProofPath) {
       return {
         verdict: "incomplete",
         unmet: ["no machine-verifiable evidence submitted"],
@@ -327,22 +338,31 @@ export class GoalVerifier {
       }
 
       if (criterion.spec?.type === "command" || criterion.spec?.type === "test") {
-        // A command criterion is proven by a bound command/test execution that
-        // actually exited with the expected status.
+        // A command criterion is proven by a bound run of the required
+        // command itself — matched by the explicit normalization policy —
+        // that actually exited with the expected status. A successful
+        // unrelated command proves nothing about this requirement.
         const expected = criterion.spec.type === "test" ? 0 : (criterion.spec.expectExit ?? 0);
+        const required = normalizedCommand(criterion.spec.command);
         const proof = bound.filter(
-          (e) => (e.kind === "command" || e.kind === "test") && e.exitCode === expected,
+          (e) =>
+            (e.kind === "command" || e.kind === "test") &&
+            e.exitCode === expected &&
+            normalizedCommand(e.ref) === required,
         );
         if (proof.length === 0) {
+          const ran = bound.filter((e) => e.kind === "command" || e.kind === "test");
           proofs.push({
             criterionID: criterion.id,
             evidenceIDs: [],
             validatorID: "spec.command",
             verdict: "fail",
-            detail: `no bound command/test evidence exited ${expected}`,
+            detail: ran.some((e) => e.exitCode === expected)
+              ? `${ran.length} bound run(s) exited ${expected}, but none was the required command`
+              : `no bound command/test evidence exited ${expected}`,
           });
           unmet.push(
-            `criterion not evidenced: ${criterion.text} (no bound command/test exited ${expected})`,
+            `criterion not evidenced: ${criterion.text} (a run of "${criterion.spec.command}" exiting ${expected} was not observed)`,
           );
         } else {
           proofs.push({
@@ -429,7 +449,10 @@ export class GoalVerifier {
     return {
       verdict: "complete",
       unmet: [],
-      reason: `objective satisfied: ${criteria.length} criteria covered by ${verifiable.length} validated evidence item(s)`,
+      reason:
+        verifiable.length === 0
+          ? `objective satisfied: ${criteria.length} criteria established by independent checks and user acceptance`
+          : `objective satisfied: ${criteria.length} criteria covered by ${verifiable.length} validated evidence item(s)`,
       proofs,
       snapshot,
     };

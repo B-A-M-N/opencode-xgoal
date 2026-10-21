@@ -586,3 +586,103 @@ describe("completion commits only the snapshot that was verified", () => {
     expect(done.status).toBe("complete");
   });
 });
+
+// Audit-3 #2: a command criterion must verify the command that ran, not just
+// that something bound to the criterion exited with the expected status.
+describe("command criteria verify the command that ran", () => {
+  test("an unrelated successful command cannot satisfy a command criterion", async () => {
+    const goal = store.create({ sessionID: "ses_a", objective: "keep the suite green" });
+    const criterionID = store.addCriterion(goal.id, "the suite is green", {
+      type: "test",
+      command: "bun test",
+    });
+    store.addEvidence({
+      goalID: goal.id,
+      criterionID,
+      kind: "command",
+      ref: "echo ok",
+      detail: "exit 0",
+      exitCode: 0,
+    });
+
+    const verifier = new GoalVerifier(store, validator());
+    const result = await verifier.verify(goal.id);
+    expect(result.verdict).toBe("incomplete");
+    expect(result.unmet.some((u) => u.includes("bun test"))).toBe(true);
+  });
+
+  test("a run of the required command with the expected exit proves it", async () => {
+    const goal = store.create({ sessionID: "ses_a", objective: "keep the suite green" });
+    const criterionID = store.addCriterion(goal.id, "the suite is green", {
+      type: "test",
+      command: "bun test",
+    });
+    store.addEvidence({
+      goalID: goal.id,
+      criterionID,
+      kind: "test",
+      ref: "bun test",
+      detail: "exit 0",
+      exitCode: 0,
+    });
+
+    const verifier = new GoalVerifier(store, validator());
+    const result = await verifier.verify(goal.id);
+    expect(result.verdict).toBe("complete");
+  });
+
+  test("the required command with an unexpected exit does not prove it", async () => {
+    const goal = store.create({ sessionID: "ses_a", objective: "keep the suite green" });
+    const criterionID = store.addCriterion(goal.id, "the suite is green", {
+      type: "test",
+      command: "bun test",
+    });
+    store.addEvidence({
+      goalID: goal.id,
+      criterionID,
+      kind: "test",
+      ref: "bun test",
+      detail: "exit 1",
+      exitCode: 1,
+    });
+
+    const verifier = new GoalVerifier(store, validator());
+    const result = await verifier.verify(goal.id);
+    expect(result.verdict).toBe("incomplete");
+  });
+
+  test("command identity is matched under the explicit whitespace policy", async () => {
+    const goal = store.create({ sessionID: "ses_a", objective: "lint is clean" });
+    const criterionID = store.addCriterion(goal.id, "lint passes", {
+      type: "command",
+      command: "bun run lint",
+    });
+    store.addEvidence({
+      goalID: goal.id,
+      criterionID,
+      kind: "command",
+      ref: "bun  run\tlint",
+      detail: "exit 0",
+      exitCode: 0,
+    });
+
+    const verifier = new GoalVerifier(store, validator());
+    expect((await verifier.verify(goal.id)).verdict).toBe("complete");
+
+    // A different command composition is a different command, however it
+    // exited — no shell-string canonicalization.
+    const other = store.addCriterion(goal.id, "typed lint passes", {
+      type: "command",
+      command: "cd src && bun run lint",
+    });
+    store.addEvidence({
+      goalID: goal.id,
+      criterionID: other,
+      kind: "command",
+      ref: "bun run lint",
+      detail: "exit 0",
+      exitCode: 0,
+    });
+    expect((await verifier.verify(goal.id)).verdict).toBe("incomplete");
+  });
+});

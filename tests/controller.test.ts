@@ -6,7 +6,7 @@
  * is not a blocker.
  */
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GoalController } from "../src/controller/controller.ts";
@@ -467,6 +467,156 @@ describe("criterion refinement is additive, idempotent and fenced", () => {
 
     expect(out.rejected).toContain("cannot be superseded");
     expect(controller.store.listCriteria(goal.id).map((c) => c.id)).toContain(userCriterion.id);
+  });
+
+  // Audit-3 #5: requirements extracted from the user's objective (numbered
+  // items included) were labeled "derived" and were therefore retireable by
+  // the model via goal_supersede_criterion. Their origin is the user's.
+  test("a requirement derived from the user's objective cannot be retired by the model", () => {
+    const goal = start(
+      ["Complete all of the following:", "1. Create a file called a.txt containing exactly: alpha", "2. The changelog documents the fix"].join("\n"),
+    );
+    const changelog = controller.store
+      .listCriteria(goal.id)
+      .find((c) => c.text.includes("changelog"))!;
+    // The auditor's repro: the requirement was stored with user authority.
+    expect(changelog.source).toBe("user");
+
+    const out = controller.supersedeCriterion("ses_a", {
+      ...ref(),
+      criterion_id: changelog.id,
+      reason: "documentation is out of scope",
+    });
+    expect(out.rejected).toContain("cannot be superseded");
+    expect(controller.store.listCriteria(goal.id).map((c) => c.id)).toContain(changelog.id);
+  });
+
+  test("completion stays impossible while the user requirement stands", async () => {
+    const { GoalVerifier } = await import("../src/controller/verification.ts");
+    const goal = start(
+      [
+        "Complete all of the following:",
+        "1. Create a file called a.txt containing exactly: alpha",
+        "2. Create a file called CHANGELOG.md",
+      ].join("\n"),
+    );
+    const changelog = controller.store
+      .listCriteria(goal.id)
+      .find((c) => c.text.includes("CHANGELOG.md"))!;
+    controller.supersedeCriterion("ses_a", {
+      ...ref(),
+      criterion_id: changelog.id,
+      reason: "documentation is out of scope",
+    });
+
+    // The a.txt requirement is satisfied and the objective accepted — but the
+    // changelog requirement stands, so completion is refused.
+    const workspace = mkdtempSync(join(tmpdir(), "xgoal-authority-"));
+    try {
+      writeFileSync(join(workspace, "a.txt"), "alpha");
+      const verifier = new GoalVerifier(controller.store, {
+        validate: async () => ({ valid: true, reason: "ok" }),
+        checkSpec: async (criterion) => {
+          if (criterion.spec?.type !== "file") {
+            return { valid: false, reason: "no independent check" };
+          }
+          const resolved = join(workspace, criterion.spec.path);
+          if (criterion.spec.equals === undefined && criterion.spec.contains === undefined) {
+            return existsSync(resolved)
+              ? { valid: true, reason: "exists" }
+              : { valid: false, reason: `file not found: ${criterion.spec.path}` };
+          }
+          const content = readFileSync(resolved, "utf8");
+          return content === criterion.spec.equals
+            ? { valid: true, reason: "exact" }
+            : { valid: false, reason: "content differs" };
+        },
+      });
+      // The user accepts the objective — acceptance must not waive the
+      // unsatisfied explicit file requirement.
+      controller.acceptObjective("ses_a");
+      const result = await verifier.verify(goal.id);
+      expect(result.verdict).toBe("incomplete");
+      expect(result.unmet.some((u) => u.toLowerCase().includes("changelog"))).toBe(true);
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  test("a proposed replacement that preserves the obligation is accepted", () => {
+    const goal = start("Create a file called a.txt containing exactly: alpha");
+    const original = controller.store.listCriteria(goal.id).find((c) => c.spec?.type === "file")!;
+
+    const out = controller.supersedeCriterion("ses_a", {
+      ...ref(),
+      criterion_id: original.id,
+      reason: "the objective's phrasing was a paraphrase; the user's list says exactly this",
+      replacement: {
+        text: "a.txt must be exactly: alpha",
+        spec: { type: "file", path: "a.txt", equals: "alpha" },
+      },
+    });
+    expect(out.superseded).toBe(true);
+
+    // The replacement is user-authoritative and gates verification; the
+    // original row is retained only for the audit trail.
+    const criteria = controller.store.listCriteria(goal.id);
+    expect(criteria.map((c) => c.id)).not.toContain(original.id);
+    const replacement = criteria.find((c) => c.text === "a.txt must be exactly: alpha")!;
+    expect(replacement.source).toBe("user");
+    expect(replacement.spec).toEqual({ type: "file", path: "a.txt", equals: "alpha" });
+  });
+
+  test("an empty replacement proposal is refused", () => {
+    const goal = start("Create a file called a.txt containing exactly: alpha");
+    const original = controller.store.listCriteria(goal.id).find((c) => c.spec?.type === "file")!;
+    const out = controller.supersedeCriterion("ses_a", {
+      ...ref(),
+      criterion_id: original.id,
+      reason: "typo",
+      replacement: { text: "   ", spec: { type: "file", path: "a.txt", equals: "alpha" } },
+    });
+    expect(out.rejected).toContain("non-empty text");
+    expect(controller.store.listCriteria(goal.id).map((c) => c.id)).toContain(original.id);
+  });
+
+  test("a weakening replacement proposal is refused", () => {
+    const goal = start("Create a file called a.txt containing exactly: alpha");
+    const original = controller.store.listCriteria(goal.id).find((c) => c.spec?.type === "file")!;
+
+    const out = controller.supersedeCriterion("ses_a", {
+      ...ref(),
+      criterion_id: original.id,
+      reason: "a prefix should be enough",
+      replacement: {
+        text: "a.txt contains al",
+        spec: { type: "file", path: "a.txt", contains: "al" },
+      },
+    });
+    expect(out.rejected).toContain("does not preserve");
+    expect(controller.store.listCriteria(goal.id).map((c) => c.id)).toContain(original.id);
+  });
+
+  test("legacy derived rows are normalized to user authority on reopen", () => {
+    // Rows stored as "derived" by older versions all came from the user's
+    // objective; on upgrade they must gain user authority and protection.
+    const goal = start("Create a file called a.txt containing exactly: alpha");
+    controller.store.db
+      .query(`UPDATE goal_criteria SET source = 'derived' WHERE goal_id = ?`)
+      .run(goal.id);
+    controller.close();
+    controller = new GoalController({ dbPath: join(dir, "goals.db") });
+
+    const sources = controller.store.listCriteria(goal.id).map((c) => c.source);
+    expect(sources.length).toBeGreaterThan(0);
+    expect(sources.every((s) => s === "user")).toBe(true);
+    const original = controller.store.listCriteria(goal.id)[0];
+    const out = controller.supersedeCriterion("ses_a", {
+      ...ref(),
+      criterion_id: original.id,
+      reason: "inconvenient",
+    });
+    expect(out.rejected).toContain("cannot be superseded");
   });
 
   test("a superseded criterion no longer blocks verification", async () => {

@@ -13,6 +13,12 @@
  * explicit user acceptance. The original objective is never rewritten,
  * and derived criteria are additive — the model may refine them during
  * investigation but may not remove an explicit requirement to pass.
+ *
+ * Authority is a property of the requirement's origin, not of the parsing
+ * mechanism: every criterion this module extracts comes from the user's own
+ * objective text, so it carries `source: "user"`. The model may not retire it
+ * (see `supersedeCriterion`); it may only propose a replacement that provably
+ * preserves the obligation (see `preservesObligation`).
  */
 
 /** A machine-checkable criterion specification. */
@@ -33,9 +39,72 @@ export type CriterionSpec =
   /** Human judgement; requires explicitly bound evidence. */
   | { type: "manual" };
 
+/**
+ * Explicit normalization policy for command identity: trim and collapse runs
+ * of internal whitespace. Deliberately NOT shell-string canonicalization —
+ * `bun  test` and `bun test` are the same command as written, but
+ * `cd x && bun test` is a different command and must not match.
+ */
+export function normalizedCommand(command: string): string {
+  return command.trim().replace(/\s+/g, " ");
+}
+
+/**
+ * Can `newSpec` replace `oldSpec` without weakening what the user required?
+ *
+ * Used when the model proposes correcting a misparsed user requirement: the
+ * replacement is accepted only if everything the old spec accepted, the new
+ * spec rejects — i.e. the obligation is preserved or narrowed. Specifications
+ * that cannot be compared mechanically (objective, manual, type changes)
+ * cannot be established to preserve anything and are refused; the user must
+ * authorize those.
+ *
+ * File specs, same path:
+ *  - equals X  → preserved only by the identical equals X
+ *  - contains X → preserved by equals Y when Y includes X, or by contains Y
+ *    when Y includes X (every string containing Y then contains X)
+ *  - existence only → preserved by any content spec on the same path
+ *
+ * Command/test specs: preserved only by the identical normalized command
+ * (and expected exit, for command specs).
+ */
+export function preservesObligation(
+  oldSpec: CriterionSpec | undefined,
+  newSpec: CriterionSpec | undefined,
+): boolean {
+  if (!oldSpec || !newSpec || oldSpec.type !== newSpec.type) return false;
+  if (oldSpec.type === "file" && newSpec.type === "file") {
+    if (oldSpec.path !== newSpec.path) return false;
+    if (oldSpec.equals !== undefined) return newSpec.equals === oldSpec.equals;
+    if (oldSpec.contains !== undefined) {
+      if (newSpec.equals !== undefined) return newSpec.equals.includes(oldSpec.contains);
+      if (newSpec.contains !== undefined) return newSpec.contains.includes(oldSpec.contains);
+      return false;
+    }
+    // Existence-only: any same-path spec that also checks content is stricter.
+    return newSpec.equals !== undefined || newSpec.contains !== undefined;
+  }
+  if (oldSpec.type === "command" && newSpec.type === "command") {
+    return (
+      normalizedCommand(oldSpec.command) === normalizedCommand(newSpec.command) &&
+      (oldSpec.expectExit ?? 0) === (newSpec.expectExit ?? 0)
+    );
+  }
+  if (oldSpec.type === "test" && newSpec.type === "test") {
+    return normalizedCommand(oldSpec.command) === normalizedCommand(newSpec.command);
+  }
+  // objective/manual/spec-type changes: preservation cannot be established.
+  return false;
+}
+
 export interface DerivedCriterion {
   text: string;
   spec: CriterionSpec;
+  /**
+   * The requirement's authority origin. Criteria extracted from the user's
+   * objective are "user" regardless of how they were parsed; "model" marks
+   * requirements the model established during investigation.
+   */
   source: "derived" | "user" | "model";
 }
 
@@ -43,7 +112,7 @@ export interface DerivedCriterion {
 export interface CriterionInput {
   text: string;
   spec?: CriterionSpec;
-  /** "derived" marks criteria synthesized from the objective, not stated. */
+  /** Authority origin: the user's objective, or a model-added requirement. */
   source?: "derived" | "user" | "model";
 }
 
@@ -53,9 +122,37 @@ const FILE_NAME = "[\\w./\\-]+\\.[A-Za-z0-9]+";
 // `v1.2`), so sentence punctuation is stripped after capture instead.
 const PATH_TOKEN = "(`[^`]+`|\"[^\"]+\"|'[^']+'|[^\\s,;]+)";
 const CONTENT_TOKEN = "(`[^`]+`|\"[^\"]+\"|'[^']+'|[^.;\\n]+)";
+// The "exactly" modifier is captured, not consumed: an exact requirement
+// emits an `equals` spec, whose match is byte-exact, not a substring test.
+const EXACTLY_TOKEN = "((?:exactly:?\\s+)?)";
 // A bare "create X" only names a file when X looks like one. Requiring an
 // extension prevents "make the tests pass" from becoming a file criterion.
 const PATH_NAME = `(${FILE_NAME}|\`[^\`]+\`|"[^"]+"|'[^']+')`;
+
+function strip(value: string | undefined, exact = false): string {
+  if (!value) return "";
+  const trimmed = value.trim();
+  // Quoted values are literal. An exact requirement keeps the inner content
+  // verbatim — significant whitespace is material to an exact match.
+  if (/^([`"']).*\1$/s.test(trimmed)) {
+    const inner = trimmed.slice(1, -1);
+    return exact ? inner : inner.trim();
+  }
+  // Unquoted values end at sentence punctuation, which is prose formatting
+  // rather than content. Quoting is how a user makes punctuation or
+  // whitespace material to the requirement. Stripping here can only make
+  // verification stricter, never weaker.
+  return trimmed.replace(/[.!?]+$/, "");
+}
+
+/** Build a file spec from a parsed path/content pair, honoring `exactly`. */
+function fileSpec(path: string, exact: boolean, content: string): CriterionSpec | undefined {
+  if (!path) return undefined;
+  if (!content) return { type: "file", path };
+  // "write alpha to a.txt" has no `exactly` modifier; substring is the
+  // conservative reading (a conventional trailing newline must not fail it).
+  return exact ? { type: "file", path, equals: content } : { type: "file", path, contains: content };
+}
 
 /**
  * Objective patterns that name a concrete file requirement. Each returns a
@@ -68,14 +165,14 @@ const FILE_PATTERNS: Array<{ re: RegExp; build: (m: RegExpMatchArray) => Criteri
     // "create a file called a.txt containing exactly: alpha"
     // "create src/mod.js that exports a function named add"
     re: new RegExp(
-      `(?:create|write|make|add)\\s+(?:a\\s+|the\\s+)?(?:file\\s+)?(?:called\\s+|named\\s+)?${PATH_TOKEN}\\s+(?:containing|with|that contains|that has|must contain|contains)\\s+(?:exactly:?\\s+)?${CONTENT_TOKEN}`,
+      `(?:create|write|make|add)\\s+(?:a\\s+|the\\s+)?(?:file\\s+)?(?:called\\s+|named\\s+)?${PATH_TOKEN}\\s+(?:containing|with|that contains|that has|must contain|contains)\\s+${EXACTLY_TOKEN}${CONTENT_TOKEN}`,
       "gi",
     ),
     build: (m) => {
       const path = strip(m[1]);
-      const content = strip(m[2]);
-      if (!path) return undefined;
-      return { type: "file", path, contains: content || undefined };
+      const exact = Boolean(m[2]);
+      const content = strip(m[3], exact);
+      return fileSpec(path, exact, content);
     },
   },
   {
@@ -84,18 +181,17 @@ const FILE_PATTERNS: Array<{ re: RegExp; build: (m: RegExpMatchArray) => Criteri
     build: (m) => {
       const content = strip(m[1]);
       const path = strip(m[2]);
-      if (!path) return undefined;
-      return { type: "file", path, contains: content || undefined };
+      return fileSpec(path, false, content);
     },
   },
   {
     // "a.txt must contain alpha" / "a.txt contains alpha"
-    re: new RegExp(`${FILE_NAME}\\s+(?:must\\s+)?(?:contain|include|have)\\s+(?:exactly:?\\s+)?${CONTENT_TOKEN}`, "gi"),
+    re: new RegExp(`${FILE_NAME}\\s+(?:must\\s+)?(?:contain|include|have)\\s+${EXACTLY_TOKEN}${CONTENT_TOKEN}`, "gi"),
     build: (m) => {
       const path = strip(m[0].split(/\s+/)[0]);
-      const content = strip(m[1]);
-      if (!path) return undefined;
-      return { type: "file", path, contains: content || undefined };
+      const exact = Boolean(m[1]);
+      const content = strip(m[2], exact);
+      return fileSpec(path, exact, content);
     },
   },
   {
@@ -108,15 +204,6 @@ const FILE_PATTERNS: Array<{ re: RegExp; build: (m: RegExpMatchArray) => Criteri
     },
   },
 ];
-
-function strip(value: string | undefined): string {
-  if (!value) return "";
-  const trimmed = value.trim();
-  // Quoted values are literal: keep punctuation inside the quotes.
-  if (/^([`"']).*\1$/s.test(trimmed)) return trimmed.slice(1, -1).trim();
-  // Unquoted values end at sentence punctuation.
-  return trimmed.replace(/[.!?]+$/, "");
-}
 
 /**
  * Derive preliminary acceptance criteria from an objective.
@@ -153,7 +240,20 @@ export function deriveCriteria(objective: string): DerivedCriterion[] {
     const key = `${spec.type}::${criterionText}`;
     if (seen.has(key)) return;
     seen.add(key);
-    criteria.push({ text: criterionText, spec, source: "derived" });
+    // Authority follows origin: everything here was extracted from the
+    // user's own objective, so it carries the user's authority even though
+    // a regex produced the spec. See preservesObligation for the model's
+    // correction path.
+    criteria.push({ text: criterionText, spec, source: "user" });
+  };
+
+  const contentOf = (spec: CriterionSpec): string | undefined =>
+    spec.type === "file" ? (spec.contains ?? spec.equals) : undefined;
+  const contentText = (spec: CriterionSpec, content: string): string => {
+    if (spec.type !== "file") return content;
+    return spec.equals !== undefined
+      ? `${spec.path} must be exactly: ${content}`
+      : `${spec.path} contains ${content}`;
   };
 
   const targets = enumerated ? listLines : [text];
@@ -168,20 +268,21 @@ export function deriveCriteria(objective: string): DerivedCriterion[] {
       for (const match of target.matchAll(re)) {
         const spec = build(match);
         if (!spec || spec.type !== "file") continue;
-        const content = "contains" in spec ? spec.contains : undefined;
+        const content = contentOf(spec);
         if (!content) continue;
         matched = true;
         contentPaths.add(spec.path);
-        push(`${spec.path} contains ${content}`, spec);
+        push(contentText(spec, content), spec);
       }
     }
     // Second pass: existence-only requirements, unless a content criterion
-    // already covers the same path.
+    // already covers the same path — an existence-only criterion must never
+    // sit beside a stronger content requirement for the same file.
     for (const { re, build } of FILE_PATTERNS) {
       for (const match of target.matchAll(re)) {
         const spec = build(match);
         if (!spec || spec.type !== "file") continue;
-        if ("contains" in spec && spec.contains) continue;
+        if (contentOf(spec)) continue;
         if (contentPaths.has(spec.path)) continue;
         matched = true;
         push(`${spec.path} exists`, spec);

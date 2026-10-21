@@ -88,6 +88,157 @@ function isNonTerminal(status) {
   return NON_TERMINAL_STATUSES.includes(status);
 }
 
+// src/controller/criteria.ts
+function normalizedCommand(command) {
+  return command.trim().replace(/\s+/g, " ");
+}
+function preservesObligation(oldSpec, newSpec) {
+  if (!oldSpec || !newSpec || oldSpec.type !== newSpec.type)
+    return false;
+  if (oldSpec.type === "file" && newSpec.type === "file") {
+    if (oldSpec.path !== newSpec.path)
+      return false;
+    if (oldSpec.equals !== undefined)
+      return newSpec.equals === oldSpec.equals;
+    if (oldSpec.contains !== undefined) {
+      if (newSpec.equals !== undefined)
+        return newSpec.equals.includes(oldSpec.contains);
+      if (newSpec.contains !== undefined)
+        return newSpec.contains.includes(oldSpec.contains);
+      return false;
+    }
+    return newSpec.equals !== undefined || newSpec.contains !== undefined;
+  }
+  if (oldSpec.type === "command" && newSpec.type === "command") {
+    return normalizedCommand(oldSpec.command) === normalizedCommand(newSpec.command) && (oldSpec.expectExit ?? 0) === (newSpec.expectExit ?? 0);
+  }
+  if (oldSpec.type === "test" && newSpec.type === "test") {
+    return normalizedCommand(oldSpec.command) === normalizedCommand(newSpec.command);
+  }
+  return false;
+}
+var FILE_NAME = "[\\w./\\-]+\\.[A-Za-z0-9]+";
+var PATH_TOKEN = "(`[^`]+`|\"[^\"]+\"|'[^']+'|[^\\s,;]+)";
+var CONTENT_TOKEN = "(`[^`]+`|\"[^\"]+\"|'[^']+'|[^.;\\n]+)";
+var EXACTLY_TOKEN = "((?:exactly:?\\s+)?)";
+var PATH_NAME = `(${FILE_NAME}|\`[^\`]+\`|"[^"]+"|'[^']+')`;
+function strip(value, exact = false) {
+  if (!value)
+    return "";
+  const trimmed = value.trim();
+  if (/^([`"']).*\1$/s.test(trimmed)) {
+    const inner = trimmed.slice(1, -1);
+    return exact ? inner : inner.trim();
+  }
+  return trimmed.replace(/[.!?]+$/, "");
+}
+function fileSpec(path, exact, content) {
+  if (!path)
+    return;
+  if (!content)
+    return { type: "file", path };
+  return exact ? { type: "file", path, equals: content } : { type: "file", path, contains: content };
+}
+var FILE_PATTERNS = [
+  {
+    re: new RegExp(`(?:create|write|make|add)\\s+(?:a\\s+|the\\s+)?(?:file\\s+)?(?:called\\s+|named\\s+)?${PATH_TOKEN}\\s+(?:containing|with|that contains|that has|must contain|contains)\\s+${EXACTLY_TOKEN}${CONTENT_TOKEN}`, "gi"),
+    build: (m) => {
+      const path = strip(m[1]);
+      const exact = Boolean(m[2]);
+      const content = strip(m[3], exact);
+      return fileSpec(path, exact, content);
+    }
+  },
+  {
+    re: new RegExp(`write\\s+${CONTENT_TOKEN}\\s+(?:to|into)\\s+${PATH_TOKEN}`, "gi"),
+    build: (m) => {
+      const content = strip(m[1]);
+      const path = strip(m[2]);
+      return fileSpec(path, false, content);
+    }
+  },
+  {
+    re: new RegExp(`${FILE_NAME}\\s+(?:must\\s+)?(?:contain|include|have)\\s+${EXACTLY_TOKEN}${CONTENT_TOKEN}`, "gi"),
+    build: (m) => {
+      const path = strip(m[0].split(/\s+/)[0]);
+      const exact = Boolean(m[1]);
+      const content = strip(m[2], exact);
+      return fileSpec(path, exact, content);
+    }
+  },
+  {
+    re: new RegExp(`(?:create|write|make|add)\\s+(?:a\\s+|the\\s+)?(?:file\\s+)?(?:called\\s+|named\\s+)?${PATH_NAME}`, "gi"),
+    build: (m) => {
+      const path = strip(m[1]);
+      if (!path)
+        return;
+      return { type: "file", path };
+    }
+  }
+];
+function deriveCriteria(objective) {
+  const text = objective.trim();
+  if (!text)
+    return [];
+  const rawLines = text.split(/\n+/);
+  const listLines = rawLines.filter((line) => /^\s*(?:\d+[.)]|[-*+])\s*/.test(line)).map((line) => line.replace(/^\s*(?:\d+[.)]|[-*+])\s*/, "").trim()).filter((line) => line.length > 0);
+  const allLines = rawLines.map((line) => line.replace(/^\s*(?:\d+[.)]|[-*+])\s*/, "").trim()).filter((line) => line.length > 0);
+  const enumerated = listLines.length > 1 && listLines.length >= Math.ceil(allLines.length / 2);
+  const criteria = [];
+  const seen = new Set;
+  const push = (criterionText, spec) => {
+    const key = `${spec.type}::${criterionText}`;
+    if (seen.has(key))
+      return;
+    seen.add(key);
+    criteria.push({ text: criterionText, spec, source: "user" });
+  };
+  const contentOf = (spec) => spec.type === "file" ? spec.contains ?? spec.equals : undefined;
+  const contentText = (spec, content) => {
+    if (spec.type !== "file")
+      return content;
+    return spec.equals !== undefined ? `${spec.path} must be exactly: ${content}` : `${spec.path} contains ${content}`;
+  };
+  const targets = enumerated ? listLines : [text];
+  const contentPaths = new Set;
+  for (const target of targets) {
+    let matched = false;
+    for (const { re, build } of FILE_PATTERNS) {
+      for (const match of target.matchAll(re)) {
+        const spec = build(match);
+        if (!spec || spec.type !== "file")
+          continue;
+        const content = contentOf(spec);
+        if (!content)
+          continue;
+        matched = true;
+        contentPaths.add(spec.path);
+        push(contentText(spec, content), spec);
+      }
+    }
+    for (const { re, build } of FILE_PATTERNS) {
+      for (const match of target.matchAll(re)) {
+        const spec = build(match);
+        if (!spec || spec.type !== "file")
+          continue;
+        if (contentOf(spec))
+          continue;
+        if (contentPaths.has(spec.path))
+          continue;
+        matched = true;
+        push(`${spec.path} exists`, spec);
+      }
+    }
+    if (!matched) {
+      push(`The requirement is achieved: ${target}`, { type: "objective" });
+    }
+  }
+  if (criteria.length === 0) {
+    push(`The objective is achieved: ${text}`, { type: "objective" });
+  }
+  return criteria;
+}
+
 // src/controller/store.ts
 class GoalConflictError extends Error {
   constructor(message) {
@@ -160,10 +311,12 @@ CREATE TABLE IF NOT EXISTS goal_criteria (
   -- verified independently of any evidence the model claims; a criterion
   -- without one still requires explicitly bound evidence.
   spec        TEXT,
-  -- Who established the criterion: derived from the objective, an explicit
-  -- user requirement, or a model refinement. Never removed to pass
-  -- verification.
-  source      TEXT NOT NULL DEFAULT 'derived',
+  -- Who established the criterion: the user's objective (including
+  -- requirements the controller extracted from it), an explicit user
+  -- addition, or a model refinement. User-authoritative rows are never
+  -- removed to pass verification. Historical "derived" rows are normalized
+  -- to "user" by migrate() on open.
+  source      TEXT NOT NULL DEFAULT 'user',
   met         INTEGER NOT NULL DEFAULT 0,
   -- A derived/model criterion that investigation proved wrong is superseded,
   -- not deleted: the row stays for the audit trail but no longer gates
@@ -359,6 +512,7 @@ class GoalStore {
     if (!columns.includes("superseded")) {
       this.db.exec(`ALTER TABLE goal_criteria ADD COLUMN superseded INTEGER NOT NULL DEFAULT 0`);
     }
+    this.db.query(`UPDATE goal_criteria SET source = 'user' WHERE source = 'derived'`).run();
   }
   close() {
     this.db.close();
@@ -596,13 +750,28 @@ class GoalStore {
     });
     return id;
   }
-  supersedeCriterion(criterionID, reason) {
+  supersedeCriterion(criterionID, reason, replacement) {
     this.tx(() => {
-      const row = this.db.query(`SELECT goal_id, generation, source, superseded FROM goal_criteria WHERE id = ?`).get(criterionID);
+      const row = this.db.query(`SELECT goal_id, generation, source, spec, superseded FROM goal_criteria WHERE id = ?`).get(criterionID);
       if (!row)
         throw new GoalConflictError(`unknown criterion ${criterionID}`);
       if (row.source === "user") {
-        throw new TransitionRejectedError("an explicit user requirement cannot be superseded; it must be satisfied or the objective replaced");
+        if (!replacement) {
+          throw new TransitionRejectedError("an explicit user requirement cannot be superseded; it must be satisfied, or the user must replace the objective");
+        }
+        const oldSpec = row.spec ? JSON.parse(row.spec) : undefined;
+        if (!preservesObligation(oldSpec, replacement.spec)) {
+          throw new TransitionRejectedError("the proposed replacement does not preserve the original obligation; ask the user to authorize the change");
+        }
+        if (row.superseded === 1)
+          return;
+        this.db.query(`UPDATE goal_criteria SET superseded = 1, met = 0 WHERE id = ?`).run(criterionID);
+        this.insertCriterion(row.goal_id, row.generation, { text: replacement.text, spec: replacement.spec, source: "user" }, Date.now());
+        this.appendEvent(row.goal_id, row.generation, "criterion-superseded", {
+          actor: "controller",
+          detail: `model-proposed replacement preserved the obligation: ${reason.slice(0, 240)}`
+        });
+        return;
       }
       if (row.superseded === 1)
         return;
@@ -1013,117 +1182,6 @@ function toRound(r) {
   };
 }
 
-// src/controller/criteria.ts
-var FILE_NAME = "[\\w./\\-]+\\.[A-Za-z0-9]+";
-var PATH_TOKEN = "(`[^`]+`|\"[^\"]+\"|'[^']+'|[^\\s,;]+)";
-var CONTENT_TOKEN = "(`[^`]+`|\"[^\"]+\"|'[^']+'|[^.;\\n]+)";
-var PATH_NAME = `(${FILE_NAME}|\`[^\`]+\`|"[^"]+"|'[^']+')`;
-var FILE_PATTERNS = [
-  {
-    re: new RegExp(`(?:create|write|make|add)\\s+(?:a\\s+|the\\s+)?(?:file\\s+)?(?:called\\s+|named\\s+)?${PATH_TOKEN}\\s+(?:containing|with|that contains|that has|must contain|contains)\\s+(?:exactly:?\\s+)?${CONTENT_TOKEN}`, "gi"),
-    build: (m) => {
-      const path = strip(m[1]);
-      const content = strip(m[2]);
-      if (!path)
-        return;
-      return { type: "file", path, contains: content || undefined };
-    }
-  },
-  {
-    re: new RegExp(`write\\s+${CONTENT_TOKEN}\\s+(?:to|into)\\s+${PATH_TOKEN}`, "gi"),
-    build: (m) => {
-      const content = strip(m[1]);
-      const path = strip(m[2]);
-      if (!path)
-        return;
-      return { type: "file", path, contains: content || undefined };
-    }
-  },
-  {
-    re: new RegExp(`${FILE_NAME}\\s+(?:must\\s+)?(?:contain|include|have)\\s+(?:exactly:?\\s+)?${CONTENT_TOKEN}`, "gi"),
-    build: (m) => {
-      const path = strip(m[0].split(/\s+/)[0]);
-      const content = strip(m[1]);
-      if (!path)
-        return;
-      return { type: "file", path, contains: content || undefined };
-    }
-  },
-  {
-    re: new RegExp(`(?:create|write|make|add)\\s+(?:a\\s+|the\\s+)?(?:file\\s+)?(?:called\\s+|named\\s+)?${PATH_NAME}`, "gi"),
-    build: (m) => {
-      const path = strip(m[1]);
-      if (!path)
-        return;
-      return { type: "file", path };
-    }
-  }
-];
-function strip(value) {
-  if (!value)
-    return "";
-  const trimmed = value.trim();
-  if (/^([`"']).*\1$/s.test(trimmed))
-    return trimmed.slice(1, -1).trim();
-  return trimmed.replace(/[.!?]+$/, "");
-}
-function deriveCriteria(objective) {
-  const text = objective.trim();
-  if (!text)
-    return [];
-  const rawLines = text.split(/\n+/);
-  const listLines = rawLines.filter((line) => /^\s*(?:\d+[.)]|[-*+])\s*/.test(line)).map((line) => line.replace(/^\s*(?:\d+[.)]|[-*+])\s*/, "").trim()).filter((line) => line.length > 0);
-  const allLines = rawLines.map((line) => line.replace(/^\s*(?:\d+[.)]|[-*+])\s*/, "").trim()).filter((line) => line.length > 0);
-  const enumerated = listLines.length > 1 && listLines.length >= Math.ceil(allLines.length / 2);
-  const criteria = [];
-  const seen = new Set;
-  const push = (criterionText, spec) => {
-    const key = `${spec.type}::${criterionText}`;
-    if (seen.has(key))
-      return;
-    seen.add(key);
-    criteria.push({ text: criterionText, spec, source: "derived" });
-  };
-  const targets = enumerated ? listLines : [text];
-  const contentPaths = new Set;
-  for (const target of targets) {
-    let matched = false;
-    for (const { re, build } of FILE_PATTERNS) {
-      for (const match of target.matchAll(re)) {
-        const spec = build(match);
-        if (!spec || spec.type !== "file")
-          continue;
-        const content = "contains" in spec ? spec.contains : undefined;
-        if (!content)
-          continue;
-        matched = true;
-        contentPaths.add(spec.path);
-        push(`${spec.path} contains ${content}`, spec);
-      }
-    }
-    for (const { re, build } of FILE_PATTERNS) {
-      for (const match of target.matchAll(re)) {
-        const spec = build(match);
-        if (!spec || spec.type !== "file")
-          continue;
-        if ("contains" in spec && spec.contains)
-          continue;
-        if (contentPaths.has(spec.path))
-          continue;
-        matched = true;
-        push(`${spec.path} exists`, spec);
-      }
-    }
-    if (!matched) {
-      push(`The requirement is achieved: ${target}`, { type: "objective" });
-    }
-  }
-  if (criteria.length === 0) {
-    push(`The objective is achieved: ${text}`, { type: "objective" });
-  }
-  return criteria;
-}
-
 // src/controller/controller.ts
 class GoalController {
   store;
@@ -1340,12 +1398,15 @@ class GoalController {
     const target = this.resolveTarget(sessionID, input);
     if (!target.ok)
       return { rejected: target.rejected };
+    if (input.replacement && !input.replacement.text.trim()) {
+      return { rejected: "a replacement proposal requires non-empty text" };
+    }
     const criterionID = this.resolveCriterion(target.goal.id, input.criterion_id);
     if (!criterionID) {
       return { rejected: `criterion ${input.criterion_id} does not exist on this goal` };
     }
     try {
-      this.store.supersedeCriterion(criterionID, input.reason);
+      this.store.supersedeCriterion(criterionID, input.reason, input.replacement);
       return { superseded: true };
     } catch (error) {
       return { rejected: String(error) };
@@ -2210,7 +2271,8 @@ class GoalVerifier {
       };
     }
     const verifiable = evidence.filter((e) => e.kind !== "ref");
-    if (verifiable.length === 0) {
+    const hasIndependentProofPath = criteria.some((c) => c.spec?.type === "file" || c.spec?.type === "objective");
+    if (verifiable.length === 0 && !hasIndependentProofPath) {
       return {
         verdict: "incomplete",
         unmet: ["no machine-verifiable evidence submitted"],
@@ -2259,16 +2321,18 @@ class GoalVerifier {
       }
       if (criterion.spec?.type === "command" || criterion.spec?.type === "test") {
         const expected = criterion.spec.type === "test" ? 0 : criterion.spec.expectExit ?? 0;
-        const proof = bound.filter((e) => (e.kind === "command" || e.kind === "test") && e.exitCode === expected);
+        const required = normalizedCommand(criterion.spec.command);
+        const proof = bound.filter((e) => (e.kind === "command" || e.kind === "test") && e.exitCode === expected && normalizedCommand(e.ref) === required);
         if (proof.length === 0) {
+          const ran = bound.filter((e) => e.kind === "command" || e.kind === "test");
           proofs.push({
             criterionID: criterion.id,
             evidenceIDs: [],
             validatorID: "spec.command",
             verdict: "fail",
-            detail: `no bound command/test evidence exited ${expected}`
+            detail: ran.some((e) => e.exitCode === expected) ? `${ran.length} bound run(s) exited ${expected}, but none was the required command` : `no bound command/test evidence exited ${expected}`
           });
-          unmet.push(`criterion not evidenced: ${criterion.text} (no bound command/test exited ${expected})`);
+          unmet.push(`criterion not evidenced: ${criterion.text} (a run of "${criterion.spec.command}" exiting ${expected} was not observed)`);
         } else {
           proofs.push({
             criterionID: criterion.id,
@@ -2335,7 +2399,7 @@ class GoalVerifier {
     return {
       verdict: "complete",
       unmet: [],
-      reason: `objective satisfied: ${criteria.length} criteria covered by ${verifiable.length} validated evidence item(s)`,
+      reason: verifiable.length === 0 ? `objective satisfied: ${criteria.length} criteria established by independent checks and user acceptance` : `objective satisfied: ${criteria.length} criteria covered by ${verifiable.length} validated evidence item(s)`,
       proofs,
       snapshot
     };
@@ -2964,10 +3028,33 @@ var src_default = {
         });
         editor.add({
           name: "goal_supersede_criterion",
-          description: "Retire a derived or model-added criterion that investigation proved wrong. The criterion is kept for the audit trail but no longer gates verification. Explicit user requirements cannot be superseded; they must be satisfied.",
+          description: "Retire a model-added criterion that investigation proved wrong; it no longer gates verification. Requirements that came from the user's objective cannot be retired — you may propose a replacement only when it provably preserves the original obligation (e.g. a stricter content requirement on the same file path); otherwise ask the user to run /goal replace.",
           input: obj({
             criterion_id: str2,
             reason: str2,
+            replacement: {
+              type: "object",
+              properties: {
+                text: { type: "string" },
+                spec: {
+                  type: "object",
+                  properties: {
+                    type: {
+                      type: "string",
+                      enum: ["file", "command", "test", "manual"]
+                    },
+                    path: { type: "string" },
+                    equals: { type: "string" },
+                    contains: { type: "string" },
+                    command: { type: "string" },
+                    expectExit: num2
+                  },
+                  additionalProperties: false
+                }
+              },
+              required: ["text"],
+              additionalProperties: false
+            },
             goal_id: str2,
             generation: num2
           }, ["criterion_id", "reason"]),
@@ -2978,9 +3065,25 @@ var src_default = {
             const target = selectToolRef(ref, input, toolCtx?.messageID);
             if (!target.ok)
               return { content: `Goal call rejected: ${target.reason}` };
+            let replacement;
+            if (input?.replacement && typeof input.replacement === "object") {
+              replacement = { text: String(input.replacement.text ?? "") };
+              const rawSpec = input.replacement.spec;
+              if (rawSpec && typeof rawSpec === "object") {
+                const parsed = { ...rawSpec };
+                if (parsed.type === "file" && typeof parsed.path !== "string") {
+                  return { content: "Replacement rejected: a file spec requires path." };
+                }
+                if ((parsed.type === "command" || parsed.type === "test") && typeof parsed.command !== "string") {
+                  return { content: "Replacement rejected: a command/test spec requires command." };
+                }
+                replacement.spec = parsed;
+              }
+            }
             const out = controller.supersedeCriterion(toolCtx?.sessionID, {
               criterion_id: String(input?.criterion_id ?? ""),
               reason: String(input?.reason ?? ""),
+              replacement,
               goalID: target.ref.goalID,
               generation: target.ref.generation
             });

@@ -47,14 +47,19 @@ describe("Model omitting an explicit requirement", () => {
     controller.store.addCriterion(goal.id, "feature X is implemented");
     controller.store.addCriterion(goal.id, "tests are written and passing");
 
-    // Model only completes the first criterion
-    const criteria = controller.store.listCriteria(goal.id).filter((c) => c.source === "user");
+    // Model only completes the first criterion.
+    // Audit-3 #5: requirements extracted from the objective are user-source,
+    // so the user-added criteria are filtered by text, not by source label.
+    const criteria = controller.store
+      .listCriteria(goal.id)
+      .filter((c) => c.text !== goal.objective && !c.text.startsWith("The requirement is achieved"));
+    const first = criteria.find((c) => c.text.includes("feature X is implemented")) ?? criteria[0];
     controller.store.addEvidence({
       goalID: goal.id,
       kind: "command",
       ref: "echo 'feature implemented'",
       detail: "exit 0",
-      criterionID: criteria[0].id,
+      criterionID: first.id,
     });
 
     // The second criterion has no evidence
@@ -237,8 +242,10 @@ describe("A compaction boundary", () => {
     const goal = startGoal("ses_a", "do work");
     controller.store.addCriterion(goal.id, "work is done");
     const before = controller.store.listCriteria(goal.id);
-    const derivedCount = before.filter((c) => c.source === "derived").length;
-    expect(derivedCount).toBeGreaterThan(0);
+    // Audit-3 #5: requirements extracted from the objective carry user
+    // authority, so the derived criterion here is the model-added one.
+    const userCount = before.filter((c) => c.source === "user").length;
+    expect(userCount).toBeGreaterThan(0);
     controller.close();
     controller = new GoalController({ dbPath: join(dir, "goals.db") });
     const status = controller.status("ses_a");

@@ -562,11 +562,34 @@ export default {
         editor.add({
           name: "goal_supersede_criterion",
           description:
-            "Retire a derived or model-added criterion that investigation proved wrong. The criterion is kept for the audit trail but no longer gates verification. Explicit user requirements cannot be superseded; they must be satisfied.",
+            "Retire a model-added criterion that investigation proved wrong; it no longer gates verification. Requirements that came from the user's objective cannot be retired — you may propose a replacement only when it provably preserves the original obligation (e.g. a stricter content requirement on the same file path); otherwise ask the user to run /goal replace.",
           input: obj(
             {
               criterion_id: str,
               reason: str,
+              replacement: {
+                type: "object",
+                properties: {
+                  text: { type: "string" },
+                  spec: {
+                    type: "object",
+                    properties: {
+                      type: {
+                        type: "string",
+                        enum: ["file", "command", "test", "manual"],
+                      },
+                      path: { type: "string" },
+                      equals: { type: "string" },
+                      contains: { type: "string" },
+                      command: { type: "string" },
+                      expectExit: num,
+                    },
+                    additionalProperties: false,
+                  },
+                },
+                required: ["text"],
+                additionalProperties: false,
+              },
               goal_id: str,
               generation: num,
             },
@@ -577,9 +600,28 @@ export default {
             const ref = await resolveMessageRef(toolCtx?.sessionID, toolCtx?.messageID);
             const target = selectToolRef(ref, input, toolCtx?.messageID);
             if (!target.ok) return { content: `Goal call rejected: ${target.reason}` };
+            let replacement: { text: string; spec?: Record<string, unknown> } | undefined;
+            if (input?.replacement && typeof input.replacement === "object") {
+              replacement = { text: String(input.replacement.text ?? "") };
+              const rawSpec = input.replacement.spec;
+              if (rawSpec && typeof rawSpec === "object") {
+                const parsed: Record<string, unknown> = { ...rawSpec };
+                if (parsed.type === "file" && typeof parsed.path !== "string") {
+                  return { content: "Replacement rejected: a file spec requires path." };
+                }
+                if (
+                  (parsed.type === "command" || parsed.type === "test") &&
+                  typeof parsed.command !== "string"
+                ) {
+                  return { content: "Replacement rejected: a command/test spec requires command." };
+                }
+                replacement.spec = parsed;
+              }
+            }
             const out = controller.supersedeCriterion(toolCtx?.sessionID, {
               criterion_id: String(input?.criterion_id ?? ""),
               reason: String(input?.reason ?? ""),
+              replacement: replacement as any,
               goalID: target.ref.goalID,
               generation: target.ref.generation,
             });

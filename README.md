@@ -218,15 +218,25 @@ existing consumers.
 `goal_get` returns the criteria *and* the evidence the controller has captured,
 so the model can bind evidence to a criterion by id or ref. File criteria with a
 machine spec are re-checked independently; other criteria require explicitly
-bound, currently valid evidence.
+bound, currently valid evidence. Command/test criteria additionally require the
+bound evidence to be a run of the *required command* itself (matched under an
+explicit whitespace-normalization policy — not shell canonicalization) with the
+expected exit status.
 
 `goal_add_criterion` is additive and idempotent (an identical normalized
 requirement returns the existing criterion) and fenced like every other tool. It
 cannot create an objective-type criterion — accepting the objective is the
 user's verdict, not the model's. `goal_supersede_criterion` retires a
-derived/model criterion investigation proved wrong; the row is kept for the
-audit trail, and an explicit user requirement can never be superseded — it must
-be satisfied or the objective replaced.
+model-added criterion investigation proved wrong; the row is kept for the audit
+trail. Requirements extracted from the user's objective — numbered items
+included — carry user authority: the model cannot retire them, and may propose
+only a replacement that provably preserves the original obligation (a stricter
+content requirement on the same path, or the identical command); anything else
+must go to the user (`/goal replace`). Exact-content requirements are parsed
+into byte-exact `equals` specs: "containing exactly: success" demands the file
+be `success`, not merely contain it — quoting is how punctuation or whitespace
+is made material. User acceptance alone resolves a goal whose only criterion is
+objective-level acceptance; it never waives explicit file requirements.
 
 ---
 

@@ -367,25 +367,33 @@ export class GoalController {
   }
 
   /**
-   * `goal_supersede_criterion` — retire a derived criterion investigation
-   * proved wrong.
+   * `goal_supersede_criterion` — retire a model-added criterion investigation
+   * proved wrong, or propose a correcting replacement for a user requirement.
    *
-   * Only derived/model criteria are retireable; an explicit user requirement
-   * must be satisfied, not explained away. The row is retained for the audit
-   * trail.
+   * Explicit user requirements are never freely retireable: the model may
+   * propose only a replacement that provably preserves the original
+   * obligation; the store rejects anything weaker and the user must
+   * authorize the rest. Rows are retained for the audit trail.
    */
   supersedeCriterion(
     sessionID: string,
-    input: { criterion_id: string; reason: string } & GoalRef,
+    input: {
+      criterion_id: string;
+      reason: string;
+      replacement?: { text: string; spec?: CriterionSpec };
+    } & GoalRef,
   ): { superseded?: boolean; rejected?: string } {
     const target = this.resolveTarget(sessionID, input);
     if (!target.ok) return { rejected: target.rejected };
+    if (input.replacement && !input.replacement.text.trim()) {
+      return { rejected: "a replacement proposal requires non-empty text" };
+    }
     const criterionID = this.resolveCriterion(target.goal.id, input.criterion_id);
     if (!criterionID) {
       return { rejected: `criterion ${input.criterion_id} does not exist on this goal` };
     }
     try {
-      this.store.supersedeCriterion(criterionID, input.reason);
+      this.store.supersedeCriterion(criterionID, input.reason, input.replacement);
       return { superseded: true };
     } catch (error) {
       return { rejected: String(error) };

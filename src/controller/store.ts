@@ -26,7 +26,7 @@ import {
   isNonTerminal,
   isTerminal,
 } from "./state.ts";
-import type { CriterionInput, CriterionSpec } from "./criteria.ts";
+import { preservesObligation, type CriterionInput, type CriterionSpec } from "./criteria.ts";
 
 export interface GoalEvent {
   seq: number;
@@ -112,10 +112,12 @@ CREATE TABLE IF NOT EXISTS goal_criteria (
   -- verified independently of any evidence the model claims; a criterion
   -- without one still requires explicitly bound evidence.
   spec        TEXT,
-  -- Who established the criterion: derived from the objective, an explicit
-  -- user requirement, or a model refinement. Never removed to pass
-  -- verification.
-  source      TEXT NOT NULL DEFAULT 'derived',
+  -- Who established the criterion: the user's objective (including
+  -- requirements the controller extracted from it), an explicit user
+  -- addition, or a model refinement. User-authoritative rows are never
+  -- removed to pass verification. Historical "derived" rows are normalized
+  -- to "user" by migrate() on open.
+  source      TEXT NOT NULL DEFAULT 'user',
   met         INTEGER NOT NULL DEFAULT 0,
   -- A derived/model criterion that investigation proved wrong is superseded,
   -- not deleted: the row stays for the audit trail but no longer gates
@@ -371,6 +373,13 @@ export class GoalStore {
     if (!columns.includes("superseded")) {
       this.db.exec(`ALTER TABLE goal_criteria ADD COLUMN superseded INTEGER NOT NULL DEFAULT 0`);
     }
+    // Authority normalization: rows stored as "derived" were all extracted
+    // from the user's objective by the controller (model-added rows are
+    // "model"). Their origin is the user's, so they carry the user's
+    // authority — including protection from model supersession.
+    this.db
+      .query(`UPDATE goal_criteria SET source = 'user' WHERE source = 'derived'`)
+      .run();
   }
 
   close(): void {
@@ -861,24 +870,61 @@ export class GoalStore {
   }
 
   /**
-   * Supersede a derived or model criterion that investigation proved wrong.
+   * Supersede a criterion that investigation proved wrong.
    *
    * The row is retained for the audit trail but stops gating verification.
-   * Explicit user requirements are never supersedeable: removing one to pass
-   * verification is exactly the failure this ledger exists to prevent.
+   * Explicit user requirements are never freely supersedeable: removing one
+   * to pass verification is exactly the failure this ledger exists to
+   * prevent. The model's only route is a proposed replacement that provably
+   * preserves the original obligation (`preservesObligation`); anything
+   * weaker — or a requirement whose preservation cannot be established
+   * mechanically — is refused and must go to the user.
    */
-  supersedeCriterion(criterionID: string, reason: string): void {
+  supersedeCriterion(
+    criterionID: string,
+    reason: string,
+    replacement?: { text: string; spec?: CriterionSpec },
+  ): void {
     this.tx(() => {
       const row = this.db
-        .query<{ goal_id: string; generation: number; source: string; superseded: number }, [string]>(
-          `SELECT goal_id, generation, source, superseded FROM goal_criteria WHERE id = ?`,
+        .query<{
+          goal_id: string;
+          generation: number;
+          source: string;
+          spec: string | null;
+          superseded: number;
+        }, [string]>(
+          `SELECT goal_id, generation, source, spec, superseded FROM goal_criteria WHERE id = ?`,
         )
         .get(criterionID);
       if (!row) throw new GoalConflictError(`unknown criterion ${criterionID}`);
       if (row.source === "user") {
-        throw new TransitionRejectedError(
-          "an explicit user requirement cannot be superseded; it must be satisfied or the objective replaced",
+        if (!replacement) {
+          throw new TransitionRejectedError(
+            "an explicit user requirement cannot be superseded; it must be satisfied, or the user must replace the objective",
+          );
+        }
+        const oldSpec: CriterionSpec | undefined = row.spec ? JSON.parse(row.spec) : undefined;
+        if (!preservesObligation(oldSpec, replacement.spec)) {
+          throw new TransitionRejectedError(
+            "the proposed replacement does not preserve the original obligation; ask the user to authorize the change",
+          );
+        }
+        if (row.superseded === 1) return; // idempotent
+        this.db
+          .query(`UPDATE goal_criteria SET superseded = 1, met = 0 WHERE id = ?`)
+          .run(criterionID);
+        this.insertCriterion(
+          row.goal_id,
+          row.generation,
+          { text: replacement.text, spec: replacement.spec, source: "user" },
+          Date.now(),
         );
+        this.appendEvent(row.goal_id, row.generation, "criterion-superseded", {
+          actor: "controller",
+          detail: `model-proposed replacement preserved the obligation: ${reason.slice(0, 240)}`,
+        });
+        return;
       }
       if (row.superseded === 1) return; // idempotent
       this.db
