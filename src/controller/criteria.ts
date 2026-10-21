@@ -115,11 +115,10 @@ export interface DerivedCriterion {
  *    model verdict is needed.
  *  - `audited`: the objective is open-ended, but completion is defined
  *    operationally — every confirmed requirement must be machine-proven AND
- *    the objective-level remainder must be covered by an independent,
- *    controller-recorded audit whose scope is the objective as stated. The
- *    model cannot grant this itself; it registers requirements and evidence,
- *    and the audit verdict is recorded through the user-facing boundary
- *    (http RPC / TUI), exactly like acceptance, but scoped to a stated scope.
+ *    the objective-level remainder must be covered by concrete criteria the
+ *    controller proved independently. The verdict (`ObjectiveAssessment`) is
+ *    computed by the controller from proofs it re-checked itself — never from
+ *    a model assertion — and is persisted with generation fencing.
  *  - `userAcceptance`: subjective outcomes that only a human can judge.
  *
  * `audited` deliberately does NOT mean "the machine proved there are no
