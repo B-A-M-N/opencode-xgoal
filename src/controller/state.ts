@@ -185,4 +185,13 @@ export interface Goal {
   verificationSnapshot?: string;
   /** True when a continuation submission terminally failed and dispatch is stopped. */
   deliveryFailed: boolean;
+  /**
+   * How this goal is permitted to reach completion (audit #1). A `machine` goal
+   * needs only machine-checkable proofs; `audited` requires a scoped,
+   * controller-recorded objective audit; `userAcceptance` requires explicit
+   * user acceptance of the objective-level remainder.
+   */
+  completionPolicy: "machine" | "audited" | "userAcceptance";
+  /** Revision of the user's objective; audits are scoped to a revision. */
+  objectiveRevision: number;
 }

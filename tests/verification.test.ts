@@ -855,6 +855,165 @@ describe("objective-level criteria require user acceptance", () => {
   });
 });
 
+// Audit-4 #1 (P0): an open-ended engineering objective must be able to reach
+// verified completion hands-off, without `/goal accept`, while never completing
+// over a known, actionable requirement. Completion is defined operationally:
+// every confirmed requirement is independently proven and the objective-level
+// remainder is covered by those proofs. `indeterminate` is the honest verdict
+// when no bounded scope was ever established.
+describe("audited completion policy", () => {
+  /** A controller-created goal, so the policy is derived exactly as production does. */
+  function auditedGoal(objective: string) {
+    const result = controller.startOrDescribe("ses_a", objective);
+    if (!("created" in result)) throw new Error("expected a new goal");
+    return result.created;
+  }
+
+  test("an open-ended repair objective derives the audited policy", () => {
+    const goal = auditedGoal("Audit the repository and fix any critical bugs found.");
+    expect(goal.completionPolicy).toBe("audited");
+  });
+
+  test("a machine-checkable objective derives the machine policy", () => {
+    const goal = auditedGoal("Create a file called notes.txt containing exactly: done.");
+    expect(goal.completionPolicy).toBe("machine");
+  });
+
+  test("no confirmed requirement is indeterminate, never satisfied", async () => {
+    const goal = auditedGoal("Audit the repository and fix any critical bugs found.");
+    const verifier = new GoalVerifier(store, validator());
+    const result = await verifier.verify(goal.id);
+
+    expect(result.verdict).toBe("incomplete");
+    expect(result.unmet.some((u) => u.includes("indeterminate"))).toBe(true);
+    const assessment = store.objectiveAssessment(goal.id);
+    expect(assessment?.verdict).toBe("indeterminate");
+    expect(assessment?.unresolvedRequirements.length).toBeGreaterThan(0);
+    // The model cannot mark the objective met by asserting it.
+    expect(store.listCriteria(goal.id).find((c) => c.spec?.type === "objective")?.met).toBe(false);
+  });
+
+  test("confirmed, proven requirements complete the goal without acceptance", async () => {
+    const goal = auditedGoal("Audit the repository and fix any critical bugs found.");
+    const objectiveID = store.listCriteria(goal.id).find((c) => c.spec?.type === "objective")!.id;
+
+    // The model discovered two concrete requirements during investigation and
+    // declared each one as coverage for the objective remainder.
+    const bugOne = store.addCriterion(
+      goal.id,
+      "bug one: the parser drops the last token",
+      { type: "test", command: "bun test tests/parser.test.ts" },
+      "model",
+      [objectiveID],
+    );
+    const bugTwo = store.addCriterion(
+      goal.id,
+      "bug two: the writer truncates large files",
+      { type: "file", path: "tests/writer.test.ts" },
+      "model",
+      [objectiveID],
+    );
+    store.addEvidence({
+      goalID: goal.id,
+      criterionID: bugOne,
+      kind: "test",
+      ref: "bun test tests/parser.test.ts",
+      detail: "exit 0",
+      exitCode: 0,
+    });
+
+    const verifier = new GoalVerifier(store, {
+      validate: async () => ({ valid: true, reason: "still present" }),
+      checkSpec: async () => ({ valid: true, reason: "regression test present" }),
+    });
+    const result = await verifier.verify(goal.id);
+
+    // Hands-off: no user acceptance row exists.
+    expect(store.userAcceptance(goal.id)).toBeUndefined();
+    expect(result.verdict).toBe("complete");
+    expect(result.unmet).toHaveLength(0);
+    const assessment = store.objectiveAssessment(goal.id);
+    expect(assessment?.verdict).toBe("satisfied");
+    expect(assessment?.unresolvedRequirements).toEqual([]);
+    expect(assessment?.coveredRequirements.length).toBe(2);
+    expect(assessment?.generation).toBe(goal.generation);
+    // The objective proof came from the audit, not from acceptance.
+    expect(result.proofs?.find((p) => p.criterionID === objectiveID)?.validatorID).toBe(
+      "objective-audit",
+    );
+    expect(store.listCriteria(goal.id).find((c) => c.id === objectiveID)?.met).toBe(true);
+  });
+
+  test("a known, actionable defect keeps an audited goal incomplete", async () => {
+    const goal = auditedGoal("Audit the repository and fix any critical bugs found.");
+    const objectiveID = store.listCriteria(goal.id).find((c) => c.spec?.type === "objective")!.id;
+    store.addCriterion(
+      goal.id,
+      "bug one: the parser drops the last token",
+      { type: "test", command: "bun test tests/parser.test.ts" },
+      "model",
+      [objectiveID],
+    );
+    // The defect was discovered but never fixed: no passing run exists.
+    store.addEvidence({
+      goalID: goal.id,
+      kind: "test",
+      ref: "bun test tests/parser.test.ts",
+      detail: "exit 1",
+      exitCode: 1,
+    });
+
+    const verifier = new GoalVerifier(store, validator());
+    const result = await verifier.verify(goal.id);
+
+    expect(result.verdict).toBe("incomplete");
+    expect(result.unmet.some((u) => u.includes("parser drops the last token"))).toBe(true);
+    const assessment = store.objectiveAssessment(goal.id);
+    expect(assessment?.verdict).toBe("incomplete");
+    expect(assessment?.unresolvedRequirements.some((r) => r.includes("parser"))).toBe(true);
+  });
+
+  test("a superseded objective cannot reuse the previous generation's assessment", async () => {
+    const first = auditedGoal("Audit the repository and fix any critical bugs found.");
+    const firstObjective = store.listCriteria(first.id).find((c) => c.spec?.type === "objective")!.id;
+    store.addCriterion(
+      first.id,
+      "the only bug",
+      { type: "file", path: "fixed.txt" },
+      "model",
+      [firstObjective],
+    );
+    const verifier = new GoalVerifier(store, {
+      validate: async () => ({ valid: true, reason: "present" }),
+      checkSpec: async () => ({ valid: true, reason: "present" }),
+    });
+    expect((await verifier.verify(first.id)).verdict).toBe("complete");
+    expect(store.objectiveAssessment(first.id)?.verdict).toBe("satisfied");
+
+    const second = controller.replace("ses_a", "Audit the module and fix any critical bugs found.");
+    expect(second.generation).toBe(first.generation + 1);
+    const result = await verifier.verify(second.id);
+    expect(result.verdict).toBe("incomplete");
+    expect(store.objectiveAssessment(second.id)?.generation).toBe(second.generation);
+    expect(store.objectiveAssessment(second.id)?.verdict).toBe("indeterminate");
+  });
+
+  test("repeated objective additions cannot be covered by a criterion the model added to itself", () => {
+    const goal = auditedGoal("Audit the repository and fix any critical bugs found.");
+    const objectiveID = store.listCriteria(goal.id).find((c) => c.spec?.type === "objective")!.id;
+    // Coverage may only name an objective-level requirement, never a concrete
+    // row the model just created.
+    const concrete = store.addCriterion(goal.id, "the only bug", { type: "file", path: "a.txt" }, "model");
+    expect(() =>
+      store.addCriterion(goal.id, "bootstrap", { type: "file", path: "b.txt" }, "model", [concrete]),
+    ).toThrow(/not an objective-level requirement/);
+    expect(() =>
+      store.addCriterion(goal.id, "unknown", { type: "file", path: "c.txt" }, "model", ["crit_missing"]),
+    ).toThrow(/unknown criterion/);
+    expect(objectiveID).toBeTruthy();
+  });
+});
+
 // Audit P2: a completion commit must be rejected when the criteria or
 // evidence changed AFTER the verification decision — the verdict describes a
 // world that no longer exists, so freshness is recomputed, not trusted.

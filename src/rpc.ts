@@ -12,6 +12,7 @@
 import type { GoalController } from "./controller/controller.ts";
 import type { GoalCoordinator } from "./controller/coordinator.ts";
 import type { Goal } from "./controller/state.ts";
+import type { CriterionSpec } from "./controller/criteria.ts";
 
 export const RPC_ID = "local.opencode-xgoal";
 
@@ -29,7 +30,41 @@ export interface GoalWire {
   noProgressRounds: number;
   tokensUsed: number | null;
   tokenBudget: number | null;
-  criteria: { id: string; text: string; met: boolean }[];
+  criteria: CriterionWire[];
+}
+
+/**
+ * Wire shape of one criterion. Store rows carry optional fields (`spec`,
+ * `covers`) whose absent value is `undefined` — not a JSON value — so each is
+ * coerced to `null` here. An uncoerced `undefined` is rejected by the RPC
+ * output schema, which would turn a successful mutation into a serialization
+ * error reported to the caller.
+ */
+export interface CriterionWire {
+  id: string;
+  text: string;
+  met: boolean;
+  spec: Record<string, unknown> | null;
+  source: string;
+  covers: string[] | null;
+}
+
+function criterionWire(row: {
+  id: string;
+  text: string;
+  met: boolean;
+  spec?: CriterionSpec;
+  source: string;
+  covers?: string[];
+}): CriterionWire {
+  return {
+    id: row.id,
+    text: row.text,
+    met: row.met,
+    spec: (row.spec as Record<string, unknown> | undefined) ?? null,
+    source: row.source,
+    covers: row.covers ?? null,
+  };
 }
 
 function wire(controller: GoalController, goal: Goal | undefined): GoalWire | null {
@@ -47,7 +82,7 @@ function wire(controller: GoalController, goal: Goal | undefined): GoalWire | nu
     noProgressRounds: goal.noProgressRounds,
     tokensUsed: goal.tokensUsed ?? null,
     tokenBudget: goal.tokenBudget ?? null,
-    criteria: controller.store.listCriteria(goal.id),
+    criteria: controller.store.listCriteria(goal.id).map(criterionWire),
   };
 }
 

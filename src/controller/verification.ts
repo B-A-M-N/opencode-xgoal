@@ -338,6 +338,12 @@ export class GoalVerifier {
     //    never by pooling rows across mechanisms. Invalid historical
     //    evidence is annotated, not disqualifying, when a newer valid proof
     //    exists (finding 7).
+    //
+    //    Objective-level criteria are deferred to step 5: under the `audited`
+    //    completion policy (audit #1) their verdict is an objective-level
+    //    assessment computed from the proofs of every confirmed requirement,
+    //    not from user acceptance.
+    const objectives: typeof criteria = [];
     for (const criterion of criteria) {
       let bound = validBound(criterion);
 
@@ -446,26 +452,7 @@ export class GoalVerifier {
       }
 
       if (criterion.spec?.type === "objective") {
-        // An objective-level criterion is the part of the goal that cannot be
-        // decomposed into a machine-checkable requirement. Ordinary evidence
-        // cannot prove it: a passing test or a real file change is equally
-        // consistent with a partial job. It resolves only when the user
-        // explicitly accepts this generation of the objective.
-        const acceptance = this.store.userAcceptance(goal.id);
-        if (acceptance && acceptance.generation === goal.generation) {
-          proofs.push(await proof("user-acceptance", "pass", acceptance.note
-            ? `user accepted the objective: ${acceptance.note}`
-            : "user accepted the objective"));
-          continue;
-        }
-        proofs.push(await proof(
-          "objective-acceptance",
-          "unknown",
-          "broad objective; cannot establish completeness from ordinary evidence — needs concrete sub-criteria or explicit user acceptance",
-        ));
-        unmet.push(
-          `criterion unresolved: ${criterion.text} — register concrete machine-checkable criteria with goal_add_criterion, or ask the user to run /goal accept`,
-        );
+        objectives.push(criterion);
         continue;
       }
 
@@ -481,6 +468,167 @@ export class GoalVerifier {
         unmet.push(`criterion not evidenced: ${criterion.text}`);
       } else {
         proofs.push(await proof("bound-evidence", "pass", `${bound.length} bound evidence item(s)`));
+      }
+    }
+
+    // 5. Objective-level remainder and the completion policy (audit #1).
+    //
+    //    The original objective is immutable. What varies is the evidence
+    //    standard for declaring it met:
+    //
+    //      - userAcceptance: the user explicitly accepts this generation.
+    //      - machine: no objective remainder may exist (creation-time policy
+    //        derivation guarantees this; if one appears, fail closed).
+    //      - audited: the controller computes an ObjectiveAssessment from the
+    //        proofs it just re-checked. The objective is satisfied only when
+    //        every confirmed requirement is independently proven, at least one
+    //        concrete requirement covers the objective remainder, and nothing
+    //        known remains unresolved. This does not prove the absence of
+    //        undiscovered defects; it certifies the audited scope, and scope
+    //        that was never bounded yields `indeterminate`, not success.
+    //
+    //    Acceptance is honoured under every policy: an explicit human verdict
+    //    outranks both the machine and the audit.
+    let assessment:
+      | {
+          objectiveRevision: number;
+          verdict: "satisfied" | "incomplete" | "indeterminate";
+          scope: string;
+          coveredRequirements: string[];
+          unresolvedRequirements: string[];
+          evidenceIDs: string[];
+          note?: string;
+        }
+      | undefined;
+    if (objectives.length > 0) {
+      const acceptance = this.store.userAcceptance(goal.id);
+      const accepted = Boolean(acceptance && acceptance.generation === goal.generation);
+      const objectiveIDs = new Set(objectives.map((o) => o.id));
+      const concrete = criteria.filter((c) => !objectiveIDs.has(c.id));
+      const passing = new Set(proofs.filter((p) => p.verdict === "pass").map((p) => p.criterionID));
+      const covered: string[] = [];
+      const coveringEvidence: string[] = [];
+      const unresolved: string[] = [];
+      const coverageGaps: string[] = [];
+      for (const criterion of concrete) {
+        if (!criterion.covers) continue;
+        if (!criterion.covers.some((id) => objectiveIDs.has(id))) continue;
+        if (passing.has(criterion.id)) {
+          covered.push(criterion.text);
+          for (const evidenceID of proofs.find((p) => p.criterionID === criterion.id)?.evidenceIDs ?? []) {
+            coveringEvidence.push(evidenceID);
+          }
+        }
+      }
+      for (const criterion of concrete) {
+        // A known, actionable requirement that failed its own proof is
+        // unresolved by definition: completion must not hide it behind a
+        // satisfied objective.
+        if (!passing.has(criterion.id)) {
+          unresolved.push(`${criterion.text}`);
+        }
+      }
+      for (const objective of objectives) {
+        const proven = concrete.filter(
+          (c) => c.covers?.includes(objective.id) && passing.has(c.id),
+        );
+        if (proven.length === 0) {
+          coverageGaps.push(`no independently proven requirement covers: ${objective.text}`);
+        }
+      }
+      const scope =
+        objectives.map((o) => o.text).join(" | ").slice(0, 400) || goal.objective.slice(0, 400);
+      // Verdict semantics (audit #1): an audit can only certify a scope it
+      // actually bounded. Nothing failing but nothing linked to the objective
+      // means `indeterminate` — not success, and not a failure either. A known
+      // requirement that failed makes it `incomplete`.
+      const verdict: "satisfied" | "incomplete" | "indeterminate" =
+        concrete.length === 0
+          ? "indeterminate"
+          : unresolved.length > 0
+            ? "incomplete"
+            : coverageGaps.length > 0
+              ? "indeterminate"
+              : "satisfied";
+      const allUnresolved = [...unresolved, ...coverageGaps];
+      assessment = {
+        objectiveRevision: goal.objectiveRevision,
+        verdict,
+        scope,
+        coveredRequirements: covered,
+        unresolvedRequirements: allUnresolved,
+        evidenceIDs: [...new Set(coveringEvidence)],
+        note:
+          verdict === "indeterminate"
+            ? "no confirmed requirement was established; an open-ended objective cannot be declared satisfied without a bounded final review"
+            : verdict === "satisfied" && accepted
+              ? acceptance?.note
+                ? `user accepted the objective: ${acceptance.note}`
+                : "user accepted the objective"
+              : undefined,
+      };
+      for (const objective of objectives) {
+        if (accepted) {
+          proofs.push({
+            criterionID: objective.id,
+            evidenceIDs: [],
+            validatorID: "user-acceptance",
+            verdict: "pass",
+            detail: acceptance?.note
+              ? `user accepted the objective: ${acceptance.note}`
+              : "user accepted the objective",
+          });
+          continue;
+        }
+        if (goal.completionPolicy === "audited" && verdict === "satisfied") {
+          const proven = concrete.filter(
+            (c) => c.covers?.includes(objective.id) && passing.has(c.id),
+          );
+          proofs.push({
+            criterionID: objective.id,
+            evidenceIDs: [...new Set(proven.flatMap((c) => proofs.find((p) => p.criterionID === c.id)?.evidenceIDs ?? []))],
+            validatorID: "objective-audit",
+            verdict: "pass",
+            detail: `audited scope satisfied: ${proven.map((c) => c.text).join("; ").slice(0, 300)}`,
+          });
+          continue;
+        }
+        if (goal.completionPolicy === "audited" && verdict === "indeterminate") {
+          proofs.push({
+            criterionID: objective.id,
+            evidenceIDs: [],
+            validatorID: "objective-audit",
+            verdict: "unknown",
+            detail: "indeterminate: no confirmed requirement bounded the objective's scope",
+          });
+          unmet.push(
+            `criterion indeterminate: ${objective.text} — register at least one concrete requirement with covers=<objective criterion id>, prove it, and propose completion again`,
+          );
+          continue;
+        }
+        proofs.push({
+          criterionID: objective.id,
+          evidenceIDs: [],
+          validatorID: "objective-acceptance",
+          verdict: "unknown",
+          detail:
+            goal.completionPolicy === "audited"
+              ? "audit incomplete: a known requirement or objective remainder is unresolved"
+              : "broad objective; cannot establish completeness from ordinary evidence — needs concrete sub-criteria or explicit user acceptance",
+        });
+        if (goal.completionPolicy === "audited") {
+          unmet.push(
+            ...allUnresolved.map((r) =>
+              r.startsWith("no independently proven requirement covers: ")
+                ? `criterion uncovered: ${r.replace("no independently proven requirement covers: ", "")} — register a concrete requirement with covers=<objective criterion id> and prove it`
+                : `criterion unresolved: ${r} — prove it (bound evidence or a machine spec) before completion`,
+            ),
+          );
+        } else {
+          unmet.push(
+            `criterion unresolved: ${objective.text} — register concrete machine-checkable criteria with goal_add_criterion, or ask the user to run /goal accept`,
+          );
+        }
       }
     }
 
@@ -504,7 +652,7 @@ export class GoalVerifier {
     // does not accept this run's proofs; its criterion readouts stay
     // untouched.
     const snapshot = snapshotHash(criteria, evidence);
-    const recorded = this.store.recordProofs(goalID, proofs, snapshot, attempt);
+    const recorded = this.store.recordProofs(goalID, proofs, snapshot, attempt, assessment);
     if (!recorded) {
       return {
         verdict: "incomplete",

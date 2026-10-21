@@ -108,6 +108,60 @@ export interface DerivedCriterion {
   source: "derived" | "user" | "model";
 }
 
+/**
+ * How a goal is allowed to reach verified completion (audit #1).
+ *
+ *  - `machine`: every criterion has a machine-checkable spec; no human or
+ *    model verdict is needed.
+ *  - `audited`: the objective is open-ended, but completion is defined
+ *    operationally — every confirmed requirement must be machine-proven AND
+ *    the objective-level remainder must be covered by an independent,
+ *    controller-recorded audit whose scope is the objective as stated. The
+ *    model cannot grant this itself; it registers requirements and evidence,
+ *    and the audit verdict is recorded through the user-facing boundary
+ *    (http RPC / TUI), exactly like acceptance, but scoped to a stated scope.
+ *  - `userAcceptance`: subjective outcomes that only a human can judge.
+ *
+ * `audited` deliberately does NOT mean "the machine proved there are no
+ * remaining bugs". It means every requirement discovered within the audited
+ * scope is resolved, and the scope itself is recorded. An inherently
+ * open-ended objective stays `indeterminate` rather than being declared
+ * exhaustively satisfied.
+ */
+export type CompletionPolicy = "machine" | "audited" | "userAcceptance";
+
+/**
+ * The completion policy an objective calls for, decided at creation time from
+ * the objective's own text and the criteria it yielded.
+ *
+ * An objective that parsed into only machine-checkable requirements is
+ * `machine`. An objective whose remainder is a broad investigation/repair task
+ * ("audit ... and fix ...", "find and fix ...", "review ...") is `audited`.
+ * Anything else is `userAcceptance`.
+ */
+export function completionPolicyFor(
+  objective: string,
+  criteria: DerivedCriterion[],
+): CompletionPolicy {
+  if (criteria.length === 0) return "userAcceptance";
+  if (criteria.every((c) => c.spec.type !== "objective")) return "machine";
+  const text = objective.toLowerCase();
+  // Engineering objectives are recognisable by the artefacts and activities
+  // they name. A broad engineering task gets the `audited` policy so it can
+  // finish hands-off once every discovered requirement is independently
+  // proven; a subjective objective ("write a poem", "improve the onboarding
+  // copy") keeps the explicit user-acceptance rule, because no machine check
+  // can stand in for human judgement there.
+  const investigation =
+    /\b(?:audit|investigate|find|review|analy[sz]e|harden|diagnose|debug)\b/.test(text) &&
+    /\b(?:fix|repair|address|resolve|correct|eliminate|patch)\b/.test(text);
+  const engineering =
+    /\b(?:file|files|tests?|suite|bugs?|code|repo(?:sitory)?|build|deploy(?:ment)?|commit|branch|function|module|api|endpoint|config(?:uration)?|dependenc(?:y|ies)|lint|typecheck|script|package|database|schema|migration|server|client|pipeline|workflow|command|error|failure|regression|issue|security|performance)\b/.test(
+      text,
+    );
+  return investigation || engineering ? "audited" : "userAcceptance";
+}
+
 /** A requirement established explicitly by the user or the model. */
 export interface CriterionInput {
   text: string;
@@ -121,13 +175,30 @@ const FILE_NAME = "[\\w./\\-]+\\.[A-Za-z0-9]+";
 // phrase that ends at sentence punctuation. Both may contain dots (`a.txt`,
 // `v1.2`), so sentence punctuation is stripped after capture instead.
 const PATH_TOKEN = "(`[^`]+`|\"[^\"]+\"|'[^']+'|[^\\s,;]+)";
-const CONTENT_TOKEN = "(`[^`]+`|\"[^\"]+\"|'[^']+'|[^.;\\n]+)";
+// Unquoted content ends at sentence punctuation, a comma/semicolon, or a
+// conjunction that introduces another obligation ("and", "then"). Quoting is
+// how a user makes punctuation, whitespace, or a conjunction material to the
+// requirement; without quotes the boundary of literal content is ambiguous,
+// so the conservative reading stops the content and leaves the remainder as a
+// separate requirement rather than absorbing it (audit #2).
+// Quoted alternatives are non-capturing so CONTENT_TOKEN's own group stays the
+// single index every pattern builder refers to.
+const QUOTED_TOKEN = "(?:`[^`]+`|\"[^\"]+\"|'[^']+')";
+const UNQUOTED_CONTENT = "[^.;\\n]+";
+const CONTENT_TOKEN = `(${QUOTED_TOKEN}|${UNQUOTED_CONTENT})`;
 // The "exactly" modifier is captured, not consumed: an exact requirement
 // emits an `equals` spec, whose match is byte-exact, not a substring test.
 const EXACTLY_TOKEN = "((?:exactly:?\\s+)?)";
 // A bare "create X" only names a file when X looks like one. Requiring an
 // extension prevents "make the tests pass" from becoming a file criterion.
 const PATH_NAME = `(${FILE_NAME}|\`[^\`]+\`|"[^"]+"|'[^']+')`;
+// An imperative lead-in that enumerates files ("Write two files: a.txt ...").
+// Consumed as part of a match so it cannot resurface as a residual obligation.
+// Optional as a whole; the file word must be followed by a real separator
+// (":" or "," plus space, or plain whitespace), so a path that merely starts
+// with "file" ("files.json containing x") is never partially eaten by it.
+const FILE_LIST_PREAMBLE =
+  "(?:(?:please\\s+)?(?:create|write|make|add)\\s+(?:(?:a|an|the|new|one|two|three|four|five|six|seven|eight|nine|ten|several|multiple|both|all)\\s+)*(?:new\\s+)?files?(?:\\s*[:,]\\s*|\\s+)(?:(?:called|named)\\s+)?)?";
 
 function strip(value: string | undefined, exact = false): string {
   if (!value) return "";
@@ -145,6 +216,113 @@ function strip(value: string | undefined, exact = false): string {
   return trimmed.replace(/[.!?]+$/, "");
 }
 
+/**
+ * Split unquoted captured content at a conjunction that introduces a new,
+ * obligation-bearing clause ("... and run the integration suite").
+ *
+ * Audit #2: an unquoted content capture must not absorb a trailing requirement.
+ * The boundary is only trusted when the text after the conjunction starts with
+ * an imperative verb or modal — "alpha and beta" is literal content, while
+ * "alpha and run the tests" is two requirements. Quoted content is never split:
+ * its boundary is explicit. Returns the residual text (still part of the same
+ * source span) so the caller can account for it instead of dropping it.
+ */
+function splitObligation(raw: string): { content: string; residual?: string } {
+  const trimmed = raw.trim();
+  if (/^([`"']).*\1$/s.test(trimmed)) return { content: raw };
+  const re = /(\s*,\s*|\s+)(?:and|then|also)\s+/gi;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(raw))) {
+    const after = raw.slice(match.index + match[0].length);
+    if (!OBLIGATION_VERB.test(after)) continue;
+    return {
+      content: raw.slice(0, match.index).replace(/[\s,;]+$/, ""),
+      residual: after.trim(),
+    };
+  }
+  return { content: raw };
+}
+
+/** An imperative verb or modal that starts a new obligation clause. */
+const OBLIGATION_VERB =
+  /^(?:run|execute|test|verify|ensure|make|create|write|add|remove|delete|update|fix|refactor|publish|deploy|commit|push|install|configure|document|keep|avoid|check|confirm|use|start|stop|build|lint|format|review|audit|do\s+not|don't|never|must|should|shall|not)\b/i;
+
+/**
+ * A clause that itself states a file requirement ("b.txt containing exactly
+ * bravo"). A conjunction followed by this shape is a boundary between two
+ * requirements, not literal content inside the previous one.
+ */
+const FILE_REQUIREMENT_START = new RegExp(
+  `^(?:${FILE_NAME}|\`[^\`]+\`|"[^"]+"|'[^']+')\\s+(?:must\\s+)?(?:contain|contains|containing|include|includes|including|have|has)\\b`,
+  "i",
+);
+
+/** A clause that reads as an obligation: it carries a verb or a modal. */
+const OBLIGATIONISH =
+  /\b(?:[a-z]+(?:e|ed|s|ing|ise|ize|ate|ify)\b|must|should|shall|ensure|verify|run|test|check|deploy|publish|pass|fail|fix|add|create|write|make|keep|avoid|never|do not|don't|no)\b/i;
+
+function readsAsObligation(clause: string): boolean {
+  return OBLIGATIONISH.test(clause);
+}
+
+/**
+ * Split a target into obligation clauses at boundaries a conservative reader
+ * trusts (audit #2): sentence punctuation outside quotes, and a conjunction
+ * whose following text itself states an obligation — an imperative verb or
+ * another file requirement. Quoted text is never split; the quote is the
+ * user's explicit boundary. A dot that stays attached to a token ("a.txt")
+ * is not sentence punctuation, so the path of a following file requirement
+ * can no longer be amputated into the previous content capture — the failure
+ * that corrupted "alpha, and b.txt containing exactly bravo" into the literal
+ * content "alpha, and b".
+ */
+function splitObligationClauses(text: string): string[] {
+  const clauses: string[] = [];
+  let start = 0;
+  let quote: string | undefined;
+  const push = (end: number) => {
+    const raw = text.slice(start, end).trim();
+    start = end;
+    if (raw) clauses.push(raw);
+  };
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!;
+    if (quote) {
+      if (ch === quote) {
+        // A single quote closes only at a word boundary, so the apostrophe
+        // in a contraction cannot swallow the rest of the clause.
+        const next = text[i + 1];
+        if (quote !== "'" || next === undefined || !/\w/.test(next)) quote = undefined;
+      }
+      continue;
+    }
+    if (ch === '"' || ch === "`" || (ch === "'" && (i === 0 || !/\w/.test(text[i - 1]!)))) {
+      quote = ch;
+      continue;
+    }
+    if (ch === "." || ch === "!" || ch === "?" || ch === ";" || ch === "\n") {
+      const next = text[i + 1];
+      if (next === undefined || /\s/.test(next)) push(i + 1);
+      continue;
+    }
+    if (ch === "," || /\s/.test(ch)) {
+      // A conjunction splits only when the text after it states an
+      // obligation; otherwise it is literal content ("alpha and beta").
+      const conj = /^,?\s*(?:and|then|also)\s+/i.exec(text.slice(i));
+      if (conj) {
+        const after = text.slice(i + conj[0].length);
+        if (OBLIGATION_VERB.test(after) || FILE_REQUIREMENT_START.test(after)) {
+          push(i);
+          start = i + conj[0].length;
+          i = start - 1;
+        }
+      }
+    }
+  }
+  push(text.length);
+  return clauses.length > 0 ? clauses : [text];
+}
+
 /** Build a file spec from a parsed path/content pair, honoring `exactly`. */
 function fileSpec(path: string, exact: boolean, content: string): CriterionSpec | undefined {
   if (!path) return undefined;
@@ -154,13 +332,20 @@ function fileSpec(path: string, exact: boolean, content: string): CriterionSpec 
   return exact ? { type: "file", path, equals: content } : { type: "file", path, contains: content };
 }
 
+/** A parsed file requirement plus any obligation-bearing tail it excluded. */
+interface ParsedFile {
+  spec: CriterionSpec;
+  /** Text inside the match that is a separate requirement, not content. */
+  residual?: string;
+}
+
 /**
  * Objective patterns that name a concrete file requirement. Each returns a
  * `{ type: "file" }` spec when it matches. These are heuristics, not a parser:
  * an objective that matches none of them is handled by the objective fallback,
  * which is still machine-verified (it just cannot be pre-checked).
  */
-const FILE_PATTERNS: Array<{ re: RegExp; build: (m: RegExpMatchArray) => CriterionSpec | undefined }> = [
+const FILE_PATTERNS: Array<{ re: RegExp; build: (m: RegExpMatchArray) => ParsedFile | undefined }> = [
   {
     // "create a file called a.txt containing exactly: alpha"
     // "create src/mod.js that exports a function named add"
@@ -171,27 +356,38 @@ const FILE_PATTERNS: Array<{ re: RegExp; build: (m: RegExpMatchArray) => Criteri
     build: (m) => {
       const path = strip(m[1]);
       const exact = Boolean(m[2]);
-      const content = strip(m[3], exact);
-      return fileSpec(path, exact, content);
+      // Split the RAW capture: quoting is the user's explicit boundary, and it
+      // must be visible here so quoted conjunctions are never split.
+      const split = splitObligation(m[3] ?? "");
+      const spec = fileSpec(path, exact, strip(split.content, exact));
+      return spec ? { spec, residual: split.residual } : undefined;
     },
   },
   {
     // "write alpha to a.txt" / "write alpha into a.txt"
     re: new RegExp(`write\\s+${CONTENT_TOKEN}\\s+(?:to|into)\\s+${PATH_TOKEN}`, "gi"),
     build: (m) => {
-      const content = strip(m[1]);
+      const split = splitObligation(m[1] ?? "");
       const path = strip(m[2]);
-      return fileSpec(path, false, content);
+      const spec = fileSpec(path, false, strip(split.content));
+      return spec ? { spec, residual: split.residual } : undefined;
     },
   },
   {
-    // "a.txt must contain alpha" / "a.txt contains alpha"
-    re: new RegExp(`${FILE_NAME}\\s+(?:must\\s+)?(?:contain|include|have)\\s+${EXACTLY_TOKEN}${CONTENT_TOKEN}`, "gi"),
+    // "a.txt must contain alpha" / "a.txt contains alpha" / "a.txt containing exactly: alpha"
+    // An enumerating preamble ("write two files: a.txt containing ...") is
+    // optional and non-capturing; when present it is part of the match, so
+    // the span accounting sees it as explained rather than residual.
+    re: new RegExp(
+      `${FILE_LIST_PREAMBLE}(${FILE_NAME})\\s+(?:must\\s+)?(?:contain|contains|containing|include|includes|including|have|has)\\s+${EXACTLY_TOKEN}${CONTENT_TOKEN}`,
+      "gi",
+    ),
     build: (m) => {
-      const path = strip(m[0].split(/\s+/)[0]);
-      const exact = Boolean(m[1]);
-      const content = strip(m[2], exact);
-      return fileSpec(path, exact, content);
+      const path = strip(m[1]);
+      const exact = Boolean(m[2]);
+      const split = splitObligation(m[3] ?? "");
+      const spec = fileSpec(path, exact, strip(split.content, exact));
+      return spec ? { spec, residual: split.residual } : undefined;
     },
   },
   {
@@ -200,10 +396,80 @@ const FILE_PATTERNS: Array<{ re: RegExp; build: (m: RegExpMatchArray) => Criteri
     build: (m) => {
       const path = strip(m[1]);
       if (!path) return undefined;
-      return { type: "file", path };
+      return { spec: { type: "file", path } };
     },
   },
 ];
+
+/**
+ * Completion instructions are workflow, not outcome: "when it exists, propose
+ * completion" tells the model what to do next, it does not state a requirement
+ * the finished work must satisfy. Treating them as obligations would make every
+ * ordinary objective unsolvable.
+ */
+function isProceduralInstruction(clause: string): boolean {
+  const stripped = clause
+    .replace(/^(?:when|once|after|if|as soon as)\b[^,]*,\s*/i, "")
+    .trim();
+  return new RegExp(
+    "^(?:(?:please|then|now|finally)\\s+)*(" +
+      "(?:propose|declare|report|signal|announce)\\s+(?:the\\s+)?(?:goal\\s+)?(?:completion|complete|done|finished)" +
+      "|call\\s+`?goal_propose_complete`?" +
+      "|(?:report|come)\\s+back(?:\\s+to\\s+the\\s+user)?" +
+      "|stop(?:\\s+work)?|finish(?:ed)?|done" +
+      ")[\\s.!]*$",
+    "i",
+  ).test(stripped);
+}
+
+/**
+ * Extract obligation-bearing text that no confident match explained.
+ *
+ * Audit #2: a parsed file requirement must not absorb the rest of its clause.
+ * The unconsumed spans of a clause are grouped into clauses (split on
+ * sentence punctuation and on `and`/`then` conjunctions) and anything that
+ * still reads as a requirement — a verb or a modal, not bare connective
+ * prose — is returned. Ambiguity resolves toward "unresolved obligation",
+ * never toward guessing that the residue was literal file content.
+ */
+export function residualObligations(text: string, consumed: boolean[]): string[] {
+  const residuals: string[] = [];
+  let start = -1;
+  const flush = (end: number) => {
+    if (start === -1) return;
+    const raw = text.slice(start, end).trim();
+    start = -1;
+    if (!raw) return;
+    const cleaned = raw
+      .replace(/^[\s,;.]+|[\s,;.]+$/g, "")
+      .replace(/^(?:and|then|also|plus)\s+/i, "")
+      .trim();
+    if (!cleaned) return;
+    // Connective-only residue is prose glue, not a requirement.
+    if (/^(?:and|then|also|plus)$/i.test(cleaned)) return;
+    // Workflow instructions ("propose completion", "report back") describe
+    // what the model should do next, not a property the finished work needs.
+    if (isProceduralInstruction(cleaned)) return;
+    // A clause without any verb-like or modal token is a fragment (e.g. the
+    // tail of a quoted string) rather than an action the user required.
+    if (!readsAsObligation(cleaned)) return;
+    residuals.push(cleaned);
+  };
+  for (let i = 0; i < text.length; i++) {
+    if (consumed[i]) {
+      flush(i);
+      continue;
+    }
+    const ch = text[i]!;
+    if (ch === "." || ch === ";" || ch === "\n") {
+      flush(i);
+      continue;
+    }
+    start = start === -1 ? i : start;
+  }
+  flush(text.length);
+  return residuals;
+}
 
 /**
  * Derive preliminary acceptance criteria from an objective.
@@ -259,37 +525,108 @@ export function deriveCriteria(objective: string): DerivedCriterion[] {
   const targets = enumerated ? listLines : [text];
   const contentPaths = new Set<string>();
   for (const target of targets) {
-    let matched = false;
-    // First pass: content-bearing file requirements. There is deliberately no
-    // cap on how many requirements are kept: truncation silently discarded the
-    // tail of an enumerated objective, letting verification certify a
-    // shortened interpretation of what the user asked for.
-    for (const { re, build } of FILE_PATTERNS) {
-      for (const match of target.matchAll(re)) {
-        const spec = build(match);
-        if (!spec || spec.type !== "file") continue;
-        const content = contentOf(spec);
-        if (!content) continue;
-        matched = true;
-        contentPaths.add(spec.path);
-        push(contentText(spec, content), spec);
+    // Clause pre-splitting (audit #2): each target is parsed clause by clause
+    // at boundaries a conservative reader trusts. Within a clause the regexes
+    // never cross a boundary, so a following file requirement can no longer
+    // be truncated into the previous content by the dot inside its own path,
+    // and an obligation after "and"/"then" is its own clause rather than
+    // somebody else's literal content.
+    const unresolvedClauses: string[] = [];
+    let targetMatched = false;
+    for (const clause of splitObligationClauses(target)) {
+      let matched = false;
+      // Source-span accounting (audit #2): a regex match proves only that the
+      // span it consumed was represented. The remainder of the clause must be
+      // examined: an obligation-bearing residual ("... and run the integration
+      // suite") is a separate requirement, never absorbed into a parsed file
+      // content and never silently dropped. `consumed[i]` marks characters of
+      // the clause a confident match explained.
+      const consumed = new Array<boolean>(clause.length).fill(false);
+      const mark = (start: number, end: number) => {
+        for (let i = Math.max(0, start); i < Math.min(clause.length, end); i++) consumed[i] = true;
+      };
+
+      // First pass: content-bearing file requirements. There is deliberately
+      // no cap on how many requirements are kept: truncation silently
+      // discarded the tail of an enumerated objective, letting verification
+      // certify a shortened interpretation of what the user asked for.
+      for (const { re, build } of FILE_PATTERNS) {
+        for (const match of clause.matchAll(re)) {
+          const parsed = build(match);
+          if (!parsed || parsed.spec.type !== "file") continue;
+          const spec = parsed.spec;
+          const content = contentOf(spec);
+          if (!content) continue;
+          matched = true;
+          contentPaths.add(spec.path);
+          push(contentText(spec, content), spec);
+          mark(match.index ?? 0, (match.index ?? 0) + match[0].length);
+          // A conjunction inside an unquoted capture introduced a separate
+          // obligation: it was excluded from the content, and it is preserved
+          // as its own unresolved requirement rather than absorbed or dropped.
+          if (parsed.residual) {
+            push(`The requirement is achieved: ${parsed.residual}`, { type: "objective" });
+          }
+        }
+      }
+      // Second pass: existence-only requirements, unless a content criterion
+      // already covers the same path — an existence-only criterion must never
+      // sit beside a stronger content requirement for the same file.
+      for (const { re, build } of FILE_PATTERNS) {
+        for (const match of clause.matchAll(re)) {
+          const parsed = build(match);
+          if (!parsed || parsed.spec.type !== "file") continue;
+          if (contentOf(parsed.spec)) continue;
+          const spec = parsed.spec;
+          if (contentPaths.has(spec.path)) continue;
+          matched = true;
+          push(`${spec.path} exists`, spec);
+          mark(match.index ?? 0, (match.index ?? 0) + match[0].length);
+        }
+      }
+      if (matched) {
+        targetMatched = true;
+        // Residual obligations: text left outside every confident match that
+        // still carries an obligation. Each becomes its own criterion so
+        // nothing is lost or folded into a neighbour's content. Pure
+        // connective prose ("and", "then") is not an obligation and is
+        // discarded.
+        for (const residual of residualObligations(clause, consumed)) {
+          push(`The requirement is achieved: ${residual}`, { type: "objective" });
+        }
+      } else {
+        unresolvedClauses.push(clause);
       }
     }
-    // Second pass: existence-only requirements, unless a content criterion
-    // already covers the same path — an existence-only criterion must never
-    // sit beside a stronger content requirement for the same file.
-    for (const { re, build } of FILE_PATTERNS) {
-      for (const match of target.matchAll(re)) {
-        const spec = build(match);
-        if (!spec || spec.type !== "file") continue;
-        if (contentOf(spec)) continue;
-        if (contentPaths.has(spec.path)) continue;
-        matched = true;
-        push(`${spec.path} exists`, spec);
-      }
-    }
-    if (!matched) {
+    if (!targetMatched) {
+      // Nothing in the target parsed concretely: the target itself is the
+      // objective-level remainder, kept verbatim as ONE criterion. It is
+      // never proven by ordinary evidence; it resolves through concrete
+      // sub-criteria, an audit verdict, or user acceptance. Fragmenting an
+      // unparseable objective would invent arbitrary sub-remainders ("audit
+      // the repository" / "fix any critical bugs") whose coverage semantics
+      // the model cannot honestly establish.
       push(`The requirement is achieved: ${target}`, { type: "objective" });
+      continue;
+    }
+    // Excluded clauses of a partially parsed target: each unresolved clause is
+    // a specific obligation the confident parse set aside. It is recorded as
+    // its own criterion when it still reads as an obligation; connective
+    // prose, fragments, and workflow instructions ("propose completion") are
+    // not requirements and are dropped.
+    for (const clause of unresolvedClauses) {
+      const cleaned = clause
+        .replace(/^[\s,;.]+|[\s,;.]+$/g, "")
+        .replace(/^(?:and|then|also|plus)\s+/i, "")
+        .trim();
+      if (
+        cleaned &&
+        !/^(?:and|then|also|plus)$/i.test(cleaned) &&
+        !isProceduralInstruction(cleaned) &&
+        readsAsObligation(cleaned)
+      ) {
+        push(`The requirement is achieved: ${cleaned}`, { type: "objective" });
+      }
     }
   }
 

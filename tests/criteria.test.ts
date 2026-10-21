@@ -7,6 +7,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import {
+  completionPolicyFor,
   deriveCriteria,
   preservesObligation,
   type CriterionSpec,
@@ -154,6 +155,113 @@ describe("deriveCriteria", () => {
     // duplicate that a bare file write could satisfy instead.
     expect(fileCriteria).toHaveLength(1);
     expect(fileCriteria[0].spec).toEqual({ type: "file", path: "result.txt", equals: "success" });
+  });
+});
+
+// Audit-4 #2 (P0): a confident file match must not absorb the rest of its
+// clause, and no explicit obligation may silently disappear. Every requirement
+// either becomes a faithful criterion or is preserved as an unresolved one.
+describe("compound requirements are never absorbed or dropped", () => {
+  const fileSpecs = (objective: string) =>
+    deriveCriteria(objective)
+      .filter((c) => c.spec.type === "file")
+      .map((c) => c.spec);
+  const texts = (objective: string) => deriveCriteria(objective).map((c) => c.text);
+
+  test("an unquoted exact capture stops before a following obligation", () => {
+    const objective =
+      "Create a file called a.txt containing exactly: alpha and run the complete integration suite.";
+    // The file content is the literal `alpha`; the suite requirement is NOT
+    // part of it.
+    expect(fileSpecs(objective)).toEqual([{ type: "file", path: "a.txt", equals: "alpha" }]);
+    // ...and the suite requirement survives as its own unresolved criterion.
+    expect(
+      texts(objective).some(
+        (t) => t.includes("run the complete integration suite") && !t.includes("a.txt"),
+      ),
+    ).toBe(true);
+  });
+
+  test("quoted content keeps conjunctions verbatim and is never split", () => {
+    const objective =
+      'Create a file called a.txt containing exactly: "alpha and run the complete integration suite".';
+    expect(fileSpecs(objective)).toEqual([
+      { type: "file", path: "a.txt", equals: "alpha and run the complete integration suite" },
+    ]);
+    // Nothing residual: the quote bounded the content.
+    expect(deriveCriteria(objective)).toHaveLength(1);
+  });
+
+  test("a conjunction without an imperative verb stays literal content", () => {
+    expect(fileSpecs("Create a file called a.txt containing exactly: alpha and beta")).toEqual([
+      { type: "file", path: "a.txt", equals: "alpha and beta" },
+    ]);
+    expect(fileSpecs("Write alpha and beta to notes.txt.")).toEqual([
+      { type: "file", path: "notes.txt", contains: "alpha and beta" },
+    ]);
+  });
+
+  test("file creation, test execution, deployment, security, and negative clauses all survive", () => {
+    const objective = [
+      "Create a file called report.md containing exactly: done.",
+      "Run the complete integration suite.",
+      "Do not deploy to production.",
+      "Keep the audit log immutable.",
+      "Never modify the public API.",
+    ].join("\n");
+    const criteria = deriveCriteria(objective);
+    const all = criteria.map((c) => c.text.toLowerCase());
+    expect(fileSpecs(objective)).toEqual([{ type: "file", path: "report.md", equals: "done" }]);
+    expect(all.some((t) => t.includes("integration suite"))).toBe(true);
+    expect(all.some((t) => t.includes("deploy to production"))).toBe(true);
+    expect(all.some((t) => t.includes("audit log"))).toBe(true);
+    expect(all.some((t) => t.includes("public api"))).toBe(true);
+    // Every clause has either a faithful spec or an unresolved criterion.
+    expect(criteria.every((c) => c.spec.type === "file" || c.spec.type === "objective")).toBe(true);
+  });
+
+  test("a negative constraint is never folded into a neighbouring content spec", () => {
+    const objective =
+      "Create a file called config.json containing exactly: {}. Never commit credentials.";
+    expect(fileSpecs(objective)).toEqual([{ type: "file", path: "config.json", equals: "{}" }]);
+    expect(texts(objective).some((t) => t.toLowerCase().includes("credentials"))).toBe(true);
+  });
+
+  test("comma-separated file requirements each keep their own exact content", () => {
+    const objective =
+      "Write two files: a.txt containing exactly alpha, and b.txt containing exactly bravo.";
+    const criteria = deriveCriteria(objective);
+    // The dot inside "b.txt" must not truncate the first capture: each file
+    // keeps its own literal content, and neither the preamble ("Write two
+    // files:") nor the second requirement resurfaces as an unresolved
+    // criterion.
+    expect(fileSpecs(objective)).toEqual([
+      { type: "file", path: "a.txt", equals: "alpha" },
+      { type: "file", path: "b.txt", equals: "bravo" },
+    ]);
+    expect(criteria.every((c) => c.spec.type === "file")).toBe(true);
+  });
+
+  test("a path that merely starts with 'file' is not eaten by the list preamble", () => {
+    expect(fileSpecs("Write files.json containing exactly: alpha")).toEqual([
+      { type: "file", path: "files.json", equals: "alpha" },
+    ]);
+  });
+});
+
+describe("completionPolicyFor", () => {
+  test("a fully machine-checkable objective needs no human verdict", () => {
+    expect(completionPolicyFor("Create a file called a.txt containing exactly: alpha.", deriveCriteria("Create a file called a.txt containing exactly: alpha."))).toBe("machine");
+  });
+
+  test("an open-ended investigation-and-repair objective is audited", () => {
+    const objective = "Audit the repository and fix any critical bugs found.";
+    expect(completionPolicyFor(objective, deriveCriteria(objective))).toBe("audited");
+  });
+
+  test("a subjective objective keeps user acceptance", () => {
+    const objective = "Make the onboarding copy warmer and more inviting.";
+    expect(completionPolicyFor(objective, deriveCriteria(objective))).toBe("userAcceptance");
   });
 });
 

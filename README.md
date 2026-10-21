@@ -273,7 +273,7 @@ inspection. It never touches the user's database or sessions.
 ## Verification
 
 ```bash
-bun test          # 228 unit/integration tests, 645 assertions
+bun test          # 245 unit/integration tests, 694 assertions
 bun run typecheck # clean
 bash scripts/parity.sh  # 17/17 live acceptance checks
 ```
@@ -476,3 +476,40 @@ sweep driving of active goals, session usage accounting, and a health RPC.
 The earlier RPC `undefined` bug is also fixed: absent fields are coerced to
 `null` before the output schema validates, so `goal.replace` no longer mutates
 state and then fails serialization.
+
+A fourth independent audit then found completion-authority and
+requirement-preservation gaps; package 1 of its remediation plan is fixed
+with regression tests:
+
+18. **Completion policy is explicit (P0)** — every goal now records how it may
+    reach verified completion. `machine` (every criterion has a
+    machine-checkable spec), `audited` (an open-ended engineering objective:
+    completion is hands-off once every confirmed requirement is
+    machine-proven AND the objective-level remainder is covered by
+    controller-computed `ObjectiveAssessment` whose scope is the objective as
+    stated), or `userAcceptance` (subjective outcomes). The policy is derived
+    from the objective at creation, stored in `goals.completion_policy`, and
+    backfilled for existing goals. The audit verdict is computed from proofs
+    re-checked in the same fenced transaction and persisted in
+    `goal_objective_assessments`; `satisfied` requires zero unresolved
+    requirements and proven criteria covering the objective remainder, and
+    `indeterminate` is the honest verdict when no concrete requirement exists.
+    An audited goal certifies its bounded scope — it is not a claim that no
+    undiscovered defect exists. User acceptance is honored under every policy.
+19. **Coverage links (P0)** — concrete sub-criteria declare which objective
+    requirement they cover (`goal_criteria.covers`, supplied through
+    `goal_add_criterion`); the store validates that coverage targets exist
+    and are objective-type, and re-adding a criterion merges its coverage.
+20. **Source-span accounting in derivation (P0)** — objective text is split
+    into obligation clauses at boundaries a conservative reader trusts
+    (sentence punctuation outside quotes; a conjunction followed by an
+    imperative verb or another file requirement), each clause is parsed
+    independently, and unconsumed spans are examined for residual obligations.
+    A parsed file requirement can no longer absorb the rest of its clause
+    (including the comma-separated two-file case, where the dot inside
+    "b.txt" used to truncate the capture into corrupted literal content), and
+    nothing is silently dropped: every obligation becomes a faithful
+    criterion or an explicitly unresolved one. Quoted content is never split,
+    a conjunction without an obligation after it stays literal content
+    ("alpha and beta"), and workflow instructions ("propose completion") are
+    never treated as outcome requirements.

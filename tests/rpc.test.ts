@@ -55,6 +55,51 @@ describe("rpc definition", () => {
 });
 
 describe("goal.status", () => {
+  // The parity harness caught this failure mode: the store's optional row
+  // fields (`spec`, `covers`) are `undefined` when absent, and the RPC output
+  // schema rejects `undefined` — turning a successful goal.create mutation
+  // into `RpcInternalError: Expected JSON value at ["goal"]["criteria"]` while
+  // the goal itself was created and driven.
+  function assertJSONValues(value: unknown, path = "$"): void {
+    if (value === undefined) {
+      throw new Error(`undefined at ${path} — not a JSON value; the RPC output schema rejects it`);
+    }
+    if (Array.isArray(value)) {
+      value.forEach((v, i) => assertJSONValues(v, `${path}[${i}]`));
+    } else if (value && typeof value === "object") {
+      for (const [k, v] of Object.entries(value)) assertJSONValues(v, `${path}.${k}`);
+    }
+  }
+
+  test("every wire field is a JSON value; absent spec/covers serialize as null", async () => {
+    const start = controller.startOrDescribe(
+      "ses_a",
+      "Create a file called a.txt containing exactly: alpha and run the integration suite",
+    );
+    if (!("created" in start)) throw new Error("expected a new goal");
+    const goal = start.created;
+    const objectiveID = controller.store
+      .listCriteria(goal.id)
+      .find((c) => c.spec?.type === "objective")?.id;
+    if (!objectiveID) throw new Error("expected an objective-level criterion");
+    controller.store.addCriterion(
+      goal.id,
+      "sub requirement: the suite exits zero",
+      { type: "test", command: "bun test" },
+      "model",
+      [objectiveID!],
+    );
+    const res = await handlers["goal.status"]({ sessionID: "ses_a" });
+    expect(() => assertJSONValues(res)).not.toThrow();
+    const criteria = res.goal!.criteria;
+    expect(criteria.length).toBeGreaterThanOrEqual(2);
+    expect(criteria.every((c) => c.covers === null || Array.isArray(c.covers))).toBe(true);
+    expect(criteria.every((c) => c.spec !== undefined)).toBe(true);
+    expect(criteria.find((c) => c.text.includes("suite exits zero"))?.covers).toEqual([
+      objectiveID,
+    ]);
+  });
+
   test("reports no goal for an empty session", async () => {
     const res = await handlers["goal.status"]({ sessionID: "ses_a" });
     expect(res.goal).toBeNull();

@@ -520,6 +520,12 @@ export default {
                 },
                 additionalProperties: false,
               },
+              covers: {
+                type: "array",
+                items: { type: "string" },
+                description:
+                  "Objective-level criterion IDs this concrete requirement was registered to satisfy. Only proven concrete requirements discharge an objective-level remainder under the audited completion policy.",
+              },
               goal_id: str,
               generation: num,
             },
@@ -548,6 +554,9 @@ export default {
             const out = controller.addCriterion(toolCtx?.sessionID, {
               text: String(input?.text ?? ""),
               spec: spec as any,
+              covers: Array.isArray(input?.covers)
+                ? input.covers.map((v: unknown) => String(v))
+                : undefined,
               goalID: target.ref.goalID,
               generation: target.ref.generation,
             });

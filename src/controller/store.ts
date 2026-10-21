@@ -77,6 +77,13 @@ CREATE TABLE IF NOT EXISTS goals (
   -- evidence changed underneath it.
   verification_revision    INTEGER NOT NULL DEFAULT 0,
   verification_snapshot    TEXT,
+  -- How this goal is permitted to reach completion (audit #1): machine,
+  -- audited, or userAcceptance. Decided at creation from the objective text
+  -- and its derived criteria; never changed by the model.
+  completion_policy        TEXT NOT NULL DEFAULT 'userAcceptance',
+  -- Revision of the immutable objective text. Assessments are scoped to it so
+  -- a stale assessment can never certify a different requirement set.
+  objective_revision       INTEGER NOT NULL DEFAULT 1,
   -- Set when a continuation submission terminally failed. While set, the
   -- driver refuses to dispatch until recovery clears it, so a terminal
   -- delivery failure cannot be circumvented by minting a fresh continuation.
@@ -123,6 +130,11 @@ CREATE TABLE IF NOT EXISTS goal_criteria (
   -- not deleted: the row stays for the audit trail but no longer gates
   -- verification. User-source criteria cannot be superseded by the model.
   superseded  INTEGER NOT NULL DEFAULT 0,
+  -- JSON array of objective-level criterion IDs this concrete requirement was
+  -- registered to satisfy (audit #1). Only a proven concrete requirement can
+  -- discharge an objective-level remainder under the audited policy, so the
+  -- model must name the coverage instead of asserting the objective is met.
+  covers      TEXT,
   created_at_ms INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS goal_criteria_goal ON goal_criteria (goal_id);
@@ -214,6 +226,31 @@ CREATE TABLE IF NOT EXISTS goal_acceptances (
   at_ms       INTEGER NOT NULL
 );
 
+-- Controller-computed objective-level assessments (audit #1, audited policy).
+--
+-- Audited goals define completion operationally: the objective is
+-- open-ended, so completion means every confirmed requirement discovered
+-- within the audited scope is independently verified, and no known,
+-- actionable requirement remains unresolved. The controller records the
+-- assessment it computed from the per-criterion proofs; the model cannot write
+-- this row and cannot declare its own verdict.
+--
+-- This is NOT a claim that no undiscovered bugs exist. The recorded scope is
+-- the honest boundary: what the final bounded review covered, and what it did
+-- not. Scope that cannot be bounded yields indeterminate, not satisfied.
+CREATE TABLE IF NOT EXISTS goal_objective_assessments (
+  goal_id                TEXT PRIMARY KEY,
+  generation             INTEGER NOT NULL,
+  objective_revision     INTEGER NOT NULL,
+  verdict                TEXT NOT NULL,
+  scope                  TEXT NOT NULL,
+  covered_requirements   TEXT NOT NULL,
+  unresolved_requirements TEXT NOT NULL,
+  evidence_ids           TEXT NOT NULL,
+  note                   TEXT,
+  at_ms                  INTEGER NOT NULL
+);
+
 -- Continuation ledger. One row per continuation attempt.
 --
 -- inbox_id is the OpenCode message ID we reserve BEFORE submitting, and it is
@@ -272,6 +309,8 @@ interface GoalRow {
   verification_revision: number;
   verification_snapshot: string | null;
   delivery_failed: number;
+  completion_policy: string;
+  objective_revision: number;
 }
 
 function toGoal(row: GoalRow): Goal {
@@ -295,6 +334,8 @@ function toGoal(row: GoalRow): Goal {
     verificationRevision: row.verification_revision,
     verificationSnapshot: row.verification_snapshot ?? undefined,
     deliveryFailed: row.delivery_failed === 1,
+    completionPolicy: (row.completion_policy ?? "userAcceptance") as Goal["completionPolicy"],
+    objectiveRevision: row.objective_revision ?? 1,
   };
 }
 
@@ -373,6 +414,42 @@ export class GoalStore {
     if (!columns.includes("superseded")) {
       this.db.exec(`ALTER TABLE goal_criteria ADD COLUMN superseded INTEGER NOT NULL DEFAULT 0`);
     }
+    // Coverage links (audit #1): which objective-level criterion a concrete
+    // requirement was registered to satisfy.
+    if (!columns.includes("covers")) {
+      this.db.exec(`ALTER TABLE goal_criteria ADD COLUMN covers TEXT`);
+    }
+    // Completion policy (audit #1). Older rows default to userAcceptance: a
+    // goal created before the policy existed must not silently gain a weaker
+    // (or stronger) completion rule. Backfill `machine` only where every
+    // non-superseded criterion is machine-checkable.
+    const goalColumns = this.db
+      .query<{ name: string }, []>(`PRAGMA table_info(goals)`)
+      .all()
+      .map((row) => row.name);
+    if (!goalColumns.includes("completion_policy")) {
+      this.db.exec(
+        `ALTER TABLE goals ADD COLUMN completion_policy TEXT NOT NULL DEFAULT 'userAcceptance'`,
+      );
+    }
+    if (!goalColumns.includes("objective_revision")) {
+      this.db.exec(
+        `ALTER TABLE goals ADD COLUMN objective_revision INTEGER NOT NULL DEFAULT 1`,
+      );
+    }
+    this.db
+      .query(
+        `UPDATE goals SET completion_policy = 'machine'
+          WHERE completion_policy = 'userAcceptance'
+            AND status IN ('active', 'verifying', 'paused')
+            AND EXISTS (SELECT 1 FROM goal_criteria c WHERE c.goal_id = goals.id AND c.superseded = 0)
+            AND NOT EXISTS (
+              SELECT 1 FROM goal_criteria c
+               WHERE c.goal_id = goals.id AND c.superseded = 0
+                 AND (c.spec IS NULL OR json_extract(c.spec, '$.type') = 'objective')
+            )`,
+      )
+      .run();
     // Authority normalization: rows stored as "derived" were all extracted
     // from the user's objective by the controller (model-added rows are
     // "model"). Their origin is the user's, so they carry the user's
@@ -534,6 +611,7 @@ export class GoalStore {
     tokenBudget?: number;
     actor?: Actor;
     criteria?: CriterionInput[];
+    completionPolicy?: Goal["completionPolicy"];
   }): Goal {
     if (!input.objective || !input.objective.trim()) {
       throw new TransitionRejectedError("objective must not be empty");
@@ -562,10 +640,19 @@ export class GoalStore {
         .query(
           `INSERT INTO goals (id, session_id, generation, objective, status, rounds,
              no_progress_rounds, repeated_blocker_rounds, token_budget, version,
-             created_at_ms, updated_at_ms)
-           VALUES (?, ?, ?, ?, 'active', 0, 0, 0, ?, 0, ?, ?)`,
+             completion_policy, created_at_ms, updated_at_ms)
+           VALUES (?, ?, ?, ?, 'active', 0, 0, 0, ?, 0, ?, ?, ?)`,
         )
-        .run(id, input.sessionID, generation, input.objective.trim(), input.tokenBudget ?? null, now, now);
+        .run(
+          id,
+          input.sessionID,
+          generation,
+          input.objective.trim(),
+          input.tokenBudget ?? null,
+          input.completionPolicy ?? "userAcceptance",
+          now,
+          now,
+        );
       this.appendEvent(id, generation, "created", {
         toStatus: "active",
         actor: input.actor ?? "user",
@@ -592,6 +679,7 @@ export class GoalStore {
     actor?: Actor;
     reason?: string;
     criteria?: CriterionInput[];
+    completionPolicy?: Goal["completionPolicy"];
   }): Goal {
     if (!input.objective || !input.objective.trim()) {
       throw new TransitionRejectedError("objective must not be empty");
@@ -639,8 +727,8 @@ export class GoalStore {
         .query(
           `INSERT INTO goals (id, session_id, generation, objective, status, rounds,
              no_progress_rounds, repeated_blocker_rounds, token_budget, version,
-             created_at_ms, updated_at_ms)
-           VALUES (?, ?, ?, ?, 'active', 0, 0, 0, ?, 0, ?, ?)`,
+             completion_policy, created_at_ms, updated_at_ms)
+           VALUES (?, ?, ?, ?, 'active', 0, 0, 0, ?, 0, ?, ?, ?)`,
         )
         .run(
           newIDValue,
@@ -648,6 +736,7 @@ export class GoalStore {
           nextGeneration,
           input.objective.trim(),
           input.tokenBudget ?? existing.tokenBudget ?? null,
+          input.completionPolicy ?? "userAcceptance",
           now,
           now,
         );
@@ -806,12 +895,13 @@ export class GoalStore {
     generation: number,
     input: CriterionInput,
     atMs: number,
+    covers?: string[],
   ): string {
     const id = newID("crit");
     this.db
       .query(
-        `INSERT INTO goal_criteria (id, goal_id, generation, text, spec, source, met, created_at_ms)
-         VALUES (?, ?, ?, ?, ?, ?, 0, ?)`,
+        `INSERT INTO goal_criteria (id, goal_id, generation, text, spec, source, met, covers, created_at_ms)
+         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)`,
       )
       .run(
         id,
@@ -820,6 +910,7 @@ export class GoalStore {
         input.text.trim(),
         input.spec ? JSON.stringify(input.spec) : null,
         input.source ?? "user",
+        covers && covers.length > 0 ? JSON.stringify(covers) : null,
         atMs,
       );
     return id;
@@ -838,6 +929,7 @@ export class GoalStore {
     text: string,
     spec?: CriterionSpec,
     source: "user" | "model" | "derived" = "user",
+    covers?: string[],
   ): string {
     const goal = this.byID(goalID);
     if (!goal) throw new GoalConflictError(`unknown goal ${goalID}`);
@@ -850,6 +942,25 @@ export class GoalStore {
         "the model cannot establish an objective-type criterion; only the user can accept the objective",
       );
     }
+    const covered = covers && covers.length > 0 ? [...new Set(covers)] : undefined;
+    if (covered) {
+      // Coverage links are claims about *this* goal's objective-level
+      // requirements. They are validated here so a link can never point at
+      // another goal, a missing row, or a criterion the model itself created
+      // (a model row must not bootstrap authority by covering itself).
+      const existing = this.listCriteria(goalID);
+      for (const id of covered) {
+        const target = existing.find((c) => c.id === id);
+        if (!target) {
+          throw new TransitionRejectedError(`unknown criterion ${id} in covers`);
+        }
+        if (target.spec?.type !== "objective") {
+          throw new TransitionRejectedError(
+            `criterion ${id} is not an objective-level requirement; covers may only name the objective remainder`,
+          );
+        }
+      }
+    }
     let id = "";
     this.tx(() => {
       const existingRows = this.db
@@ -861,12 +972,28 @@ export class GoalStore {
         (r) => r.text.trim().toLowerCase().replace(/\s+/g, " ") === normalized,
       );
       if (existing) {
+        // Idempotent re-registration can still contribute coverage: the same
+        // concrete requirement may be the model's evidence for two objective
+        // requirements. Merge rather than replace.
+        if (covered) this.mergeCoverage(existing.id, covered);
         id = existing.id;
         return;
       }
-      id = this.insertCriterion(goalID, goal.generation, { text, spec, source }, Date.now());
+      id = this.insertCriterion(goalID, goal.generation, { text, spec, source }, Date.now(), covered);
     });
     return id;
+  }
+
+  /** Union new coverage links into an existing criterion row. */
+  private mergeCoverage(criterionID: string, covers: string[]): void {
+    const row = this.db
+      .query<{ covers: string | null }, [string]>(`SELECT covers FROM goal_criteria WHERE id = ?`)
+      .get(criterionID);
+    if (!row) return;
+    const merged = new Set<string>([...(row.covers ? (JSON.parse(row.covers) as string[]) : []), ...covers]);
+    this.db
+      .query(`UPDATE goal_criteria SET covers = ? WHERE id = ?`)
+      .run(JSON.stringify([...merged]), criterionID);
   }
 
   /**
@@ -979,6 +1106,54 @@ export class GoalStore {
     return { generation: row.generation, note: row.note ?? undefined, atMs: row.at_ms };
   }
 
+  /** The latest objective-level assessment recorded for a goal, if any. */
+  objectiveAssessment(goalID: string):
+    | {
+        generation: number;
+        objectiveRevision: number;
+        verdict: "satisfied" | "incomplete" | "indeterminate";
+        scope: string;
+        coveredRequirements: string[];
+        unresolvedRequirements: string[];
+        evidenceIDs: string[];
+        note?: string;
+        atMs: number;
+      }
+    | undefined {
+    const row = this.db
+      .query<
+        {
+          generation: number;
+          objective_revision: number;
+          verdict: string;
+          scope: string;
+          covered_requirements: string;
+          unresolved_requirements: string;
+          evidence_ids: string;
+          note: string | null;
+          at_ms: number;
+        },
+        [string]
+      >(
+        `SELECT generation, objective_revision, verdict, scope, covered_requirements,
+                unresolved_requirements, evidence_ids, note, at_ms
+           FROM goal_objective_assessments WHERE goal_id = ?`,
+      )
+      .get(goalID);
+    if (!row) return undefined;
+    return {
+      generation: row.generation,
+      objectiveRevision: row.objective_revision,
+      verdict: row.verdict as "satisfied" | "incomplete" | "indeterminate",
+      scope: row.scope,
+      coveredRequirements: JSON.parse(row.covered_requirements) as string[],
+      unresolvedRequirements: JSON.parse(row.unresolved_requirements) as string[],
+      evidenceIDs: JSON.parse(row.evidence_ids) as string[],
+      note: row.note ?? undefined,
+      atMs: row.at_ms,
+    };
+  }
+
   addEvidence(input: {
     goalID: string;
     criterionID?: string;
@@ -1024,13 +1199,14 @@ export class GoalStore {
     met: boolean;
     spec?: CriterionSpec;
     source: string;
+    covers?: string[];
   }[] {
     return this.db
       .query<
-        { id: string; text: string; met: number; spec: string | null; source: string },
+        { id: string; text: string; met: number; spec: string | null; source: string; covers: string | null },
         [string]
       >(
-        `SELECT id, text, met, spec, source FROM goal_criteria
+        `SELECT id, text, met, spec, source, covers FROM goal_criteria
           WHERE goal_id = ? AND superseded = 0 ORDER BY created_at_ms ASC`,
       )
       .all(goalID)
@@ -1040,6 +1216,7 @@ export class GoalStore {
         met: r.met === 1,
         spec: r.spec ? (JSON.parse(r.spec) as CriterionSpec) : undefined,
         source: r.source,
+        covers: r.covers ? (JSON.parse(r.covers) as string[]) : undefined,
       }));
   }
 
@@ -1129,6 +1306,15 @@ export class GoalStore {
     }[],
     snapshot: string,
     attempt?: { generation: number; version: number },
+    assessment?: {
+      objectiveRevision: number;
+      verdict: "satisfied" | "incomplete" | "indeterminate";
+      scope: string;
+      coveredRequirements: string[];
+      unresolvedRequirements: string[];
+      evidenceIDs: string[];
+      note?: string;
+    },
   ): boolean {
     return this.tx(() => {
       const goal = this.byID(goalID);
@@ -1162,6 +1348,39 @@ export class GoalStore {
         this.db
           .query(`UPDATE goal_criteria SET met = ? WHERE id = ? AND goal_id = ?`)
           .run(proof.verdict === "pass" ? 1 : 0, proof.criterionID, goalID);
+      }
+      if (assessment) {
+        // The objective-level assessment is written in the same fenced
+        // transaction as the proofs it was computed from: a stale attempt can
+        // never persist an assessment against a superseded goal.
+        this.db
+          .query(
+            `INSERT INTO goal_objective_assessments
+               (goal_id, generation, objective_revision, verdict, scope,
+                covered_requirements, unresolved_requirements, evidence_ids, note, at_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(goal_id) DO UPDATE SET generation=excluded.generation,
+               objective_revision=excluded.objective_revision, verdict=excluded.verdict,
+               scope=excluded.scope, covered_requirements=excluded.covered_requirements,
+               unresolved_requirements=excluded.unresolved_requirements,
+               evidence_ids=excluded.evidence_ids, note=excluded.note, at_ms=excluded.at_ms`,
+          )
+          .run(
+            goalID,
+            goal.generation,
+            assessment.objectiveRevision,
+            assessment.verdict,
+            assessment.scope,
+            JSON.stringify(assessment.coveredRequirements),
+            JSON.stringify(assessment.unresolvedRequirements),
+            JSON.stringify(assessment.evidenceIDs),
+            assessment.note ?? null,
+            now,
+          );
+        this.appendEvent(goalID, goal.generation, "assessed", {
+          actor: "controller",
+          detail: `${assessment.verdict}: ${assessment.unresolvedRequirements.length} unresolved requirement(s)`,
+        });
       }
       this.db
         .query(

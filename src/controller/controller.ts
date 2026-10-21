@@ -12,7 +12,9 @@
 import { GoalStore, GoalConflictError } from "./store.ts";
 import { type Actor, type Goal, type GoalStatus, isNonTerminal } from "./state.ts";
 import {
+  completionPolicyFor,
   deriveCriteria as deriveCriterionInputs,
+  type CompletionPolicy,
   type CriterionInput,
   type CriterionSpec,
 } from "./criteria.ts";
@@ -92,17 +94,39 @@ export class GoalController {
     return this.deriveCriteria(objective);
   }
 
+  /**
+   * Decide how this objective is allowed to reach completion (audit #1).
+   *
+   * The policy is derived from the objective and its own criteria, never chosen
+   * by the model: a fully machine-checkable objective needs only proofs; an
+   * open-ended investigation-and-repair objective gets the `audited` policy so
+   * it can finish hands-off once every discovered requirement is proven; a
+   * subjective objective keeps the explicit user-acceptance rule.
+   */
+  private policyFor(objective: string, criteria: CriterionInput[]): CompletionPolicy {
+    return completionPolicyFor(
+      objective,
+      criteria.map((c) => ({
+        text: c.text,
+        spec: c.spec ?? { type: "objective" },
+        source: c.source ?? "user",
+      })),
+    );
+  }
+
   // ------------------------------------------------------- user commands
 
   /** `/goal <objective>` — start, or report that a replacement is required. */
   startOrDescribe(sessionID: string, objective: string): { created: Goal } | { existing: Goal } {
     const existing = this.store.current(sessionID);
     if (existing) return { existing };
+    const criteria = this.criteriaFor(objective);
     const goal = this.store.create({
       sessionID,
       objective,
       actor: "user",
-      criteria: this.criteriaFor(objective),
+      criteria,
+      completionPolicy: this.policyFor(objective, criteria),
     });
     return { created: goal };
   }
@@ -111,8 +135,9 @@ export class GoalController {
   replace(sessionID: string, objective: string, expectedGeneration?: number): Goal {
     const existing = this.store.current(sessionID);
     const criteria = this.criteriaFor(objective);
+    const completionPolicy = this.policyFor(objective, criteria);
     if (!existing) {
-      return this.store.create({ sessionID, objective, actor: "user", criteria });
+      return this.store.create({ sessionID, objective, actor: "user", criteria, completionPolicy });
     }
     return this.store.replace({
       sessionID,
@@ -120,6 +145,7 @@ export class GoalController {
       objective,
       actor: "user",
       criteria,
+      completionPolicy,
     });
   }
 
@@ -349,7 +375,7 @@ export class GoalController {
    */
   addCriterion(
     sessionID: string,
-    input: { text: string; spec?: CriterionSpec } & GoalRef,
+    input: { text: string; spec?: CriterionSpec; covers?: string[] } & GoalRef,
   ): { criterionID?: string; rejected?: string } {
     const target = this.resolveTarget(sessionID, input);
     if (!target.ok) return { rejected: target.rejected };
@@ -359,6 +385,7 @@ export class GoalController {
         input.text,
         input.spec,
         "model",
+        input.covers,
       );
       return { criterionID };
     } catch (error) {

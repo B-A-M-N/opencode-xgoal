@@ -117,11 +117,24 @@ function preservesObligation(oldSpec, newSpec) {
   }
   return false;
 }
+function completionPolicyFor(objective, criteria) {
+  if (criteria.length === 0)
+    return "userAcceptance";
+  if (criteria.every((c) => c.spec.type !== "objective"))
+    return "machine";
+  const text = objective.toLowerCase();
+  const investigation = /\b(?:audit|investigate|find|review|analy[sz]e|harden|diagnose|debug)\b/.test(text) && /\b(?:fix|repair|address|resolve|correct|eliminate|patch)\b/.test(text);
+  const engineering = /\b(?:file|files|tests?|suite|bugs?|code|repo(?:sitory)?|build|deploy(?:ment)?|commit|branch|function|module|api|endpoint|config(?:uration)?|dependenc(?:y|ies)|lint|typecheck|script|package|database|schema|migration|server|client|pipeline|workflow|command|error|failure|regression|issue|security|performance)\b/.test(text);
+  return investigation || engineering ? "audited" : "userAcceptance";
+}
 var FILE_NAME = "[\\w./\\-]+\\.[A-Za-z0-9]+";
 var PATH_TOKEN = "(`[^`]+`|\"[^\"]+\"|'[^']+'|[^\\s,;]+)";
-var CONTENT_TOKEN = "(`[^`]+`|\"[^\"]+\"|'[^']+'|[^.;\\n]+)";
+var QUOTED_TOKEN = "(?:`[^`]+`|\"[^\"]+\"|'[^']+')";
+var UNQUOTED_CONTENT = "[^.;\\n]+";
+var CONTENT_TOKEN = `(${QUOTED_TOKEN}|${UNQUOTED_CONTENT})`;
 var EXACTLY_TOKEN = "((?:exactly:?\\s+)?)";
 var PATH_NAME = `(${FILE_NAME}|\`[^\`]+\`|"[^"]+"|'[^']+')`;
+var FILE_LIST_PREAMBLE = "(?:(?:please\\s+)?(?:create|write|make|add)\\s+(?:(?:a|an|the|new|one|two|three|four|five|six|seven|eight|nine|ten|several|multiple|both|all)\\s+)*(?:new\\s+)?files?(?:\\s*[:,]\\s*|\\s+)(?:(?:called|named)\\s+)?)?";
 function strip(value, exact = false) {
   if (!value)
     return "";
@@ -131,6 +144,75 @@ function strip(value, exact = false) {
     return exact ? inner : inner.trim();
   }
   return trimmed.replace(/[.!?]+$/, "");
+}
+function splitObligation(raw) {
+  const trimmed = raw.trim();
+  if (/^([`"']).*\1$/s.test(trimmed))
+    return { content: raw };
+  const re = /(\s*,\s*|\s+)(?:and|then|also)\s+/gi;
+  let match;
+  while (match = re.exec(raw)) {
+    const after = raw.slice(match.index + match[0].length);
+    if (!OBLIGATION_VERB.test(after))
+      continue;
+    return {
+      content: raw.slice(0, match.index).replace(/[\s,;]+$/, ""),
+      residual: after.trim()
+    };
+  }
+  return { content: raw };
+}
+var OBLIGATION_VERB = /^(?:run|execute|test|verify|ensure|make|create|write|add|remove|delete|update|fix|refactor|publish|deploy|commit|push|install|configure|document|keep|avoid|check|confirm|use|start|stop|build|lint|format|review|audit|do\s+not|don't|never|must|should|shall|not)\b/i;
+var FILE_REQUIREMENT_START = new RegExp(`^(?:${FILE_NAME}|\`[^\`]+\`|"[^"]+"|'[^']+')\\s+(?:must\\s+)?(?:contain|contains|containing|include|includes|including|have|has)\\b`, "i");
+var OBLIGATIONISH = /\b(?:[a-z]+(?:e|ed|s|ing|ise|ize|ate|ify)\b|must|should|shall|ensure|verify|run|test|check|deploy|publish|pass|fail|fix|add|create|write|make|keep|avoid|never|do not|don't|no)\b/i;
+function readsAsObligation(clause) {
+  return OBLIGATIONISH.test(clause);
+}
+function splitObligationClauses(text) {
+  const clauses = [];
+  let start = 0;
+  let quote;
+  const push = (end) => {
+    const raw = text.slice(start, end).trim();
+    start = end;
+    if (raw)
+      clauses.push(raw);
+  };
+  for (let i = 0;i < text.length; i++) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === quote) {
+        const next = text[i + 1];
+        if (quote !== "'" || next === undefined || !/\w/.test(next))
+          quote = undefined;
+      }
+      continue;
+    }
+    if (ch === '"' || ch === "`" || ch === "'" && (i === 0 || !/\w/.test(text[i - 1]))) {
+      quote = ch;
+      continue;
+    }
+    if (ch === "." || ch === "!" || ch === "?" || ch === ";" || ch === `
+`) {
+      const next = text[i + 1];
+      if (next === undefined || /\s/.test(next))
+        push(i + 1);
+      continue;
+    }
+    if (ch === "," || /\s/.test(ch)) {
+      const conj = /^,?\s*(?:and|then|also)\s+/i.exec(text.slice(i));
+      if (conj) {
+        const after = text.slice(i + conj[0].length);
+        if (OBLIGATION_VERB.test(after) || FILE_REQUIREMENT_START.test(after)) {
+          push(i);
+          start = i + conj[0].length;
+          i = start - 1;
+        }
+      }
+    }
+  }
+  push(text.length);
+  return clauses.length > 0 ? clauses : [text];
 }
 function fileSpec(path, exact, content) {
   if (!path)
@@ -145,25 +227,28 @@ var FILE_PATTERNS = [
     build: (m) => {
       const path = strip(m[1]);
       const exact = Boolean(m[2]);
-      const content = strip(m[3], exact);
-      return fileSpec(path, exact, content);
+      const split = splitObligation(m[3] ?? "");
+      const spec = fileSpec(path, exact, strip(split.content, exact));
+      return spec ? { spec, residual: split.residual } : undefined;
     }
   },
   {
     re: new RegExp(`write\\s+${CONTENT_TOKEN}\\s+(?:to|into)\\s+${PATH_TOKEN}`, "gi"),
     build: (m) => {
-      const content = strip(m[1]);
+      const split = splitObligation(m[1] ?? "");
       const path = strip(m[2]);
-      return fileSpec(path, false, content);
+      const spec = fileSpec(path, false, strip(split.content));
+      return spec ? { spec, residual: split.residual } : undefined;
     }
   },
   {
-    re: new RegExp(`${FILE_NAME}\\s+(?:must\\s+)?(?:contain|include|have)\\s+${EXACTLY_TOKEN}${CONTENT_TOKEN}`, "gi"),
+    re: new RegExp(`${FILE_LIST_PREAMBLE}(${FILE_NAME})\\s+(?:must\\s+)?(?:contain|contains|containing|include|includes|including|have|has)\\s+${EXACTLY_TOKEN}${CONTENT_TOKEN}`, "gi"),
     build: (m) => {
-      const path = strip(m[0].split(/\s+/)[0]);
-      const exact = Boolean(m[1]);
-      const content = strip(m[2], exact);
-      return fileSpec(path, exact, content);
+      const path = strip(m[1]);
+      const exact = Boolean(m[2]);
+      const split = splitObligation(m[3] ?? "");
+      const spec = fileSpec(path, exact, strip(split.content, exact));
+      return spec ? { spec, residual: split.residual } : undefined;
     }
   },
   {
@@ -172,10 +257,51 @@ var FILE_PATTERNS = [
       const path = strip(m[1]);
       if (!path)
         return;
-      return { type: "file", path };
+      return { spec: { type: "file", path } };
     }
   }
 ];
+function isProceduralInstruction(clause) {
+  const stripped = clause.replace(/^(?:when|once|after|if|as soon as)\b[^,]*,\s*/i, "").trim();
+  return new RegExp("^(?:(?:please|then|now|finally)\\s+)*(" + "(?:propose|declare|report|signal|announce)\\s+(?:the\\s+)?(?:goal\\s+)?(?:completion|complete|done|finished)" + "|call\\s+`?goal_propose_complete`?" + "|(?:report|come)\\s+back(?:\\s+to\\s+the\\s+user)?" + "|stop(?:\\s+work)?|finish(?:ed)?|done" + ")[\\s.!]*$", "i").test(stripped);
+}
+function residualObligations(text, consumed) {
+  const residuals = [];
+  let start = -1;
+  const flush = (end) => {
+    if (start === -1)
+      return;
+    const raw = text.slice(start, end).trim();
+    start = -1;
+    if (!raw)
+      return;
+    const cleaned = raw.replace(/^[\s,;.]+|[\s,;.]+$/g, "").replace(/^(?:and|then|also|plus)\s+/i, "").trim();
+    if (!cleaned)
+      return;
+    if (/^(?:and|then|also|plus)$/i.test(cleaned))
+      return;
+    if (isProceduralInstruction(cleaned))
+      return;
+    if (!readsAsObligation(cleaned))
+      return;
+    residuals.push(cleaned);
+  };
+  for (let i = 0;i < text.length; i++) {
+    if (consumed[i]) {
+      flush(i);
+      continue;
+    }
+    const ch = text[i];
+    if (ch === "." || ch === ";" || ch === `
+`) {
+      flush(i);
+      continue;
+    }
+    start = start === -1 ? i : start;
+  }
+  flush(text.length);
+  return residuals;
+}
 function deriveCriteria(objective) {
   const text = objective.trim();
   if (!text)
@@ -202,35 +328,66 @@ function deriveCriteria(objective) {
   const targets = enumerated ? listLines : [text];
   const contentPaths = new Set;
   for (const target of targets) {
-    let matched = false;
-    for (const { re, build } of FILE_PATTERNS) {
-      for (const match of target.matchAll(re)) {
-        const spec = build(match);
-        if (!spec || spec.type !== "file")
-          continue;
-        const content = contentOf(spec);
-        if (!content)
-          continue;
-        matched = true;
-        contentPaths.add(spec.path);
-        push(contentText(spec, content), spec);
+    const unresolvedClauses = [];
+    let targetMatched = false;
+    for (const clause of splitObligationClauses(target)) {
+      let matched = false;
+      const consumed = new Array(clause.length).fill(false);
+      const mark = (start, end) => {
+        for (let i = Math.max(0, start);i < Math.min(clause.length, end); i++)
+          consumed[i] = true;
+      };
+      for (const { re, build } of FILE_PATTERNS) {
+        for (const match of clause.matchAll(re)) {
+          const parsed = build(match);
+          if (!parsed || parsed.spec.type !== "file")
+            continue;
+          const spec = parsed.spec;
+          const content = contentOf(spec);
+          if (!content)
+            continue;
+          matched = true;
+          contentPaths.add(spec.path);
+          push(contentText(spec, content), spec);
+          mark(match.index ?? 0, (match.index ?? 0) + match[0].length);
+          if (parsed.residual) {
+            push(`The requirement is achieved: ${parsed.residual}`, { type: "objective" });
+          }
+        }
+      }
+      for (const { re, build } of FILE_PATTERNS) {
+        for (const match of clause.matchAll(re)) {
+          const parsed = build(match);
+          if (!parsed || parsed.spec.type !== "file")
+            continue;
+          if (contentOf(parsed.spec))
+            continue;
+          const spec = parsed.spec;
+          if (contentPaths.has(spec.path))
+            continue;
+          matched = true;
+          push(`${spec.path} exists`, spec);
+          mark(match.index ?? 0, (match.index ?? 0) + match[0].length);
+        }
+      }
+      if (matched) {
+        targetMatched = true;
+        for (const residual of residualObligations(clause, consumed)) {
+          push(`The requirement is achieved: ${residual}`, { type: "objective" });
+        }
+      } else {
+        unresolvedClauses.push(clause);
       }
     }
-    for (const { re, build } of FILE_PATTERNS) {
-      for (const match of target.matchAll(re)) {
-        const spec = build(match);
-        if (!spec || spec.type !== "file")
-          continue;
-        if (contentOf(spec))
-          continue;
-        if (contentPaths.has(spec.path))
-          continue;
-        matched = true;
-        push(`${spec.path} exists`, spec);
-      }
-    }
-    if (!matched) {
+    if (!targetMatched) {
       push(`The requirement is achieved: ${target}`, { type: "objective" });
+      continue;
+    }
+    for (const clause of unresolvedClauses) {
+      const cleaned = clause.replace(/^[\s,;.]+|[\s,;.]+$/g, "").replace(/^(?:and|then|also|plus)\s+/i, "").trim();
+      if (cleaned && !/^(?:and|then|also|plus)$/i.test(cleaned) && !isProceduralInstruction(cleaned) && readsAsObligation(cleaned)) {
+        push(`The requirement is achieved: ${cleaned}`, { type: "objective" });
+      }
     }
   }
   if (criteria.length === 0) {
@@ -276,6 +433,13 @@ CREATE TABLE IF NOT EXISTS goals (
   -- evidence changed underneath it.
   verification_revision    INTEGER NOT NULL DEFAULT 0,
   verification_snapshot    TEXT,
+  -- How this goal is permitted to reach completion (audit #1): machine,
+  -- audited, or userAcceptance. Decided at creation from the objective text
+  -- and its derived criteria; never changed by the model.
+  completion_policy        TEXT NOT NULL DEFAULT 'userAcceptance',
+  -- Revision of the immutable objective text. Assessments are scoped to it so
+  -- a stale assessment can never certify a different requirement set.
+  objective_revision       INTEGER NOT NULL DEFAULT 1,
   -- Set when a continuation submission terminally failed. While set, the
   -- driver refuses to dispatch until recovery clears it, so a terminal
   -- delivery failure cannot be circumvented by minting a fresh continuation.
@@ -322,6 +486,11 @@ CREATE TABLE IF NOT EXISTS goal_criteria (
   -- not deleted: the row stays for the audit trail but no longer gates
   -- verification. User-source criteria cannot be superseded by the model.
   superseded  INTEGER NOT NULL DEFAULT 0,
+  -- JSON array of objective-level criterion IDs this concrete requirement was
+  -- registered to satisfy (audit #1). Only a proven concrete requirement can
+  -- discharge an objective-level remainder under the audited policy, so the
+  -- model must name the coverage instead of asserting the objective is met.
+  covers      TEXT,
   created_at_ms INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS goal_criteria_goal ON goal_criteria (goal_id);
@@ -413,6 +582,31 @@ CREATE TABLE IF NOT EXISTS goal_acceptances (
   at_ms       INTEGER NOT NULL
 );
 
+-- Controller-computed objective-level assessments (audit #1, audited policy).
+--
+-- Audited goals define completion operationally: the objective is
+-- open-ended, so completion means every confirmed requirement discovered
+-- within the audited scope is independently verified, and no known,
+-- actionable requirement remains unresolved. The controller records the
+-- assessment it computed from the per-criterion proofs; the model cannot write
+-- this row and cannot declare its own verdict.
+--
+-- This is NOT a claim that no undiscovered bugs exist. The recorded scope is
+-- the honest boundary: what the final bounded review covered, and what it did
+-- not. Scope that cannot be bounded yields indeterminate, not satisfied.
+CREATE TABLE IF NOT EXISTS goal_objective_assessments (
+  goal_id                TEXT PRIMARY KEY,
+  generation             INTEGER NOT NULL,
+  objective_revision     INTEGER NOT NULL,
+  verdict                TEXT NOT NULL,
+  scope                  TEXT NOT NULL,
+  covered_requirements   TEXT NOT NULL,
+  unresolved_requirements TEXT NOT NULL,
+  evidence_ids           TEXT NOT NULL,
+  note                   TEXT,
+  at_ms                  INTEGER NOT NULL
+);
+
 -- Continuation ledger. One row per continuation attempt.
 --
 -- inbox_id is the OpenCode message ID we reserve BEFORE submitting, and it is
@@ -470,7 +664,9 @@ function toGoal(row) {
     supersededBy: row.superseded_by ?? undefined,
     verificationRevision: row.verification_revision,
     verificationSnapshot: row.verification_snapshot ?? undefined,
-    deliveryFailed: row.delivery_failed === 1
+    deliveryFailed: row.delivery_failed === 1,
+    completionPolicy: row.completion_policy ?? "userAcceptance",
+    objectiveRevision: row.objective_revision ?? 1
   };
 }
 function normalizeBlockerReason(reason) {
@@ -512,6 +708,25 @@ class GoalStore {
     if (!columns.includes("superseded")) {
       this.db.exec(`ALTER TABLE goal_criteria ADD COLUMN superseded INTEGER NOT NULL DEFAULT 0`);
     }
+    if (!columns.includes("covers")) {
+      this.db.exec(`ALTER TABLE goal_criteria ADD COLUMN covers TEXT`);
+    }
+    const goalColumns = this.db.query(`PRAGMA table_info(goals)`).all().map((row) => row.name);
+    if (!goalColumns.includes("completion_policy")) {
+      this.db.exec(`ALTER TABLE goals ADD COLUMN completion_policy TEXT NOT NULL DEFAULT 'userAcceptance'`);
+    }
+    if (!goalColumns.includes("objective_revision")) {
+      this.db.exec(`ALTER TABLE goals ADD COLUMN objective_revision INTEGER NOT NULL DEFAULT 1`);
+    }
+    this.db.query(`UPDATE goals SET completion_policy = 'machine'
+          WHERE completion_policy = 'userAcceptance'
+            AND status IN ('active', 'verifying', 'paused')
+            AND EXISTS (SELECT 1 FROM goal_criteria c WHERE c.goal_id = goals.id AND c.superseded = 0)
+            AND NOT EXISTS (
+              SELECT 1 FROM goal_criteria c
+               WHERE c.goal_id = goals.id AND c.superseded = 0
+                 AND (c.spec IS NULL OR json_extract(c.spec, '$.type') = 'objective')
+            )`).run();
     this.db.query(`UPDATE goal_criteria SET source = 'user' WHERE source = 'derived'`).run();
   }
   close() {
@@ -590,8 +805,8 @@ class GoalStore {
       const generation = nextGen;
       this.db.query(`INSERT INTO goals (id, session_id, generation, objective, status, rounds,
              no_progress_rounds, repeated_blocker_rounds, token_budget, version,
-             created_at_ms, updated_at_ms)
-           VALUES (?, ?, ?, ?, 'active', 0, 0, 0, ?, 0, ?, ?)`).run(id, input.sessionID, generation, input.objective.trim(), input.tokenBudget ?? null, now, now);
+             completion_policy, created_at_ms, updated_at_ms)
+           VALUES (?, ?, ?, ?, 'active', 0, 0, 0, ?, 0, ?, ?, ?)`).run(id, input.sessionID, generation, input.objective.trim(), input.tokenBudget ?? null, input.completionPolicy ?? "userAcceptance", now, now);
       this.appendEvent(id, generation, "created", {
         toStatus: "active",
         actor: input.actor ?? "user",
@@ -632,8 +847,8 @@ class GoalStore {
       }
       this.db.query(`INSERT INTO goals (id, session_id, generation, objective, status, rounds,
              no_progress_rounds, repeated_blocker_rounds, token_budget, version,
-             created_at_ms, updated_at_ms)
-           VALUES (?, ?, ?, ?, 'active', 0, 0, 0, ?, 0, ?, ?)`).run(newIDValue, input.sessionID, nextGeneration, input.objective.trim(), input.tokenBudget ?? existing.tokenBudget ?? null, now, now);
+             completion_policy, created_at_ms, updated_at_ms)
+           VALUES (?, ?, ?, ?, 'active', 0, 0, 0, ?, 0, ?, ?, ?)`).run(newIDValue, input.sessionID, nextGeneration, input.objective.trim(), input.tokenBudget ?? existing.tokenBudget ?? null, input.completionPolicy ?? "userAcceptance", now, now);
       this.appendEvent(newIDValue, nextGeneration, "created", {
         toStatus: "active",
         actor: input.actor ?? "user",
@@ -721,13 +936,13 @@ class GoalStore {
       return this.byID(goal.id);
     });
   }
-  insertCriterion(goalID, generation, input, atMs) {
+  insertCriterion(goalID, generation, input, atMs, covers) {
     const id = newID("crit");
-    this.db.query(`INSERT INTO goal_criteria (id, goal_id, generation, text, spec, source, met, created_at_ms)
-         VALUES (?, ?, ?, ?, ?, ?, 0, ?)`).run(id, goalID, generation, input.text.trim(), input.spec ? JSON.stringify(input.spec) : null, input.source ?? "user", atMs);
+    this.db.query(`INSERT INTO goal_criteria (id, goal_id, generation, text, spec, source, met, covers, created_at_ms)
+         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)`).run(id, goalID, generation, input.text.trim(), input.spec ? JSON.stringify(input.spec) : null, input.source ?? "user", covers && covers.length > 0 ? JSON.stringify(covers) : null, atMs);
     return id;
   }
-  addCriterion(goalID, text, spec, source = "user") {
+  addCriterion(goalID, text, spec, source = "user", covers) {
     const goal = this.byID(goalID);
     if (!goal)
       throw new GoalConflictError(`unknown goal ${goalID}`);
@@ -738,17 +953,39 @@ class GoalStore {
     if (source === "model" && spec?.type === "objective") {
       throw new TransitionRejectedError("the model cannot establish an objective-type criterion; only the user can accept the objective");
     }
+    const covered = covers && covers.length > 0 ? [...new Set(covers)] : undefined;
+    if (covered) {
+      const existing = this.listCriteria(goalID);
+      for (const id2 of covered) {
+        const target = existing.find((c) => c.id === id2);
+        if (!target) {
+          throw new TransitionRejectedError(`unknown criterion ${id2} in covers`);
+        }
+        if (target.spec?.type !== "objective") {
+          throw new TransitionRejectedError(`criterion ${id2} is not an objective-level requirement; covers may only name the objective remainder`);
+        }
+      }
+    }
     let id = "";
     this.tx(() => {
       const existingRows = this.db.query(`SELECT id, text FROM goal_criteria WHERE goal_id = ? AND superseded = 0`).all(goalID);
       const existing = existingRows.find((r) => r.text.trim().toLowerCase().replace(/\s+/g, " ") === normalized);
       if (existing) {
+        if (covered)
+          this.mergeCoverage(existing.id, covered);
         id = existing.id;
         return;
       }
-      id = this.insertCriterion(goalID, goal.generation, { text, spec, source }, Date.now());
+      id = this.insertCriterion(goalID, goal.generation, { text, spec, source }, Date.now(), covered);
     });
     return id;
+  }
+  mergeCoverage(criterionID, covers) {
+    const row = this.db.query(`SELECT covers FROM goal_criteria WHERE id = ?`).get(criterionID);
+    if (!row)
+      return;
+    const merged = new Set([...row.covers ? JSON.parse(row.covers) : [], ...covers]);
+    this.db.query(`UPDATE goal_criteria SET covers = ? WHERE id = ?`).run(JSON.stringify([...merged]), criterionID);
   }
   supersedeCriterion(criterionID, reason, replacement) {
     this.tx(() => {
@@ -806,6 +1043,24 @@ class GoalStore {
       return;
     return { generation: row.generation, note: row.note ?? undefined, atMs: row.at_ms };
   }
+  objectiveAssessment(goalID) {
+    const row = this.db.query(`SELECT generation, objective_revision, verdict, scope, covered_requirements,
+                unresolved_requirements, evidence_ids, note, at_ms
+           FROM goal_objective_assessments WHERE goal_id = ?`).get(goalID);
+    if (!row)
+      return;
+    return {
+      generation: row.generation,
+      objectiveRevision: row.objective_revision,
+      verdict: row.verdict,
+      scope: row.scope,
+      coveredRequirements: JSON.parse(row.covered_requirements),
+      unresolvedRequirements: JSON.parse(row.unresolved_requirements),
+      evidenceIDs: JSON.parse(row.evidence_ids),
+      note: row.note ?? undefined,
+      atMs: row.at_ms
+    };
+  }
   addEvidence(input) {
     const goal = this.byID(input.goalID);
     if (!goal)
@@ -816,13 +1071,14 @@ class GoalStore {
     });
   }
   listCriteria(goalID) {
-    return this.db.query(`SELECT id, text, met, spec, source FROM goal_criteria
+    return this.db.query(`SELECT id, text, met, spec, source, covers FROM goal_criteria
           WHERE goal_id = ? AND superseded = 0 ORDER BY created_at_ms ASC`).all(goalID).map((r) => ({
       id: r.id,
       text: r.text,
       met: r.met === 1,
       spec: r.spec ? JSON.parse(r.spec) : undefined,
-      source: r.source
+      source: r.source,
+      covers: r.covers ? JSON.parse(r.covers) : undefined
     }));
   }
   listEvidence(goalID) {
@@ -851,7 +1107,7 @@ class GoalStore {
       return bound;
     });
   }
-  recordProofs(goalID, proofs, snapshot, attempt) {
+  recordProofs(goalID, proofs, snapshot, attempt, assessment) {
     return this.tx(() => {
       const goal = this.byID(goalID);
       if (!goal)
@@ -865,6 +1121,21 @@ class GoalStore {
                (id, goal_id, generation, criterion_id, evidence_ids, validator_id, verdict, detail, created_at_ms)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(newID("proof"), goalID, goal.generation, proof.criterionID, JSON.stringify(proof.evidenceIDs), proof.validatorID, proof.verdict, proof.detail, now);
         this.db.query(`UPDATE goal_criteria SET met = ? WHERE id = ? AND goal_id = ?`).run(proof.verdict === "pass" ? 1 : 0, proof.criterionID, goalID);
+      }
+      if (assessment) {
+        this.db.query(`INSERT INTO goal_objective_assessments
+               (goal_id, generation, objective_revision, verdict, scope,
+                covered_requirements, unresolved_requirements, evidence_ids, note, at_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(goal_id) DO UPDATE SET generation=excluded.generation,
+               objective_revision=excluded.objective_revision, verdict=excluded.verdict,
+               scope=excluded.scope, covered_requirements=excluded.covered_requirements,
+               unresolved_requirements=excluded.unresolved_requirements,
+               evidence_ids=excluded.evidence_ids, note=excluded.note, at_ms=excluded.at_ms`).run(goalID, goal.generation, assessment.objectiveRevision, assessment.verdict, assessment.scope, JSON.stringify(assessment.coveredRequirements), JSON.stringify(assessment.unresolvedRequirements), JSON.stringify(assessment.evidenceIDs), assessment.note ?? null, now);
+        this.appendEvent(goalID, goal.generation, "assessed", {
+          actor: "controller",
+          detail: `${assessment.verdict}: ${assessment.unresolvedRequirements.length} unresolved requirement(s)`
+        });
       }
       this.db.query(`UPDATE goals
               SET verification_revision = verification_revision + 1,
@@ -1207,30 +1478,41 @@ class GoalController {
   criteriaFor(objective) {
     return this.deriveCriteria(objective);
   }
+  policyFor(objective, criteria) {
+    return completionPolicyFor(objective, criteria.map((c) => ({
+      text: c.text,
+      spec: c.spec ?? { type: "objective" },
+      source: c.source ?? "user"
+    })));
+  }
   startOrDescribe(sessionID, objective) {
     const existing = this.store.current(sessionID);
     if (existing)
       return { existing };
+    const criteria = this.criteriaFor(objective);
     const goal = this.store.create({
       sessionID,
       objective,
       actor: "user",
-      criteria: this.criteriaFor(objective)
+      criteria,
+      completionPolicy: this.policyFor(objective, criteria)
     });
     return { created: goal };
   }
   replace(sessionID, objective, expectedGeneration) {
     const existing = this.store.current(sessionID);
     const criteria = this.criteriaFor(objective);
+    const completionPolicy = this.policyFor(objective, criteria);
     if (!existing) {
-      return this.store.create({ sessionID, objective, actor: "user", criteria });
+      return this.store.create({ sessionID, objective, actor: "user", criteria, completionPolicy });
     }
     return this.store.replace({
       sessionID,
       expectedGeneration: expectedGeneration ?? existing.generation,
       objective,
       actor: "user",
-      criteria
+      criteria,
+      completionPolicy
     });
   }
   pause(sessionID) {
@@ -1392,7 +1674,7 @@ class GoalController {
     if (!target.ok)
       return { rejected: target.rejected };
     try {
-      const criterionID = this.store.addCriterion(target.goal.id, input.text, input.spec, "model");
+      const criterionID = this.store.addCriterion(target.goal.id, input.text, input.spec, "model", input.covers);
       return { criterionID };
     } catch (error) {
       return { rejected: String(error) };
@@ -2304,6 +2586,7 @@ class GoalVerifier {
       return false;
     };
     const validBound = (criterion) => verifiable.filter((e) => e.criterionID === criterion.id && !invalid.has(e.id));
+    const objectives = [];
     for (const criterion of criteria) {
       let bound = validBound(criterion);
       const proof = async (validatorID, verdict, detail, evidenceIDs = bound.map((e) => e.id)) => ({ criterionID: criterion.id, evidenceIDs, validatorID, verdict, detail });
@@ -2346,13 +2629,7 @@ class GoalVerifier {
         continue;
       }
       if (criterion.spec?.type === "objective") {
-        const acceptance = this.store.userAcceptance(goal.id);
-        if (acceptance && acceptance.generation === goal.generation) {
-          proofs.push(await proof("user-acceptance", "pass", acceptance.note ? `user accepted the objective: ${acceptance.note}` : "user accepted the objective"));
-          continue;
-        }
-        proofs.push(await proof("objective-acceptance", "unknown", "broad objective; cannot establish completeness from ordinary evidence — needs concrete sub-criteria or explicit user acceptance"));
-        unmet.push(`criterion unresolved: ${criterion.text} — register concrete machine-checkable criteria with goal_add_criterion, or ask the user to run /goal accept`);
+        objectives.push(criterion);
         continue;
       }
       for (const item of verifiable.filter((e) => e.criterionID === criterion.id)) {
@@ -2366,12 +2643,105 @@ class GoalVerifier {
         proofs.push(await proof("bound-evidence", "pass", `${bound.length} bound evidence item(s)`));
       }
     }
+    let assessment;
+    if (objectives.length > 0) {
+      const acceptance = this.store.userAcceptance(goal.id);
+      const accepted = Boolean(acceptance && acceptance.generation === goal.generation);
+      const objectiveIDs = new Set(objectives.map((o) => o.id));
+      const concrete = criteria.filter((c) => !objectiveIDs.has(c.id));
+      const passing = new Set(proofs.filter((p) => p.verdict === "pass").map((p) => p.criterionID));
+      const covered = [];
+      const coveringEvidence = [];
+      const unresolved = [];
+      const coverageGaps = [];
+      for (const criterion of concrete) {
+        if (!criterion.covers)
+          continue;
+        if (!criterion.covers.some((id) => objectiveIDs.has(id)))
+          continue;
+        if (passing.has(criterion.id)) {
+          covered.push(criterion.text);
+          for (const evidenceID of proofs.find((p) => p.criterionID === criterion.id)?.evidenceIDs ?? []) {
+            coveringEvidence.push(evidenceID);
+          }
+        }
+      }
+      for (const criterion of concrete) {
+        if (!passing.has(criterion.id)) {
+          unresolved.push(`${criterion.text}`);
+        }
+      }
+      for (const objective of objectives) {
+        const proven = concrete.filter((c) => c.covers?.includes(objective.id) && passing.has(c.id));
+        if (proven.length === 0) {
+          coverageGaps.push(`no independently proven requirement covers: ${objective.text}`);
+        }
+      }
+      const scope = objectives.map((o) => o.text).join(" | ").slice(0, 400) || goal.objective.slice(0, 400);
+      const verdict = concrete.length === 0 ? "indeterminate" : unresolved.length > 0 ? "incomplete" : coverageGaps.length > 0 ? "indeterminate" : "satisfied";
+      const allUnresolved = [...unresolved, ...coverageGaps];
+      assessment = {
+        objectiveRevision: goal.objectiveRevision,
+        verdict,
+        scope,
+        coveredRequirements: covered,
+        unresolvedRequirements: allUnresolved,
+        evidenceIDs: [...new Set(coveringEvidence)],
+        note: verdict === "indeterminate" ? "no confirmed requirement was established; an open-ended objective cannot be declared satisfied without a bounded final review" : verdict === "satisfied" && accepted ? acceptance?.note ? `user accepted the objective: ${acceptance.note}` : "user accepted the objective" : undefined
+      };
+      for (const objective of objectives) {
+        if (accepted) {
+          proofs.push({
+            criterionID: objective.id,
+            evidenceIDs: [],
+            validatorID: "user-acceptance",
+            verdict: "pass",
+            detail: acceptance?.note ? `user accepted the objective: ${acceptance.note}` : "user accepted the objective"
+          });
+          continue;
+        }
+        if (goal.completionPolicy === "audited" && verdict === "satisfied") {
+          const proven = concrete.filter((c) => c.covers?.includes(objective.id) && passing.has(c.id));
+          proofs.push({
+            criterionID: objective.id,
+            evidenceIDs: [...new Set(proven.flatMap((c) => proofs.find((p) => p.criterionID === c.id)?.evidenceIDs ?? []))],
+            validatorID: "objective-audit",
+            verdict: "pass",
+            detail: `audited scope satisfied: ${proven.map((c) => c.text).join("; ").slice(0, 300)}`
+          });
+          continue;
+        }
+        if (goal.completionPolicy === "audited" && verdict === "indeterminate") {
+          proofs.push({
+            criterionID: objective.id,
+            evidenceIDs: [],
+            validatorID: "objective-audit",
+            verdict: "unknown",
+            detail: "indeterminate: no confirmed requirement bounded the objective's scope"
+          });
+          unmet.push(`criterion indeterminate: ${objective.text} — register at least one concrete requirement with covers=<objective criterion id>, prove it, and propose completion again`);
+          continue;
+        }
+        proofs.push({
+          criterionID: objective.id,
+          evidenceIDs: [],
+          validatorID: "objective-acceptance",
+          verdict: "unknown",
+          detail: goal.completionPolicy === "audited" ? "audit incomplete: a known requirement or objective remainder is unresolved" : "broad objective; cannot establish completeness from ordinary evidence — needs concrete sub-criteria or explicit user acceptance"
+        });
+        if (goal.completionPolicy === "audited") {
+          unmet.push(...allUnresolved.map((r) => r.startsWith("no independently proven requirement covers: ") ? `criterion uncovered: ${r.replace("no independently proven requirement covers: ", "")} — register a concrete requirement with covers=<objective criterion id> and prove it` : `criterion unresolved: ${r} — prove it (bound evidence or a machine spec) before completion`));
+        } else {
+          unmet.push(`criterion unresolved: ${objective.text} — register concrete machine-checkable criteria with goal_add_criterion, or ask the user to run /goal accept`);
+        }
+      }
+    }
     const staleEvidence = staleNotes;
     if (unmet.length > 0) {
       unmet.push(...staleEvidence);
     }
     const snapshot = snapshotHash(criteria, evidence);
-    const recorded = this.store.recordProofs(goalID, proofs, snapshot, attempt);
+    const recorded = this.store.recordProofs(goalID, proofs, snapshot, attempt, assessment);
     if (!recorded) {
       return {
         verdict: "incomplete",
@@ -2410,6 +2780,16 @@ class GoalVerifier {
 var RPC_ID = "local.opencode-xgoal";
 var str = { type: "string" };
 var num = { type: "number" };
+function criterionWire(row) {
+  return {
+    id: row.id,
+    text: row.text,
+    met: row.met,
+    spec: row.spec ?? null,
+    source: row.source,
+    covers: row.covers ?? null
+  };
+}
 function wire(controller, goal) {
   if (!goal)
     return null;
@@ -2423,7 +2803,7 @@ function wire(controller, goal) {
     noProgressRounds: goal.noProgressRounds,
     tokensUsed: goal.tokensUsed ?? null,
     tokenBudget: goal.tokenBudget ?? null,
-    criteria: controller.store.listCriteria(goal.id)
+    criteria: controller.store.listCriteria(goal.id).map(criterionWire)
   };
 }
 var goalOrNull = {
@@ -2990,6 +3370,11 @@ var src_default = {
               },
               additionalProperties: false
             },
+            covers: {
+              type: "array",
+              items: { type: "string" },
+              description: "Objective-level criterion IDs this concrete requirement was registered to satisfy. Only proven concrete requirements discharge an objective-level remainder under the audited completion policy."
+            },
             goal_id: str2,
             generation: num2
           }, ["text"]),
@@ -3015,6 +3400,7 @@ var src_default = {
             const out = controller.addCriterion(toolCtx?.sessionID, {
               text: String(input?.text ?? ""),
               spec,
+              covers: Array.isArray(input?.covers) ? input.covers.map((v) => String(v)) : undefined,
               goalID: target.ref.goalID,
               generation: target.ref.generation
             });
