@@ -9,7 +9,7 @@
  * a checkpoint or continue.
  */
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, existsSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GoalStore } from "../src/controller/store.ts";
@@ -192,13 +192,16 @@ describe("completion requires objective-level evidence", () => {
       const result = await verifier.verify(goal.id);
       expect(result.verdict).toBe("complete");
       expect(seen).toContain(`checkSpec:${workspace}`);
-      // Proof alternative 1 (independent spec check) passed, so the bound
-      // evidence was never consulted for this criterion.
+      // The spec check alone carried the proof, so the bound evidence was
+      // never consulted for this criterion.
       expect(seen).not.toContain(`validate:${workspace}`);
+      // A spec-driven pass carries no evidence ids: the filesystem, not a
+      // captured write, established the content.
+      expect(result.proofs?.find((p) => p.validatorID === "spec.file")?.evidenceIDs).toEqual([]);
 
-      // Alternative 2: when the independent check cannot confirm, a bound,
-      // currently-valid file capture still proves the criterion — and the
-      // evidence validation receives the session workspace too.
+      // When the independent check definitively fails, a bound file capture
+      // cannot override it — but the stale-evidence annotation still receives
+      // the session workspace, and the failure names the spec's reason.
       seen.length = 0;
       const goal2 = store.create({ sessionID: "ses_ws2", objective: "write notes.txt" });
       store.addCriterion(goal2.id, "notes.txt contains ok", {
@@ -218,11 +221,12 @@ describe("completion requires objective-level evidence", () => {
           seen.push(`validate:${sessionWorkspace}`);
           return { valid: true, reason: "file present" };
         },
-        checkSpec: async () => ({ valid: false, reason: "independent check unavailable" }),
+        checkSpec: async () => ({ valid: false, reason: "content does not match the spec" }),
       });
       const result2 = await failing.verify(goal2.id);
-      expect(result2.verdict).toBe("complete");
+      expect(result2.verdict).toBe("incomplete");
       expect(seen).toContain(`validate:${workspace}`);
+      expect(result2.unmet.some((u) => u.includes("content does not match the spec"))).toBe(true);
     } finally {
       rmSync(workspace, { recursive: true, force: true });
     }
@@ -497,24 +501,137 @@ describe("valid alternative proofs survive stale history", () => {
       const first = store.listEvidence(goal.id).find((e) => e.hash === "stale-hash")!;
       const second = store.listEvidence(goal.id).find((e) => e.hash === "final-hash")!;
       // The validator confirms only the current content's hash.
-    const verifier = new GoalVerifier(store, {
-      workspaceFor: async () => workspace,
-      validate: async (e) =>
-        e.hash === "final-hash"
-          ? { valid: true, reason: "current" }
-          : { valid: false, reason: "file changed since capture" },
-    });
+      const staleFirst = new GoalVerifier(store, {
+        workspaceFor: async () => workspace,
+        validate: async (e) =>
+          e.hash === "final-hash"
+            ? { valid: true, reason: "current" }
+            : { valid: false, reason: "file changed since capture" },
+      });
+      const staleResult = await staleFirst.verify(goal.id);
+      expect(staleResult.verdict).toBe("incomplete");
+      expect(staleResult.unmet.some((u) => u.includes("cannot be independently checked"))).toBe(true);
+      expect(staleResult.staleEvidence?.some((u) => u.includes(first.id))).toBe(true);
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  test("two file revisions: the independent check reads current content and stale history is irrelevant", async () => {
+    const workspace = mkdtempSync(join(tmpdir(), "xgoal-rev2-"));
+    try {
+      const goal = store.create({ sessionID: "ses_a", objective: "write the report" });
+      store.addCriterion(goal.id, "report.md says final", {
+        type: "file",
+        path: "report.md",
+        equals: "final",
+      });
+      // First write captured, then a second write supersedes it.
+      writeFileSync(join(workspace, "report.md"), "draft");
+      store.addEvidence({
+        goalID: goal.id,
+        kind: "file",
+        ref: "report.md",
+        hash: "stale-hash",
+      });
+      writeFileSync(join(workspace, "report.md"), "final");
+      store.addEvidence({
+        goalID: goal.id,
+        kind: "file",
+        ref: "report.md",
+        hash: "final-hash",
+      });
+      // The evidence validator rejects everything: on the spec-driven pass
+      // path it must never be consulted, so stale history cannot taint the
+      // verdict in either direction.
+      const verifier = new GoalVerifier(store, {
+        workspaceFor: async () => workspace,
+        validate: async () => ({ valid: false, reason: "validator must not be consulted" }),
+        checkSpec: async (_criterion, sessionWorkspace) =>
+          readFileSync(join(sessionWorkspace, "report.md"), "utf8") === "final"
+            ? { valid: true, reason: "content matches the spec" }
+            : { valid: false, reason: "content does not match the spec" },
+      });
       const result = await verifier.verify(goal.id);
       expect(result.verdict).toBe("complete");
-      // The stale item is annotated in the audit field...
-      expect(result.staleEvidence?.some((u) => u.includes(first.id) || u.includes("no longer valid"))).toBe(true);
-      expect(result.staleEvidence?.some((u) => u.includes(first.id))).toBe(true);
-      // ...the verdict is not driven by it, and unmet stays clean...
       expect(result.unmet).toHaveLength(0);
-      // ...and the passing proof carries the valid newer evidence.
-      const fileProof = result.proofs?.find((p) => p.criterionID === criterionID);
-      expect(fileProof?.verdict).toBe("pass");
-      expect(fileProof?.evidenceIDs).toEqual([second.id]);
+      expect(result.staleEvidence).toBeUndefined();
+      expect(result.proofs?.find((p) => p.validatorID === "spec.file")?.evidenceIDs).toEqual([]);
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  test("a file spec is proven only by the independent check, never by bound evidence", async () => {
+    const workspace = mkdtempSync(join(tmpdir(), "xgoal-spec-"));
+    try {
+      // The file contains content that does NOT match the equals spec, and
+      // the model binds its own write evidence whose hash matches the file.
+      // The old fallback accepted this; the spec check must be final.
+      writeFileSync(join(workspace, "out.txt"), "success but unfinished");
+      const goal = store.create({ sessionID: "ses_a", objective: "write out.txt" });
+      const criterionID = store.addCriterion(goal.id, "out.txt must be exactly: success", {
+        type: "file",
+        path: "out.txt",
+        equals: "success",
+      });
+      store.addEvidence({
+        goalID: goal.id,
+        criterionID,
+        kind: "file",
+        ref: "out.txt",
+        hash: "hash-of-nonconforming-content",
+      });
+      // An unrelated successful command bound to the same criterion must not
+      // rescue it either.
+      store.addEvidence({
+        goalID: goal.id,
+        criterionID,
+        kind: "command",
+        ref: "echo ok",
+        detail: "exit 0",
+        exitCode: 0,
+      });
+      const verifier = new GoalVerifier(store, {
+        workspaceFor: async () => workspace,
+        validate: async () => ({ valid: true, reason: "valid" }),
+        checkSpec: async (_criterion, sessionWorkspace) => {
+          const content = readFileSync(join(sessionWorkspace, "out.txt"), "utf8");
+          return content === "success"
+            ? { valid: true, reason: "matches" }
+            : { valid: false, reason: "extra bytes after the required content" };
+        },
+      });
+      const result = await verifier.verify(goal.id);
+      expect(result.verdict).toBe("incomplete");
+      expect(result.unmet.some((u) => u.includes("extra bytes"))).toBe(true);
+      // The failing proof is not dressed up as a pass by valid bound evidence.
+      expect(result.proofs?.find((p) => p.criterionID === criterionID)?.verdict).toBe("fail");
+
+      // The mirror case: an unrelated successful command cannot rescue a
+      // deleted file whose criterion carries only that command evidence.
+      rmSync(join(workspace, "out.txt"));
+      const goal2 = store.create({ sessionID: "ses_b", objective: "write out.txt" });
+      const criterion2 = store.addCriterion(goal2.id, "out.txt exists", {
+        type: "file",
+        path: "out.txt",
+      });
+      store.addEvidence({
+        goalID: goal2.id,
+        criterionID: criterion2,
+        kind: "command",
+        ref: "echo ok",
+        detail: "exit 0",
+        exitCode: 0,
+      });
+      const rescued = new GoalVerifier(store, {
+        workspaceFor: async () => workspace,
+        validate: async () => ({ valid: true, reason: "valid" }),
+        checkSpec: async () => ({ valid: false, reason: "file not found: out.txt" }),
+      });
+      const result2 = await rescued.verify(goal2.id);
+      expect(result2.verdict).toBe("incomplete");
+      expect(result2.unmet.some((u) => u.includes("file not found"))).toBe(true);
     } finally {
       rmSync(workspace, { recursive: true, force: true });
     }

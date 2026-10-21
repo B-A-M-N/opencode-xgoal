@@ -2307,21 +2307,24 @@ class GoalVerifier {
     for (const criterion of criteria) {
       let bound = validBound(criterion);
       const proof = async (validatorID, verdict, detail, evidenceIDs = bound.map((e) => e.id)) => ({ criterionID: criterion.id, evidenceIDs, validatorID, verdict, detail });
-      if (criterion.spec?.type === "file" && this.validator.checkSpec) {
+      if (criterion.spec?.type === "file") {
+        if (!this.validator.checkSpec) {
+          for (const item of verifiable.filter((e) => e.criterionID === criterion.id)) {
+            await validateItem(criterion, item);
+          }
+          proofs.push(await proof("spec.file", "unknown", "no filesystem check available for the file requirement", []));
+          unmet.push(`criterion unresolved: ${criterion.text} — the file requirement cannot be independently checked in this environment`);
+          continue;
+        }
         const check = await this.validator.checkSpec(criterion, workspace);
         if (check.valid) {
-          proofs.push(await proof("spec.file", "pass", check.reason));
+          proofs.push(await proof("spec.file", "pass", check.reason, []));
           continue;
         }
         for (const item of verifiable.filter((e) => e.criterionID === criterion.id)) {
           await validateItem(criterion, item);
         }
-        bound = validBound(criterion);
-        if (bound.length > 0) {
-          proofs.push(await proof("spec.file", "pass", `${check.reason}; but ${bound.length} bound file evidence item(s) still validate`));
-          continue;
-        }
-        proofs.push(await proof("spec.file", "fail", check.reason));
+        proofs.push(await proof("spec.file", "fail", check.reason, []));
         unmet.push(`criterion not satisfied: ${criterion.text} (${check.reason})`);
         continue;
       }

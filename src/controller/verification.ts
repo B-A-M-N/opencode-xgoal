@@ -348,31 +348,51 @@ export class GoalVerifier {
         evidenceIDs = bound.map((e) => e.id),
       ): Promise<CriterionProof> => ({ criterionID: criterion.id, evidenceIDs, validatorID, verdict, detail });
 
-      if (criterion.spec?.type === "file" && this.validator.checkSpec) {
-        // Proof alternative 1: the independent machine check — the spec, not
-        // the model's claim. Proof alternative 2: bound, currently-valid file
-        // evidence (a captured write whose hash still validates).
-        const check = await this.validator.checkSpec(criterion, workspace);
-        if (check.valid) {
-          proofs.push(await proof("spec.file", "pass", check.reason));
-          continue;
-        }
-        // Validate this criterion's own bound evidence before conceding.
-        for (const item of verifiable.filter((e) => e.criterionID === criterion.id)) {
-          await validateItem(criterion, item);
-        }
-        bound = validBound(criterion);
-        if (bound.length > 0) {
+      if (criterion.spec?.type === "file") {
+        // The independent machine check is the file criterion's whole proof
+        // contract: the spec, not the model's claim, and not a substitute
+        // capture. When it definitively fails, no bound evidence can override
+        // it — a hash-valid capture proves the file matched a capture, not
+        // that it satisfies `equals`/`contains`, and an unrelated command's
+        // success proves nothing about a file. Finding 7's stale-evidence rule
+        // therefore does not apply here: there is no alternative proof
+        // mechanism for a file criterion to fall back to. Without a checkSpec
+        // implementation the contract cannot be evaluated at all, so the
+        // criterion fails closed rather than degrading to bound-evidence
+        // semantics that would let the model prove its own file claim.
+        if (!this.validator.checkSpec) {
+          // Validate the bound evidence anyway so stale history is annotated
+          // in the audit trail, even though it cannot change the outcome.
+          for (const item of verifiable.filter((e) => e.criterionID === criterion.id)) {
+            await validateItem(criterion, item);
+          }
           proofs.push(
             await proof(
               "spec.file",
-              "pass",
-              `${check.reason}; but ${bound.length} bound file evidence item(s) still validate`,
+              "unknown",
+              "no filesystem check available for the file requirement",
+              [],
             ),
+          );
+          unmet.push(
+            `criterion unresolved: ${criterion.text} — the file requirement cannot be independently checked in this environment`,
           );
           continue;
         }
-        proofs.push(await proof("spec.file", "fail", check.reason));
+        const check = await this.validator.checkSpec(criterion, workspace);
+        if (check.valid) {
+          // Spec-driven pass: the proof carries no evidence ids because the
+          // filesystem, not a captured write, established the content.
+          proofs.push(await proof("spec.file", "pass", check.reason, []));
+          continue;
+        }
+        // Still validate this criterion's bound evidence so stale history is
+        // annotated in the audit trail, even though it cannot rescue the
+        // failing check.
+        for (const item of verifiable.filter((e) => e.criterionID === criterion.id)) {
+          await validateItem(criterion, item);
+        }
+        proofs.push(await proof("spec.file", "fail", check.reason, []));
         unmet.push(`criterion not satisfied: ${criterion.text} (${check.reason})`);
         continue;
       }
