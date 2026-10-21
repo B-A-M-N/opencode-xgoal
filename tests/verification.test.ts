@@ -9,7 +9,7 @@
  * a checkpoint or continue.
  */
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, existsSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GoalStore } from "../src/controller/store.ts";
@@ -191,8 +191,38 @@ describe("completion requires objective-level evidence", () => {
 
       const result = await verifier.verify(goal.id);
       expect(result.verdict).toBe("complete");
-      expect(seen).toContain(`validate:${workspace}`);
       expect(seen).toContain(`checkSpec:${workspace}`);
+      // Proof alternative 1 (independent spec check) passed, so the bound
+      // evidence was never consulted for this criterion.
+      expect(seen).not.toContain(`validate:${workspace}`);
+
+      // Alternative 2: when the independent check cannot confirm, a bound,
+      // currently-valid file capture still proves the criterion — and the
+      // evidence validation receives the session workspace too.
+      seen.length = 0;
+      const goal2 = store.create({ sessionID: "ses_ws2", objective: "write notes.txt" });
+      store.addCriterion(goal2.id, "notes.txt contains ok", {
+        type: "file",
+        path: "notes.txt",
+        contains: "ok",
+      });
+      store.addEvidence({
+        goalID: goal2.id,
+        criterionID: store.listCriteria(goal2.id)[0].id,
+        kind: "file",
+        ref: "notes.txt",
+      });
+      const failing = new GoalVerifier(store, {
+        workspaceFor: async () => workspace,
+        validate: async (_evidence, sessionWorkspace) => {
+          seen.push(`validate:${sessionWorkspace}`);
+          return { valid: true, reason: "file present" };
+        },
+        checkSpec: async () => ({ valid: false, reason: "independent check unavailable" }),
+      });
+      const result2 = await failing.verify(goal2.id);
+      expect(result2.verdict).toBe("complete");
+      expect(seen).toContain(`validate:${workspace}`);
     } finally {
       rmSync(workspace, { recursive: true, force: true });
     }
@@ -380,6 +410,229 @@ describe("completion cannot be self-declared", () => {
       reason: second.reason,
     });
     expect(done.status).toBe("complete");
+  });
+});
+
+// Audit-3 #6: each criterion is evaluated under its own proof contract; a
+// global nonempty-evidence demand must not refuse a goal whose criteria have
+// other legitimate verification mechanisms.
+describe("per-criterion proof contracts", () => {
+  test("user acceptance alone resolves a goal whose only criterion is objective-level", async () => {
+    const goal = store.create({ sessionID: "ses_a", objective: "explore and summarize" });
+    store.addCriterion(goal.id, "achieved: explore and summarize", { type: "objective" });
+    // No evidence rows at all — the old verifier refused here with
+    // "no machine-verifiable evidence submitted" before even looking.
+    controller.acceptObjective("ses_a", "read the summary; good");
+
+    const verifier = new GoalVerifier(store, validator(false, "nothing to validate"));
+    const result = await verifier.verify(goal.id);
+    expect(result.verdict).toBe("complete");
+    expect(result.unmet).toHaveLength(0);
+  });
+
+  test("acceptance does not waive an explicit file requirement", async () => {
+    const goal = store.create({ sessionID: "ses_a", objective: "explore and write notes" });
+    store.addCriterion(goal.id, "achieved: explore and write notes", { type: "objective" });
+    store.addCriterion(goal.id, "notes.txt exists", {
+      type: "file",
+      path: "notes.txt",
+    });
+    controller.acceptObjective("ses_a");
+
+    const verifier = new GoalVerifier(store, {
+      validate: async () => ({ valid: false, reason: "nothing to validate" }),
+      checkSpec: async (criterion) =>
+        criterion.spec?.type === "file" && existsSync(join(dir, criterion.spec.path))
+          ? { valid: true, reason: "exists" }
+          : { valid: false, reason: "file not found" },
+    });
+    const result = await verifier.verify(goal.id);
+    expect(result.verdict).toBe("incomplete");
+    expect(result.unmet.some((u) => u.includes("notes.txt"))).toBe(true);
+  });
+
+  test("unresolved criteria are unknown, never silently satisfied", async () => {
+    const goal = store.create({ sessionID: "ses_a", objective: "broad objective" });
+    store.addCriterion(goal.id, "achieved: broad objective", { type: "objective" });
+
+    const verifier = new GoalVerifier(store, validator());
+    const result = await verifier.verify(goal.id);
+    expect(result.verdict).toBe("incomplete");
+    const objectiveProof = result.proofs?.find((p) => p.validatorID === "objective-acceptance");
+    expect(objectiveProof?.verdict).toBe("unknown");
+  });
+});
+
+// Audit-3 #7: a criterion passes when a complete, currently-valid proof set
+// validates. Older invalid evidence stays in the audit trail without
+// defeating an independently valid newer proof; alternatives are evaluated
+// separately from dependencies.
+describe("valid alternative proofs survive stale history", () => {
+  test("two file revisions: stale first-write evidence does not defeat the newer capture", async () => {
+    const workspace = mkdtempSync(join(tmpdir(), "xgoal-rev-"));
+    try {
+      const goal = store.create({ sessionID: "ses_a", objective: "write the report" });
+      const criterionID = store.addCriterion(goal.id, "report.md is written", {
+        type: "file",
+        path: "report.md",
+      });
+      // First write, then a second write that supersedes it. Evidence hashes
+      // captured at write time; the first is stale afterward.
+      writeFileSync(join(workspace, "report.md"), "draft");
+      store.addEvidence({
+        goalID: goal.id,
+        criterionID,
+        kind: "file",
+        ref: "report.md",
+        hash: "stale-hash",
+      });
+      writeFileSync(join(workspace, "report.md"), "final");
+      store.addEvidence({
+        goalID: goal.id,
+        criterionID,
+        kind: "file",
+        ref: "report.md",
+        hash: "final-hash",
+      });
+      const first = store.listEvidence(goal.id).find((e) => e.hash === "stale-hash")!;
+      const second = store.listEvidence(goal.id).find((e) => e.hash === "final-hash")!;
+      // The validator confirms only the current content's hash.
+    const verifier = new GoalVerifier(store, {
+      workspaceFor: async () => workspace,
+      validate: async (e) =>
+        e.hash === "final-hash"
+          ? { valid: true, reason: "current" }
+          : { valid: false, reason: "file changed since capture" },
+    });
+      const result = await verifier.verify(goal.id);
+      expect(result.verdict).toBe("complete");
+      // The stale item is annotated in the audit field...
+      expect(result.staleEvidence?.some((u) => u.includes(first.id) || u.includes("no longer valid"))).toBe(true);
+      expect(result.staleEvidence?.some((u) => u.includes(first.id))).toBe(true);
+      // ...the verdict is not driven by it, and unmet stays clean...
+      expect(result.unmet).toHaveLength(0);
+      // ...and the passing proof carries the valid newer evidence.
+      const fileProof = result.proofs?.find((p) => p.criterionID === criterionID);
+      expect(fileProof?.verdict).toBe("pass");
+      expect(fileProof?.evidenceIDs).toEqual([second.id]);
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  test("repeated passing tests and a failed-then-fixed run both prove the criterion", async () => {
+    const goal = store.create({ sessionID: "ses_a", objective: "fix the bug" });
+    const criterionID = store.addCriterion(goal.id, "the regression is fixed", {
+      type: "test",
+      command: "bun test",
+    });
+    store.addEvidence({
+      goalID: goal.id,
+      criterionID,
+      kind: "test",
+      ref: "bun test",
+      detail: "exit 1",
+      exitCode: 1,
+    });
+    store.addEvidence({
+      goalID: goal.id,
+      criterionID,
+      kind: "test",
+      ref: "bun test",
+      detail: "exit 0",
+      exitCode: 0,
+    });
+    store.addEvidence({
+      goalID: goal.id,
+      criterionID,
+      kind: "test",
+      ref: "bun test",
+      detail: "exit 0 (repeat run)",
+      exitCode: 0,
+    });
+
+    const verifier = new GoalVerifier(store, validator());
+    const result = await verifier.verify(goal.id);
+    expect(result.verdict).toBe("complete");
+    // Only the passing runs carry the proof; the failed run is history.
+    const proof = result.proofs?.find((p) => p.criterionID === criterionID);
+    expect(proof?.verdict).toBe("pass");
+    const failedRun = store.listEvidence(goal.id).find((e) => e.exitCode === 1)!;
+    expect(proof?.evidenceIDs).toHaveLength(2);
+    expect(proof?.evidenceIDs).not.toContain(failedRun.id);
+  });
+
+  test("a genuinely required dependency whose evidence goes stale keeps the criterion unmet", async () => {
+    const goal = store.create({ sessionID: "ses_a", objective: "deploy with the token" });
+    const criterionID = store.addCriterion(goal.id, "the deploy token is verified");
+    store.addEvidence({
+      goalID: goal.id,
+      criterionID,
+      kind: "command",
+      ref: "deployctl whoami",
+      detail: "exit 0",
+      exitCode: 0,
+    });
+    // Single proof set: its only member went stale, so the criterion fails.
+    const verifier = new GoalVerifier(store, validator(false, "token expired"));
+    const result = await verifier.verify(goal.id);
+    expect(result.verdict).toBe("incomplete");
+    expect(result.unmet.some((u) => u.includes("no longer valid"))).toBe(true);
+  });
+});
+
+// Audit-3 #10: a verifier that ran before a replacement must not mutate the
+// superseded goal's proof records or criterion readouts.
+describe("verification attempts are fenced against replacement", () => {
+  test("a stale verifier discards its proofs when the goal is replaced mid-verify", async () => {
+    const goal = store.create({ sessionID: "ses_a", objective: "v1 objective" });
+    const criterionID = store.addCriterion(goal.id, "the regression is fixed", undefined, "user");
+    store.addEvidence({
+      goalID: goal.id,
+      criterionID,
+      kind: "test",
+      ref: "bun test",
+      detail: "exit 0",
+      exitCode: 0,
+    });
+    store.transition({
+      goalID: goal.id,
+      generation: goal.generation,
+      to: "verifying",
+      actor: "model",
+      reason: "proposing",
+    });
+
+    // The validator is delayed; the goal is replaced while it runs.
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const verifier = new GoalVerifier(store, {
+      validate: async () => {
+        await gate;
+        return { valid: true, reason: "ok" };
+      },
+    });
+    const pending = verifier.verify(goal.id);
+
+    store.replace({
+      sessionID: "ses_a",
+      expectedGeneration: goal.generation,
+      objective: "v2 objective",
+    });
+    release();
+    const result = await pending;
+
+    expect(result.verdict).toBe("incomplete");
+    expect(result.unmet.some((u) => u.includes("verification discarded"))).toBe(true);
+    // The superseded goal's records are untouched: no proof rows, no met flag.
+    expect(store.listProofs(goal.id)).toHaveLength(0);
+    expect(store.listCriteria(goal.id).find((c) => c.id === criterionID)!.met).toBe(false);
+    // The replacement was not contaminated either.
+    const current = store.current("ses_a")!;
+    expect(current.generation).toBe(goal.generation + 1);
+    expect(store.listProofs(current.id)).toHaveLength(0);
   });
 });
 

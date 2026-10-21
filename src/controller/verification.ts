@@ -79,6 +79,12 @@ export interface VerificationResult {
   proofs?: CriterionProof[];
   /** Hash of the criteria+evidence snapshot this verification checked. */
   snapshot?: string;
+  /**
+   * Evidence that no longer validates, annotated per criterion. Stale
+   * history never drives the verdict by itself (finding 7): a criterion
+   * proven by a currently-valid alternative is complete regardless.
+   */
+  staleEvidence?: string[];
 }
 
 /** Proof that a single criterion was established. */
@@ -245,6 +251,12 @@ export class GoalVerifier {
   async verify(goalID: string): Promise<VerificationResult> {
     const goal = this.store.byID(goalID);
     if (!goal) return { verdict: "incomplete", unmet: [], reason: "unknown goal" };
+    // Verification attempt fence: the proofs this run produces describe the
+    // goal as it existed at this version. If the goal is replaced, paused, or
+    // otherwise transitioned while asynchronous validation is running, the
+    // store discards the result instead of letting a stale verifier overwrite
+    // the superseded goal's records (finding 10).
+    const attempt = { generation: goal.generation, version: goal.version };
 
     const criteria = this.store.listCriteria(goalID);
     const evidence = this.store.listEvidence(goalID);
@@ -289,16 +301,16 @@ export class GoalVerifier {
     // 3. Only evidence bound to a criterion is load-bearing. An exploratory
     //    `ls` that the model happened to run is not a completion claim, and an
     //    unbound command without an exit status must not make the objective
-    //    "incomplete" by itself. Validate what a criterion actually relies on.
-    const boundIDs = new Set<string>();
-    for (const criterion of criteria) {
-      for (const item of verifiable) {
-        if (item.criterionID === criterion.id) boundIDs.add(item.id);
-      }
-    }
+    //    "incomplete" by itself. Validity is judged per criterion inside the
+    //    proof loop below (finding 7): stale evidence stays in the audit
+    //    trail and can contribute to an unmet annotation, but it can never
+    //    defeat an independently valid, newer proof of the same criterion.
     const invalid = new Set<string>();
-    for (const item of verifiable) {
-      if (!boundIDs.has(item.id)) continue;
+    const staleNotes: string[] = [];
+    const validateItem = async (
+      criterion: { id: string; text: string },
+      item: (typeof evidence)[number],
+    ): Promise<boolean> => {
       const validation = await this.validator.validate(
         {
           kind: item.kind as EvidenceKind,
@@ -310,30 +322,58 @@ export class GoalVerifier {
         },
         workspace,
       );
-      if (!validation.valid) {
+      if (validation.valid) return true;
+      if (!invalid.has(item.id)) {
         invalid.add(item.id);
-        unmet.push(`evidence no longer valid: ${item.ref} (${validation.reason})`);
+        staleNotes.push(`evidence no longer valid: ${item.ref} (${item.id}, ${validation.reason})`);
       }
-    }
+      return false;
+    };
+    const validBound = (criterion: { id: string }) =>
+      verifiable.filter((e) => e.criterionID === criterion.id && !invalid.has(e.id));
 
-    // 4. Prove each criterion explicitly.
+    // 4. Prove each criterion under its own contract (finding 6). A
+    //    criterion passes when at least one complete proof set validates:
+    //    alternatives (independent proof mechanisms) satisfy separately,
+    //    never by pooling rows across mechanisms. Invalid historical
+    //    evidence is annotated, not disqualifying, when a newer valid proof
+    //    exists (finding 7).
     for (const criterion of criteria) {
-      const bound = evidence.filter(
-        (e) => e.criterionID === criterion.id && !invalid.has(e.id) && e.kind !== "ref",
-      );
-      const evidenceIDs = bound.map((e) => e.id);
+      let bound = validBound(criterion);
+
+      const proof = async (
+        validatorID: string,
+        verdict: "pass" | "fail" | "unknown",
+        detail: string,
+        evidenceIDs = bound.map((e) => e.id),
+      ): Promise<CriterionProof> => ({ criterionID: criterion.id, evidenceIDs, validatorID, verdict, detail });
 
       if (criterion.spec?.type === "file" && this.validator.checkSpec) {
-        // Independent machine check: the spec, not the model's claim.
+        // Proof alternative 1: the independent machine check — the spec, not
+        // the model's claim. Proof alternative 2: bound, currently-valid file
+        // evidence (a captured write whose hash still validates).
         const check = await this.validator.checkSpec(criterion, workspace);
-        proofs.push({
-          criterionID: criterion.id,
-          evidenceIDs,
-          validatorID: "spec.file",
-          verdict: check.valid ? "pass" : "fail",
-          detail: check.reason,
-        });
-        if (!check.valid) unmet.push(`criterion not satisfied: ${criterion.text} (${check.reason})`);
+        if (check.valid) {
+          proofs.push(await proof("spec.file", "pass", check.reason));
+          continue;
+        }
+        // Validate this criterion's own bound evidence before conceding.
+        for (const item of verifiable.filter((e) => e.criterionID === criterion.id)) {
+          await validateItem(criterion, item);
+        }
+        bound = validBound(criterion);
+        if (bound.length > 0) {
+          proofs.push(
+            await proof(
+              "spec.file",
+              "pass",
+              `${check.reason}; but ${bound.length} bound file evidence item(s) still validate`,
+            ),
+          );
+          continue;
+        }
+        proofs.push(await proof("spec.file", "fail", check.reason));
+        unmet.push(`criterion not satisfied: ${criterion.text} (${check.reason})`);
         continue;
       }
 
@@ -344,34 +384,43 @@ export class GoalVerifier {
         // unrelated command proves nothing about this requirement.
         const expected = criterion.spec.type === "test" ? 0 : (criterion.spec.expectExit ?? 0);
         const required = normalizedCommand(criterion.spec.command);
-        const proof = bound.filter(
+        // Validate only this criterion's bound runs: invalid history here
+        // cannot defeat a newer valid run of the same command.
+        for (const item of verifiable.filter(
+          (e) => e.criterionID === criterion.id && (e.kind === "command" || e.kind === "test"),
+        )) {
+          await validateItem(criterion, item);
+        }
+        bound = validBound(criterion);
+        const proofRuns = bound.filter(
           (e) =>
             (e.kind === "command" || e.kind === "test") &&
             e.exitCode === expected &&
             normalizedCommand(e.ref) === required,
         );
-        if (proof.length === 0) {
+        if (proofRuns.length === 0) {
           const ran = bound.filter((e) => e.kind === "command" || e.kind === "test");
-          proofs.push({
-            criterionID: criterion.id,
-            evidenceIDs: [],
-            validatorID: "spec.command",
-            verdict: "fail",
-            detail: ran.some((e) => e.exitCode === expected)
-              ? `${ran.length} bound run(s) exited ${expected}, but none was the required command`
-              : `no bound command/test evidence exited ${expected}`,
-          });
+          proofs.push(
+            await proof(
+              "spec.command",
+              "fail",
+              ran.some((e) => e.exitCode === expected)
+                ? `${ran.length} bound run(s) exited ${expected}, but none was the required command`
+                : `no bound command/test evidence exited ${expected}`,
+            ),
+          );
           unmet.push(
             `criterion not evidenced: ${criterion.text} (a run of "${criterion.spec.command}" exiting ${expected} was not observed)`,
           );
         } else {
-          proofs.push({
-            criterionID: criterion.id,
-            evidenceIDs: proof.map((e) => e.id),
-            validatorID: "spec.command",
-            verdict: "pass",
-            detail: `${proof.length} bound run(s) exited ${expected}`,
-          });
+          proofs.push(
+            await proof(
+              "spec.command",
+              "pass",
+              `${proofRuns.length} bound run(s) of the required command exited ${expected}`,
+              proofRuns.map((e) => e.id),
+            ),
+          );
         }
         continue;
       }
@@ -384,25 +433,16 @@ export class GoalVerifier {
         // explicitly accepts this generation of the objective.
         const acceptance = this.store.userAcceptance(goal.id);
         if (acceptance && acceptance.generation === goal.generation) {
-          proofs.push({
-            criterionID: criterion.id,
-            evidenceIDs: bound.map((e) => e.id),
-            validatorID: "user-acceptance",
-            verdict: "pass",
-            detail: acceptance.note
-              ? `user accepted the objective: ${acceptance.note}`
-              : "user accepted the objective",
-          });
+          proofs.push(await proof("user-acceptance", "pass", acceptance.note
+            ? `user accepted the objective: ${acceptance.note}`
+            : "user accepted the objective"));
           continue;
         }
-        proofs.push({
-          criterionID: criterion.id,
-          evidenceIDs: bound.map((e) => e.id),
-          validatorID: "objective-acceptance",
-          verdict: "unknown",
-          detail:
-            "broad objective; cannot establish completeness from ordinary evidence — needs concrete sub-criteria or explicit user acceptance",
-        });
+        proofs.push(await proof(
+          "objective-acceptance",
+          "unknown",
+          "broad objective; cannot establish completeness from ordinary evidence — needs concrete sub-criteria or explicit user acceptance",
+        ));
         unmet.push(
           `criterion unresolved: ${criterion.text} — register concrete machine-checkable criteria with goal_add_criterion, or ask the user to run /goal accept`,
         );
@@ -410,32 +450,55 @@ export class GoalVerifier {
       }
 
       // No spec: a manual criterion still requires explicitly bound, valid,
-      // machine-verifiable evidence.
+      // machine-verifiable evidence. Stale history is annotated but a valid
+      // newer item still proves it.
+      for (const item of verifiable.filter((e) => e.criterionID === criterion.id)) {
+        await validateItem(criterion, item);
+      }
+      bound = validBound(criterion);
       if (bound.length === 0) {
-        proofs.push({
-          criterionID: criterion.id,
-          evidenceIDs: [],
-          validatorID: "bound-evidence",
-          verdict: "fail",
-          detail: "no bound, currently-valid evidence",
-        });
+        proofs.push(await proof("bound-evidence", "fail", "no bound, currently-valid evidence"));
         unmet.push(`criterion not evidenced: ${criterion.text}`);
       } else {
-        proofs.push({
-          criterionID: criterion.id,
-          evidenceIDs,
-          validatorID: "bound-evidence",
-          verdict: "pass",
-          detail: `${bound.length} bound evidence item(s)`,
-        });
+        proofs.push(await proof("bound-evidence", "pass", `${bound.length} bound evidence item(s)`));
       }
+    }
+
+    // Stale evidence remains in the audit trail: it annotates why older proof
+    // attempts stopped counting, but a criterion proven by an independent,
+    // currently-valid alternative is complete regardless (finding 7). It is
+    // reported in its own field and only joins `unmet` when the verdict is
+    // already incomplete, so the model still sees why older evidence stopped
+    // counting.
+    const staleEvidence = staleNotes;
+    if (unmet.length > 0) {
+      // The verdict is already incomplete on real grounds; annotating why
+      // older evidence stopped counting helps the model retry correctly.
+      unmet.push(...staleEvidence);
     }
 
     // The snapshot hash is the store's canonical rule (snapshotHash): this
     // verifier records its decision against exactly the rows it read, and
     // completeGoal re-hashes the current rows to reject a stale decision.
+    // The attempt fence is checked at commit: a goal superseded mid-verify
+    // does not accept this run's proofs; its criterion readouts stay
+    // untouched.
     const snapshot = snapshotHash(criteria, evidence);
-    this.store.recordProofs(goalID, proofs, snapshot);
+    const recorded = this.store.recordProofs(goalID, proofs, snapshot, attempt);
+    if (!recorded) {
+      return {
+        verdict: "incomplete",
+        unmet: [
+          ...unmet,
+          "verification discarded: the goal changed state while validation was running",
+        ],
+        reason:
+          "the goal was replaced or transitioned during verification; the proofs described a superseded goal",
+        proofs,
+        snapshot,
+        staleEvidence: staleEvidence.length > 0 ? staleEvidence : undefined,
+      };
+    }
 
     if (unmet.length > 0) {
       return {
@@ -444,6 +507,7 @@ export class GoalVerifier {
         reason: `${unmet.length} condition(s) unsatisfied against current evidence`,
         proofs,
         snapshot,
+        staleEvidence: staleEvidence.length > 0 ? staleEvidence : undefined,
       };
     }
     return {
@@ -455,6 +519,7 @@ export class GoalVerifier {
           : `objective satisfied: ${criteria.length} criteria covered by ${verifiable.length} validated evidence item(s)`,
       proofs,
       snapshot,
+      staleEvidence: staleEvidence.length > 0 ? staleEvidence : undefined,
     };
   }
 }

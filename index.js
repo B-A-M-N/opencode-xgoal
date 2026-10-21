@@ -851,11 +851,14 @@ class GoalStore {
       return bound;
     });
   }
-  recordProofs(goalID, proofs, snapshot) {
-    this.tx(() => {
+  recordProofs(goalID, proofs, snapshot, attempt) {
+    return this.tx(() => {
       const goal = this.byID(goalID);
       if (!goal)
         throw new GoalConflictError(`unknown goal ${goalID}`);
+      if (attempt && (goal.generation !== attempt.generation || goal.version !== attempt.version)) {
+        return false;
+      }
       const now = Date.now();
       for (const proof of proofs) {
         this.db.query(`INSERT INTO goal_criterion_proofs
@@ -869,6 +872,7 @@ class GoalStore {
                   updated_at_ms = ?,
                   version = version + 1
             WHERE id = ? AND version = ?`).run(snapshot, now, goalID, goal.version);
+      return true;
     });
   }
   listProofs(goalID) {
@@ -2258,6 +2262,7 @@ class GoalVerifier {
     const goal = this.store.byID(goalID);
     if (!goal)
       return { verdict: "incomplete", unmet: [], reason: "unknown goal" };
+    const attempt = { generation: goal.generation, version: goal.version };
     const criteria = this.store.listCriteria(goalID);
     const evidence = this.store.listEvidence(goalID);
     const workspace = await this.validator.workspaceFor?.(goal.sessionID) ?? "";
@@ -2279,17 +2284,9 @@ class GoalVerifier {
         reason: "completion requires evidence the controller observed (a command that ran, a file that changed); a model statement is not evidence"
       };
     }
-    const boundIDs = new Set;
-    for (const criterion of criteria) {
-      for (const item of verifiable) {
-        if (item.criterionID === criterion.id)
-          boundIDs.add(item.id);
-      }
-    }
     const invalid = new Set;
-    for (const item of verifiable) {
-      if (!boundIDs.has(item.id))
-        continue;
+    const staleNotes = [];
+    const validateItem = async (criterion, item) => {
       const validation = await this.validator.validate({
         kind: item.kind,
         ref: item.ref,
@@ -2298,102 +2295,101 @@ class GoalVerifier {
         atMs: Date.now(),
         criterionID: item.criterionID
       }, workspace);
-      if (!validation.valid) {
+      if (validation.valid)
+        return true;
+      if (!invalid.has(item.id)) {
         invalid.add(item.id);
-        unmet.push(`evidence no longer valid: ${item.ref} (${validation.reason})`);
+        staleNotes.push(`evidence no longer valid: ${item.ref} (${item.id}, ${validation.reason})`);
       }
-    }
+      return false;
+    };
+    const validBound = (criterion) => verifiable.filter((e) => e.criterionID === criterion.id && !invalid.has(e.id));
     for (const criterion of criteria) {
-      const bound = evidence.filter((e) => e.criterionID === criterion.id && !invalid.has(e.id) && e.kind !== "ref");
-      const evidenceIDs = bound.map((e) => e.id);
+      let bound = validBound(criterion);
+      const proof = async (validatorID, verdict, detail, evidenceIDs = bound.map((e) => e.id)) => ({ criterionID: criterion.id, evidenceIDs, validatorID, verdict, detail });
       if (criterion.spec?.type === "file" && this.validator.checkSpec) {
         const check = await this.validator.checkSpec(criterion, workspace);
-        proofs.push({
-          criterionID: criterion.id,
-          evidenceIDs,
-          validatorID: "spec.file",
-          verdict: check.valid ? "pass" : "fail",
-          detail: check.reason
-        });
-        if (!check.valid)
-          unmet.push(`criterion not satisfied: ${criterion.text} (${check.reason})`);
+        if (check.valid) {
+          proofs.push(await proof("spec.file", "pass", check.reason));
+          continue;
+        }
+        for (const item of verifiable.filter((e) => e.criterionID === criterion.id)) {
+          await validateItem(criterion, item);
+        }
+        bound = validBound(criterion);
+        if (bound.length > 0) {
+          proofs.push(await proof("spec.file", "pass", `${check.reason}; but ${bound.length} bound file evidence item(s) still validate`));
+          continue;
+        }
+        proofs.push(await proof("spec.file", "fail", check.reason));
+        unmet.push(`criterion not satisfied: ${criterion.text} (${check.reason})`);
         continue;
       }
       if (criterion.spec?.type === "command" || criterion.spec?.type === "test") {
         const expected = criterion.spec.type === "test" ? 0 : criterion.spec.expectExit ?? 0;
         const required = normalizedCommand(criterion.spec.command);
-        const proof = bound.filter((e) => (e.kind === "command" || e.kind === "test") && e.exitCode === expected && normalizedCommand(e.ref) === required);
-        if (proof.length === 0) {
+        for (const item of verifiable.filter((e) => e.criterionID === criterion.id && (e.kind === "command" || e.kind === "test"))) {
+          await validateItem(criterion, item);
+        }
+        bound = validBound(criterion);
+        const proofRuns = bound.filter((e) => (e.kind === "command" || e.kind === "test") && e.exitCode === expected && normalizedCommand(e.ref) === required);
+        if (proofRuns.length === 0) {
           const ran = bound.filter((e) => e.kind === "command" || e.kind === "test");
-          proofs.push({
-            criterionID: criterion.id,
-            evidenceIDs: [],
-            validatorID: "spec.command",
-            verdict: "fail",
-            detail: ran.some((e) => e.exitCode === expected) ? `${ran.length} bound run(s) exited ${expected}, but none was the required command` : `no bound command/test evidence exited ${expected}`
-          });
+          proofs.push(await proof("spec.command", "fail", ran.some((e) => e.exitCode === expected) ? `${ran.length} bound run(s) exited ${expected}, but none was the required command` : `no bound command/test evidence exited ${expected}`));
           unmet.push(`criterion not evidenced: ${criterion.text} (a run of "${criterion.spec.command}" exiting ${expected} was not observed)`);
         } else {
-          proofs.push({
-            criterionID: criterion.id,
-            evidenceIDs: proof.map((e) => e.id),
-            validatorID: "spec.command",
-            verdict: "pass",
-            detail: `${proof.length} bound run(s) exited ${expected}`
-          });
+          proofs.push(await proof("spec.command", "pass", `${proofRuns.length} bound run(s) of the required command exited ${expected}`, proofRuns.map((e) => e.id)));
         }
         continue;
       }
       if (criterion.spec?.type === "objective") {
         const acceptance = this.store.userAcceptance(goal.id);
         if (acceptance && acceptance.generation === goal.generation) {
-          proofs.push({
-            criterionID: criterion.id,
-            evidenceIDs: bound.map((e) => e.id),
-            validatorID: "user-acceptance",
-            verdict: "pass",
-            detail: acceptance.note ? `user accepted the objective: ${acceptance.note}` : "user accepted the objective"
-          });
+          proofs.push(await proof("user-acceptance", "pass", acceptance.note ? `user accepted the objective: ${acceptance.note}` : "user accepted the objective"));
           continue;
         }
-        proofs.push({
-          criterionID: criterion.id,
-          evidenceIDs: bound.map((e) => e.id),
-          validatorID: "objective-acceptance",
-          verdict: "unknown",
-          detail: "broad objective; cannot establish completeness from ordinary evidence — needs concrete sub-criteria or explicit user acceptance"
-        });
+        proofs.push(await proof("objective-acceptance", "unknown", "broad objective; cannot establish completeness from ordinary evidence — needs concrete sub-criteria or explicit user acceptance"));
         unmet.push(`criterion unresolved: ${criterion.text} — register concrete machine-checkable criteria with goal_add_criterion, or ask the user to run /goal accept`);
         continue;
       }
+      for (const item of verifiable.filter((e) => e.criterionID === criterion.id)) {
+        await validateItem(criterion, item);
+      }
+      bound = validBound(criterion);
       if (bound.length === 0) {
-        proofs.push({
-          criterionID: criterion.id,
-          evidenceIDs: [],
-          validatorID: "bound-evidence",
-          verdict: "fail",
-          detail: "no bound, currently-valid evidence"
-        });
+        proofs.push(await proof("bound-evidence", "fail", "no bound, currently-valid evidence"));
         unmet.push(`criterion not evidenced: ${criterion.text}`);
       } else {
-        proofs.push({
-          criterionID: criterion.id,
-          evidenceIDs,
-          validatorID: "bound-evidence",
-          verdict: "pass",
-          detail: `${bound.length} bound evidence item(s)`
-        });
+        proofs.push(await proof("bound-evidence", "pass", `${bound.length} bound evidence item(s)`));
       }
     }
+    const staleEvidence = staleNotes;
+    if (unmet.length > 0) {
+      unmet.push(...staleEvidence);
+    }
     const snapshot = snapshotHash(criteria, evidence);
-    this.store.recordProofs(goalID, proofs, snapshot);
+    const recorded = this.store.recordProofs(goalID, proofs, snapshot, attempt);
+    if (!recorded) {
+      return {
+        verdict: "incomplete",
+        unmet: [
+          ...unmet,
+          "verification discarded: the goal changed state while validation was running"
+        ],
+        reason: "the goal was replaced or transitioned during verification; the proofs described a superseded goal",
+        proofs,
+        snapshot,
+        staleEvidence: staleEvidence.length > 0 ? staleEvidence : undefined
+      };
+    }
     if (unmet.length > 0) {
       return {
         verdict: "incomplete",
         unmet,
         reason: `${unmet.length} condition(s) unsatisfied against current evidence`,
         proofs,
-        snapshot
+        snapshot,
+        staleEvidence: staleEvidence.length > 0 ? staleEvidence : undefined
       };
     }
     return {
@@ -2401,7 +2397,8 @@ class GoalVerifier {
       unmet: [],
       reason: verifiable.length === 0 ? `objective satisfied: ${criteria.length} criteria established by independent checks and user acceptance` : `objective satisfied: ${criteria.length} criteria covered by ${verifiable.length} validated evidence item(s)`,
       proofs,
-      snapshot
+      snapshot,
+      staleEvidence: staleEvidence.length > 0 ? staleEvidence : undefined
     };
   }
 }

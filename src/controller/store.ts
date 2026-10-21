@@ -1107,7 +1107,17 @@ export class GoalStore {
     });
   }
 
-  /** Persist the proofs a verification attempt produced, atomically. */
+  /**
+   * Persist the proofs a verification attempt produced, atomically.
+   *
+   * The write is fenced by the verification attempt (generation + version):
+   * if the goal changed state while validation was running, the proofs are
+   * discarded and the caller learns its decision described a world that no
+   * longer exists. Criterion readouts are only ever updated by a verifier
+   * that observed the current goal.
+   *
+   * Returns true when the proofs were recorded; false when discarded.
+   */
   recordProofs(
     goalID: string,
     proofs: {
@@ -1118,10 +1128,16 @@ export class GoalStore {
       detail: string;
     }[],
     snapshot: string,
-  ): void {
-    this.tx(() => {
+    attempt?: { generation: number; version: number },
+  ): boolean {
+    return this.tx(() => {
       const goal = this.byID(goalID);
       if (!goal) throw new GoalConflictError(`unknown goal ${goalID}`);
+      if (attempt && (goal.generation !== attempt.generation || goal.version !== attempt.version)) {
+        // Stale verification: the goal was replaced or transitioned mid-run.
+        // No proof rows, no criterion readout changes, no revision bump.
+        return false;
+      }
       const now = Date.now();
       for (const proof of proofs) {
         this.db
@@ -1157,6 +1173,7 @@ export class GoalStore {
             WHERE id = ? AND version = ?`,
         )
         .run(snapshot, now, goalID, goal.version);
+      return true;
     });
   }
 

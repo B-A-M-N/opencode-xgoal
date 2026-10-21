@@ -12,7 +12,7 @@ after a completed one and a generation-checked replacement.
 
 ```bash
 bun run build     # required: the package entry is ./index.js
-bun test          # 195 unit/integration tests
+bun test          # 226 unit/integration tests
 bash scripts/parity.sh   # live activation acceptance (real server + model)
 ```
 
@@ -273,7 +273,7 @@ inspection. It never touches the user's database or sessions.
 ## Verification
 
 ```bash
-bun test          # 195 unit/integration tests, 558 assertions
+bun test          # 226 unit/integration tests, 637 assertions
 bun run typecheck # clean
 bash scripts/parity.sh  # 17/17 live acceptance checks
 ```
@@ -443,6 +443,30 @@ regression tests:
 14. **Atomic supersession (P1)** — replacing a goal fails its outstanding
     rounds in the same transaction, and completion recomputes the
     criteria+evidence snapshot so a stale verification cannot commit (P2).
+
+A third independent audit then found verification-correctness gaps; the
+verification package is fixed with regression tests:
+
+15. **Per-criterion proof contracts (P1)** — the verifier no longer demands a
+    global nonempty evidence list before looking at criteria: file specs are
+    re-checked against the filesystem, objective criteria resolve by
+    generation-fenced user acceptance, command/test criteria by a bound run of
+    the required command itself, and manual criteria by their own bound,
+    currently-valid evidence. Unresolved criteria stay `unknown`, never
+    silently satisfied, and acceptance never waives an unrelated explicit
+    requirement.
+16. **Valid newer proofs defeat stale history (P1)** — evidence validity is
+    judged per criterion during proof evaluation. A criterion passes when a
+    complete proof set validates; older invalid evidence (an earlier file
+    revision, a failed test run before the fix) stays in the audit trail —
+    reported as `staleEvidence` — without making the verdict incomplete, while
+    a genuinely required dependency whose only evidence went stale still fails.
+17. **Fenced verification attempts (P1)** — `recordProofs` carries the
+    generation+version the verifier read; if the goal is replaced or
+    transitioned while asynchronous validation runs, the proofs are discarded
+    instead of overwriting the superseded goal's criterion readouts. Point-in-
+    time external file checks are acknowledged: completion re-reads the
+    snapshot, and the verifier result records what was checked and when.
 
 Additional fixes: generation fencing on every model tool, per-round blocker
 claims, checkpoint-as-annotation, round evidence baselines, `unknown → admitted`
