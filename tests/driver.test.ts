@@ -48,6 +48,8 @@ class FakeTransport implements ContinuationTransport {
   throwOnSubmit = false;
   /** Reported by liveWait: whether a background execution is still running. */
   liveWaitResult = false;
+  /** Number of liveWait calls — pins whether the wait was actually probed. */
+  liveWaitCalls = 0;
   /** Runs inside submit, before returning — lets a test inspect DB state. */
   onSubmit?: (inboxID: string) => void;
 
@@ -69,6 +71,7 @@ class FakeTransport implements ContinuationTransport {
   }
 
   liveWait(): boolean {
+    this.liveWaitCalls++;
     return this.liveWaitResult;
   }
 }
@@ -686,8 +689,11 @@ describe("progress classification counts only verifiable evidence", () => {
 
     // The recovery sweep honors the persisted next-reconciliation time: this
     // wait is NOT yet due (recheckMs is 30s, elapsed ~0), so the sweep skips
-    // the recheck entirely and still mints nothing.
+    // the recheck entirely — the transport is never probed — and mints
+    // nothing.
+    const probesBefore = transport.liveWaitCalls;
     await driver.reconcile();
+    expect(transport.liveWaitCalls).toBe(probesBefore);
     expect(transport.submitted.length).toBe(1);
     expect(store.activeWait(goal.id)).toBeDefined();
 
@@ -741,11 +747,14 @@ describe("progress classification counts only verifiable evidence", () => {
     expect(settleOutcome.action).toBe("waiting");
     expect(store.activeWait(goal.id)?.recheckMs).toBe(0);
 
-    // Sweep: the wait is due, so the sweep probes the transport (recheckWait)
-    // and, because the job is still live, re-arms the wait — no rounds minted.
+    // Sweep: the wait is due, so the sweep actually probes the transport
+    // (liveWait rises above its pre-sweep count) and, because the job is
+    // still live, re-arms the wait — no rounds minted.
+    const probesBefore = transport.liveWaitCalls;
     const sweep = await driver.reconcile();
     expect(sweep.length).toBe(1);
     expect(sweep[0]!.action).toBe("waiting");
+    expect(transport.liveWaitCalls).toBeGreaterThan(probesBefore);
     expect(transport.liveWaitResult).toBe(true);
     expect(store.activeWait(goal.id)).toBeDefined();
     expect(transport.submitted.length).toBe(1);
