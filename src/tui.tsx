@@ -77,6 +77,22 @@ function describeDrive(outcome: any): string {
   }
 }
 
+function describeError(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (typeof error === "string") return error;
+  if (error && typeof error === "object") {
+    const value = error as { message?: unknown; data?: unknown; cause?: unknown };
+    if (typeof value.message === "string") return value.message;
+    if (typeof value.data === "string") return value.data;
+    try {
+      return JSON.stringify(error) ?? Object.prototype.toString.call(error);
+    } catch {
+      return Object.prototype.toString.call(error);
+    }
+  }
+  return String(error);
+}
+
 /**
  * Build the `/goal` command handler against an injected host surface.
  *
@@ -90,6 +106,8 @@ export function createGoalCommand(host: {
   rpc: GoalRpc;
   /** Resolve the session the user is currently viewing. */
   currentSessionID: () => string | undefined;
+  /** Create and focus a session when `/goal <objective>` starts from home. */
+  createSession?: () => Promise<string | undefined>;
   /** The host dialog: Enter resolves true, Escape resolves false/undefined. */
   dialogConfirm: (input: { title: string; message: string; label: { confirm: string; cancel: string } }) => Promise<boolean | undefined>;
   notify: (message: string, variant?: "info" | "success" | "warning" | "error", sessionID?: string) => void;
@@ -166,15 +184,18 @@ export function createGoalCommand(host: {
     };
 
     const runGoal = async (raw: string) => {
-      const sessionID = currentSessionID();
+      const text = String(raw ?? "").trim();
+      const [verb, ...rest] = text.split(/\s+/);
+      const arg = rest.join(" ").trim();
+      let sessionID = currentSessionID();
+      const sessionlessVerb = new Set(["status", "pause", "resume", "replace", "budget", "accept", "health"]);
+      if (!sessionID && text && !sessionlessVerb.has(verb.toLowerCase())) {
+        sessionID = await host.createSession?.();
+      }
       if (!sessionID) {
         notify("Open a session before using /goal.", "warning");
         return;
       }
-
-      const text = String(raw ?? "").trim();
-      const [verb, ...rest] = text.split(/\s+/);
-      const arg = rest.join(" ").trim();
 
       // Bare `/goal` and the explicit control verbs never prompt.
       if (!text || verb === "status") {
@@ -317,12 +338,41 @@ export default Plugin.define({
   id: "opencode-xgoal-tui",
 
   async setup(context: Plugin.Context) {
-    const rpc = context.client.rpc(goalRpcDefinition) as unknown as GoalRpc;
+    const rpcClient = context.client.rpc(goalRpcDefinition);
+    const rpcLocation = context.location ?? context.data.location.default();
+    const rpc = Object.fromEntries(
+      Object.keys(goalRpcDefinition.methods).map((name) => [
+        name,
+        (input: unknown) => (rpcClient as any)[name](input, { location: rpcLocation }),
+      ]),
+    ) as unknown as GoalRpc;
+    const currentSessionID = () => {
+      try {
+        const route = context.ui.router.current();
+        if (route.type === "session") return route.sessionID;
+      } catch {
+        // The active session tab below is a useful fallback during route changes.
+      }
+      try {
+        const activeTab = context.data.tabs.list().find((tab) => tab.active);
+        if (activeTab) return activeTab.sessionID;
+      } catch {
+        // Tabs may be unavailable in hosts that do not enable session tabs.
+      }
+      try {
+        return context.ui.panel.current()?.sessionID;
+      } catch {
+        return undefined;
+      }
+    };
     const { runGoal } = createGoalCommand({
       rpc,
-      currentSessionID: () => {
-        const route = context.ui.router.current();
-        return route.type === "session" ? route.sessionID : undefined;
+      currentSessionID,
+      createSession: async () => {
+        const location = context.location ?? context.data.location.default();
+        const session = await context.client.session.create({ location });
+        context.ui.router.navigate({ type: "session", sessionID: session.id });
+        return session.id;
       },
       dialogConfirm: (input) => context.ui.dialog.confirm(input),
       notify: (message, variant = "info", sessionID) => {
@@ -333,10 +383,6 @@ export default Plugin.define({
         }
       },
     });
-    const currentSessionID = () => {
-      const route = context.ui.router.current();
-      return route.type === "session" ? route.sessionID : undefined;
-    };
     const notify = (message: string, variant: "info" | "success" | "warning" | "error" = "info", sessionID?: string) => {
       try {
         context.ui.toast.show({ title: "OpenCode-XGoal", message, variant, sessionID });
@@ -361,7 +407,7 @@ export default Plugin.define({
             try {
               await runGoal(String(input ?? ""));
             } catch (error) {
-              notify(`Goal command failed: ${String(error)}`, "error", currentSessionID());
+              notify(`Goal command failed: ${describeError(error)}`, "error", currentSessionID());
             }
           },
         },

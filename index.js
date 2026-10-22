@@ -3543,6 +3543,25 @@ function describeDrive(outcome) {
       return `dispatch: ${String(outcome.action)}.`;
   }
 }
+function describeError(error) {
+  if (error instanceof Error)
+    return error.message;
+  if (typeof error === "string")
+    return error;
+  if (error && typeof error === "object") {
+    const value = error;
+    if (typeof value.message === "string")
+      return value.message;
+    if (typeof value.data === "string")
+      return value.data;
+    try {
+      return JSON.stringify(error) ?? Object.prototype.toString.call(error);
+    } catch {
+      return Object.prototype.toString.call(error);
+    }
+  }
+  return String(error);
+}
 function record(entry) {
   if (!LOG)
     return;
@@ -4244,7 +4263,7 @@ Use /goal replace <objective> to supersede it.`);
                 reply(`Goal created (generation ${out.created.generation}); no driver is connected.`);
               }
             } catch (error) {
-              reply(`Goal command failed: ${String(error)}`);
+              reply(`Goal command failed: ${describeError(error)}`);
             }
           }
         });

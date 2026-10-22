@@ -54,6 +54,22 @@ function describeDrive(outcome: any): string {
   }
 }
 
+function describeError(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (typeof error === "string") return error;
+  if (error && typeof error === "object") {
+    const value = error as { message?: unknown; data?: unknown };
+    if (typeof value.message === "string") return value.message;
+    if (typeof value.data === "string") return value.data;
+    try {
+      return JSON.stringify(error) ?? Object.prototype.toString.call(error);
+    } catch {
+      return Object.prototype.toString.call(error);
+    }
+  }
+  return String(error);
+}
+
 type Evidence = Record<string, unknown> & { event: string };
 
 /** Structured evidence trail. Only active when XGOAL_HARNESS_LOG is set. */
@@ -960,7 +976,7 @@ export default {
                 reply(`Goal created (generation ${out.created.generation}); no driver is connected.`);
               }
             } catch (error) {
-              reply(`Goal command failed: ${String(error)}`);
+              reply(`Goal command failed: ${describeError(error)}`);
             }
           },
         });

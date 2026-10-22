@@ -232,6 +232,25 @@ function describeDrive(outcome) {
       return `dispatch: ${String(outcome.action)}`;
   }
 }
+function describeError(error) {
+  if (error instanceof Error)
+    return error.message;
+  if (typeof error === "string")
+    return error;
+  if (error && typeof error === "object") {
+    const value = error;
+    if (typeof value.message === "string")
+      return value.message;
+    if (typeof value.data === "string")
+      return value.data;
+    try {
+      return JSON.stringify(error) ?? Object.prototype.toString.call(error);
+    } catch {
+      return Object.prototype.toString.call(error);
+    }
+  }
+  return String(error);
+}
 function createGoalCommand(host) {
   const { rpc, dialogConfirm, notify } = host;
   const currentSessionID = host.currentSessionID;
@@ -280,14 +299,18 @@ function createGoalCommand(host) {
     notify(`Goal created (generation ${res.goal?.generation ?? "?"}). ${describeDrive(res.drive)}.`, "success", sessionID);
   };
   const runGoal = async (raw) => {
-    const sessionID = currentSessionID();
+    const text = String(raw ?? "").trim();
+    const [verb, ...rest] = text.split(/\s+/);
+    const arg = rest.join(" ").trim();
+    let sessionID = currentSessionID();
+    const sessionlessVerb = new Set(["status", "pause", "resume", "replace", "budget", "accept", "health"]);
+    if (!sessionID && text && !sessionlessVerb.has(verb.toLowerCase())) {
+      sessionID = await host.createSession?.();
+    }
     if (!sessionID) {
       notify("Open a session before using /goal.", "warning");
       return;
     }
-    const text = String(raw ?? "").trim();
-    const [verb, ...rest] = text.split(/\s+/);
-    const arg = rest.join(" ").trim();
     if (!text || verb === "status") {
       const res = await rpc["goal.status"]({ sessionID });
       notify(statusText(res.current, res.latest), "info", sessionID);
@@ -383,12 +406,37 @@ function createGoalCommand(host) {
 var tui_default = exports_plugin.define({
   id: "opencode-xgoal-tui",
   async setup(context) {
-    const rpc = context.client.rpc(goalRpcDefinition);
+    const rpcClient = context.client.rpc(goalRpcDefinition);
+    const rpcLocation = context.location ?? context.data.location.default();
+    const rpc = Object.fromEntries(Object.keys(goalRpcDefinition.methods).map((name) => [
+      name,
+      (input) => rpcClient[name](input, { location: rpcLocation })
+    ]));
+    const currentSessionID = () => {
+      try {
+        const route = context.ui.router.current();
+        if (route.type === "session")
+          return route.sessionID;
+      } catch {}
+      try {
+        const activeTab = context.data.tabs.list().find((tab) => tab.active);
+        if (activeTab)
+          return activeTab.sessionID;
+      } catch {}
+      try {
+        return context.ui.panel.current()?.sessionID;
+      } catch {
+        return;
+      }
+    };
     const { runGoal } = createGoalCommand({
       rpc,
-      currentSessionID: () => {
-        const route = context.ui.router.current();
-        return route.type === "session" ? route.sessionID : undefined;
+      currentSessionID,
+      createSession: async () => {
+        const location = context.location ?? context.data.location.default();
+        const session = await context.client.session.create({ location });
+        context.ui.router.navigate({ type: "session", sessionID: session.id });
+        return session.id;
       },
       dialogConfirm: (input) => context.ui.dialog.confirm(input),
       notify: (message, variant = "info", sessionID) => {
@@ -397,10 +445,6 @@ var tui_default = exports_plugin.define({
         } catch {}
       }
     });
-    const currentSessionID = () => {
-      const route = context.ui.router.current();
-      return route.type === "session" ? route.sessionID : undefined;
-    };
     const notify = (message, variant = "info", sessionID) => {
       try {
         context.ui.toast.show({ title: "OpenCode-XGoal", message, variant, sessionID });
@@ -420,7 +464,7 @@ var tui_default = exports_plugin.define({
             try {
               await runGoal(String(input ?? ""));
             } catch (error) {
-              notify(`Goal command failed: ${String(error)}`, "error", currentSessionID());
+              notify(`Goal command failed: ${describeError(error)}`, "error", currentSessionID());
             }
           }
         }
