@@ -22,6 +22,32 @@ bash scripts/parity.sh --qualify  # adds the #14 promotion-gate scenarios
 
 ---
 
+## Why I made this
+
+Two reasons, both from lived experience building on OpenCode 2.
+
+**The plugin API keeps breaking, and getting things to work that once did is a
+pain.** V1 plugins (`@opencode-ai/plugin`) simply do not load on V2. Bare
+specifiers in a plugin entry fail silently — no error, no warning, the plugin
+is just absent. `main` pointing at a subdirectory fails silently too. Hooks
+disappear between releases with no V2 equivalent. Every one of these cost real
+time to discover, and none of them announces itself: the failure mode is
+always "your code never runs" (see the Phase 01 findings below). This project
+is partly a record of that archaeology — what actually works on this API,
+verified live, so the next person does not have to rediscover it.
+
+**Models sometimes just... half-complete things.** Ask for two files and you
+get one, or you get a confident "done!" and the second file does not exist. A
+chat model optimizes for a satisfying reply, not for a verified outcome, and
+nothing in a normal session holds it to the objective once the conversation
+moves on. Codex solved this with its Goal contract — a persistent objective
+the host enforces across turns. OpenCode had nothing equivalent, so I built
+one: the goal survives turn after turn, the controller drives the loop
+instead of hoping, and completion requires evidence the controller observed —
+not the model's word for it.
+
+---
+
 ## What it does
 
 - **Persistent objective.** A goal survives turns, compaction, restarts, and the
