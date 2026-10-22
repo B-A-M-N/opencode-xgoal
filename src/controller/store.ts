@@ -519,6 +519,9 @@ export class GoalStore {
     if (!columns.includes("spec")) {
       this.db.exec(`ALTER TABLE goal_criteria ADD COLUMN spec TEXT`);
     }
+    if (!columns.includes("source")) {
+      this.db.exec(`ALTER TABLE goal_criteria ADD COLUMN source TEXT NOT NULL DEFAULT 'user'`);
+    }
     if (!columns.includes("superseded")) {
       this.db.exec(`ALTER TABLE goal_criteria ADD COLUMN superseded INTEGER NOT NULL DEFAULT 0`);
     }
@@ -544,6 +547,17 @@ export class GoalStore {
       this.db.exec(
         `ALTER TABLE goals ADD COLUMN objective_revision INTEGER NOT NULL DEFAULT 1`,
       );
+    }
+    if (!goalColumns.includes("verification_revision")) {
+      this.db.exec(
+        `ALTER TABLE goals ADD COLUMN verification_revision INTEGER NOT NULL DEFAULT 0`,
+      );
+    }
+    if (!goalColumns.includes("verification_snapshot")) {
+      this.db.exec(`ALTER TABLE goals ADD COLUMN verification_snapshot TEXT`);
+    }
+    if (!goalColumns.includes("delivery_failed")) {
+      this.db.exec(`ALTER TABLE goals ADD COLUMN delivery_failed INTEGER NOT NULL DEFAULT 0`);
     }
     this.db
       .query(
@@ -572,6 +586,15 @@ export class GoalStore {
       .query<{ name: string }, []>(`PRAGMA table_info(goal_evidence)`)
       .all()
       .map((row) => row.name);
+    if (!evidenceColumns.includes("exit_code")) {
+      this.db.exec(`ALTER TABLE goal_evidence ADD COLUMN exit_code INTEGER`);
+    }
+    if (!evidenceColumns.includes("hash")) {
+      this.db.exec(`ALTER TABLE goal_evidence ADD COLUMN hash TEXT`);
+    }
+    if (!evidenceColumns.includes("workspace")) {
+      this.db.exec(`ALTER TABLE goal_evidence ADD COLUMN workspace TEXT`);
+    }
     if (!evidenceColumns.includes("fingerprint")) {
       this.db.exec(`ALTER TABLE goal_evidence ADD COLUMN fingerprint TEXT`);
       const rows = this.db
@@ -628,6 +651,13 @@ export class GoalStore {
     }
     if (!goalColumns.includes("wait_recheck_ms")) {
       this.db.exec(`ALTER TABLE goals ADD COLUMN wait_recheck_ms INTEGER`);
+    }
+    const roundColumns = this.db
+      .query<{ name: string }, []>(`PRAGMA table_info(goal_rounds)`)
+      .all()
+      .map((row) => row.name);
+    if (!roundColumns.includes("evidence_baseline")) {
+      this.db.exec(`ALTER TABLE goal_rounds ADD COLUMN evidence_baseline INTEGER NOT NULL DEFAULT 0`);
     }
   }
 
