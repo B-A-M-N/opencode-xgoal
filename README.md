@@ -44,6 +44,38 @@ The symlink is the *installation*: it places the package directory inside a glob
 
 If your OpenCode installation uses a different global config directory (for example via `XDG_CONFIG_HOME`), install under **that** config directory's `opencode/plugins/` path instead. Do not assume a symlink into your ordinary home config is visible to an isolated or remotely running server.
 
+### Goal completion notifications
+
+When using `@mohak34/opencode-notifier`, its normal `complete` event means a
+single OpenCode turn became idle, which can happen while XGoal is still
+delegating or continuing the goal. To notify only when the goal is verified
+complete, configure its `complete` event to run the gate script instead of
+sending the default completion popup:
+
+```json
+{
+  "events": {
+    "complete": { "sound": false, "notification": false, "command": true, "bell": false }
+  },
+  "command": {
+    "enabled": true,
+    "path": "/usr/bin/python3",
+    "args": [
+      "/path/to/opencode-xgoal/scripts/xgoal-goal-notify.py",
+      "{event}", "{sessionID}", "{sessionTitle}"
+    ]
+  }
+}
+```
+
+Save this in `~/.config/opencode/opencode-notifier.json`. The script reads the
+latest goal for that session from the XGoal database. It suppresses completion
+alerts while a goal is active, paused, stalled, or superseded; it sends one
+when the goal status is `complete`. Sessions with no XGoal record retain the
+ordinary “session finished” alert. Permission and error alerts remain governed
+by the notifier's existing settings. The generic completion sound is disabled
+for all sessions because the notifier cannot conditionally gate that channel.
+
 ### 2. Restart OpenCode and check discovery
 
 Start/restart your OpenCode **2** server and CLI, then check:
