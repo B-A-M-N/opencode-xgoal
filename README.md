@@ -360,7 +360,9 @@ Rules that are deliberate, not accidental:
 
 `~/.local/share/opencode-xgoal/goals.db` by default (`XGOAL_DB` overrides it).
 The database is the source of truth; the event stream and the in-memory observer
-are caches.
+are caches. `XGOAL_DISABLE=1` makes the plugin completely inert — no controller,
+no driver, no RPC — used by the qualification control (README item 29) to prove
+normal OpenCode sessions work with XGoal inactive.
 
 **Legacy goal files are not this plugin.** The `.opencode/goals/*.json` files in
 this repository (e.g. `072e0449f40574c72e13daf765e2441b.json`) belong to an

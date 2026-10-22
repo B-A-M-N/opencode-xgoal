@@ -412,7 +412,11 @@ else
   report "race session established" PASS
   # A goal with real work in flight; the replacement lands while the model is
   # mid-execution. The stale-admission reconciliation (audit-4 #11) must keep
-  # the replacement clean.
+  # the replacement clean. The 2-second lead is a heuristic: it usually lands
+  # mid-execution, but the fencing assertions below are valid either way —
+  # a negative assertion on the superseded goal's files would be flaky,
+  # because the old execution may legitimately have created slow1.txt before
+  # the replacement arrived.
   rpc goal.create "{\"sessionID\":\"$SIDR\",\"objective\":\"Create a file called slow1.txt containing exactly: one, then a file called slow2.txt containing exactly: two. When both exist, propose completion.\"}" >/dev/null
   sleep 2
   RRESP=$(rpc goal.replace "{\"sessionID\":\"$SIDR\",\"objective\":\"Create a file called quick.txt containing exactly: quick. When it exists, propose completion.\",\"expectedGeneration\":1}")
