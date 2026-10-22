@@ -137,7 +137,6 @@ export default {
       record({ event: "controller.ready", dbPath: dbPath(), reconciled: repaired.length });
     } catch (error) {
       startupError = String(error);
-      console.error("[OpenCode-XGoal] controller startup failed", error);
       record({ event: "controller.failed", error: startupError });
     }
 
@@ -834,18 +833,11 @@ export default {
           goalRpcDefinition as never,
           goalRpcHandlers(controller, coordinator, verifier) as never,
         );
-        console.info("[OpenCode-XGoal] RPC registered", goalRpcDefinition.id);
         record({ event: "rpc.registered", ok: true });
       } else {
-        console.error("[OpenCode-XGoal] RPC not registered", {
-          controllerReady: Boolean(controller),
-          rpcAvailable: Boolean(ctx.rpc?.register),
-          startupError,
-        });
         record({ event: "rpc.registered", ok: false, reason: "rpc domain unavailable" });
       }
     } catch (error) {
-      console.error("[OpenCode-XGoal] RPC registration failed", error);
       record({ event: "rpc.registered", ok: false, error: String(error) });
     }
 

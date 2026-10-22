@@ -512,6 +512,13 @@ export class GoalStore {
       .query<{ name: string }, []>(`PRAGMA table_info(goal_criteria)`)
       .all()
       .map((row) => row.name);
+    // Machine-checkable criterion specs were added after the first persisted
+    // schema. CREATE TABLE IF NOT EXISTS leaves an existing goal_criteria
+    // table untouched, so add the nullable column before migrations below
+    // query c.spec (notably the completion-policy backfill).
+    if (!columns.includes("spec")) {
+      this.db.exec(`ALTER TABLE goal_criteria ADD COLUMN spec TEXT`);
+    }
     if (!columns.includes("superseded")) {
       this.db.exec(`ALTER TABLE goal_criteria ADD COLUMN superseded INTEGER NOT NULL DEFAULT 0`);
     }
