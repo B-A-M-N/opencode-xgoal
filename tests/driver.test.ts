@@ -50,8 +50,13 @@ class FakeTransport implements ContinuationTransport {
   liveWaitResult = false;
   /** Number of liveWait calls — pins whether the wait was actually probed. */
   liveWaitCalls = 0;
-  /** Runs inside submit, before returning — lets a test inspect DB state. */
-  onSubmit?: (inboxID: string) => void;
+  /**
+   * Runs inside submit (awaited, so a test can gate the submission across a
+   * replacement), before returning — lets a test inspect DB state.
+   */
+  onSubmit?: (inboxID: string) => void | Promise<void>;
+  /** Every interrupt() call, for stale-admission assertions. */
+  interrupts: { sessionID: string; inboxID: string }[] = [];
 
   async submit(input: {
     sessionID: string;
@@ -60,9 +65,17 @@ class FakeTransport implements ContinuationTransport {
     metadata: Record<string, unknown>;
   }): Promise<SubmitResult> {
     this.submitted.push(input);
-    this.onSubmit?.(input.inboxID);
+    await this.onSubmit?.(input.inboxID);
     if (this.throwOnSubmit) throw new Error("transport exploded");
     return this.submitResult;
+  }
+
+  async interrupt(input: { sessionID: string; inboxID: string }): Promise<{
+    dequeued: boolean;
+    interrupted: boolean;
+  }> {
+    this.interrupts.push({ sessionID: input.sessionID, inboxID: input.inboxID });
+    return { dequeued: true, interrupted: true };
   }
 
   async probe(input: { sessionID: string; round: { id: string } }): Promise<ProbeResult> {
@@ -728,6 +741,104 @@ describe("progress classification counts only verifiable evidence", () => {
     expect(after.status).toBe("stalled");
     expect(after.reason).toContain("background execution");
     expect(store.activeWait(goal.id)).toBeUndefined();
+  });
+
+  test("REGRESSION: a submission that lands after a replacement is stale — cancelled and fenced", async () => {
+    const transport = new FakeTransport();
+    // Gate the submit: it completes only when the test releases it, so the
+    // replacement lands DURING the in-flight submission.
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    transport.onSubmit = () => {
+      return gate;
+    };
+    const driver = new GoalDriver(store, transport, { maxNoProgressRounds: 5 });
+    const goal = store.create({ sessionID: "ses_a", objective: "v1 work" });
+
+    // The drive hangs inside the gated submit; reconciliation happens in the
+    // same drive once the submission returns.
+    const pendingDrive = driver.drive("ses_a");
+    const untilSubmitted = Date.now() + 2000;
+    while (transport.submitted.length === 0 && Date.now() < untilSubmitted) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(transport.submitted.length).toBe(1);
+
+    // The user replaces the goal while the submission is in flight. replace()
+    // fails the outstanding round in its own transaction — the submission
+    // then succeeds afterwards, which is exactly the audit's race.
+    const replacement = store.replace({
+      sessionID: "ses_a",
+      expectedGeneration: goal.generation,
+      objective: "v2 work",
+    });
+    release();
+    const outcome = await pendingDrive;
+
+    // The late submission reconciles as STALE, not admitted.
+    expect(outcome.action).toBe("stale");
+    if (outcome.action !== "stale") throw new Error("unreachable");
+    expect(outcome.cancelled).toBe(true);
+    expect(transport.interrupts).toEqual([
+      { sessionID: "ses_a", inboxID: expect.stringContaining("msg_xgoal_") },
+    ]);
+    // The round is failed, and the superseded goal's trail records the risk.
+    expect(store.roundByID(outcome.roundID)!.status).toBe("failed");
+    const events = store
+      .db.query(`SELECT kind, detail FROM goal_events WHERE goal_id = ? AND kind = 'admission.stale'`)
+      .all(goal.id) as Array<{ kind: string; detail: string }>;
+    expect(events).toHaveLength(1);
+    expect(events[0]!.detail).toContain("stale admission");
+    expect(events[0]!.detail).toContain("cancelled");
+    // The admitted message is still attributed to ITS generation, so a late
+    // execution can never contaminate the replacement's records.
+    expect(store.resolveMessageGeneration("ses_a", outcome.inboxID)).toBe(goal.generation);
+    // The replacement itself is untouched: no rounds, still active.
+    expect(store.outstandingRound(replacement.id)).toBeUndefined();
+    expect(store.roundsFor(replacement.id)).toHaveLength(0);
+    expect(replacement.status).toBe("active");
+  });
+
+  test("a stale admission without a cancel API records the residual risk explicitly", async () => {
+    const transport = new FakeTransport();
+    // Simulate a transport with no interrupt capability at all.
+    (transport as unknown as { interrupt: undefined }).interrupt = undefined;
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    transport.onSubmit = () => {
+      return gate;
+    };
+    const driver = new GoalDriver(store, transport, { maxNoProgressRounds: 5 });
+    const goal = store.create({ sessionID: "ses_a", objective: "v1 work" });
+
+    const pendingDrive = driver.drive("ses_a");
+    const untilSubmitted = Date.now() + 2000;
+    while (transport.submitted.length === 0 && Date.now() < untilSubmitted) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    store.replace({
+      sessionID: "ses_a",
+      expectedGeneration: goal.generation,
+      objective: "v2 work",
+    });
+    release();
+    const outcome = await pendingDrive;
+
+    expect(outcome.action).toBe("stale");
+    if (outcome.action !== "stale") throw new Error("unreachable");
+    expect(outcome.cancelled).toBe(false);
+    // The residual risk is named in the round detail and the audit trail —
+    // the controller does not pretend cancellation it cannot perform.
+    expect(outcome.detail).toContain("RESIDUAL RISK");
+    expect(store.roundByID(outcome.roundID)!.detail).toContain("RESIDUAL RISK");
+    const events = store
+      .db.query(`SELECT detail FROM goal_events WHERE goal_id = ? AND kind = 'admission.stale'`)
+      .all(goal.id) as Array<{ detail: string }>;
+    expect(events[0]!.detail).toContain("RESIDUAL RISK");
   });
 
   test("the sweep rechecks a wait whose persisted recheck time has fallen due", async () => {

@@ -432,6 +432,36 @@ describe("goal.accept", () => {
     expect(res.error).toBeDefined();
   });
 
+  test("REGRESSION: a confirmation fenced to a replaced generation is rejected, not applied to the replacement", async () => {
+    const start = controller.startOrDescribe("ses_a", "the objective the user reviewed");
+    if (!("created" in start)) throw new Error("expected a new goal");
+    const reviewed = start.created;
+
+    // The user decides to accept; meanwhile another client replaces the goal.
+    // The confirmation arrives targeting what the user SAW.
+    controller.replace("ses_a", "a different objective from another client", reviewed.generation);
+    const current = controller.status("ses_a")!;
+    expect(current.generation).toBe(reviewed.generation + 1);
+
+    const res = await handlers["goal.accept"]({
+      sessionID: "ses_a",
+      goalID: reviewed.id,
+      expectedGeneration: reviewed.generation,
+    });
+    expect(res.goal).toBeNull();
+    expect(res.error).toContain("stale confirmation");
+    // The replacement was NOT accepted in the user's name.
+    expect(controller.store.userAcceptance(current.id)).toBeUndefined();
+    // The fenced confirmation against the still-current goal still works.
+    const ok = await handlers["goal.accept"]({
+      sessionID: "ses_a",
+      goalID: current.id,
+      expectedGeneration: current.generation,
+    });
+    expect(ok.error).toBeUndefined();
+    expect(controller.store.userAcceptance(current.id)?.note).toBeUndefined();
+  });
+
   test("a missing sessionID is rejected", async () => {
     const res = await handlers["goal.accept"]({} as never);
     expect(res.error).toContain("sessionID");

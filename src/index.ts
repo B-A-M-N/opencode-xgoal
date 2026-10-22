@@ -41,6 +41,8 @@ function describeDrive(outcome: any): string {
       return `dispatch failed: ${outcome.detail}.`;
     case "abandoned":
       return `dispatch abandoned: ${outcome.detail}.`;
+    case "stale":
+      return `stale admission cancelled: ${outcome.detail}. The replacement goal was not touched.`;
     case "limited":
       return `not dispatched: goal is ${outcome.status}.`;
     case "waiting":
@@ -187,6 +189,19 @@ export default {
               finish: message.finish,
             })),
           };
+        },
+        // Stale-admission cancellation (audit-4 #11): dequeue our own queued
+        // message and interrupt the execution, but only when it is still ours.
+        dequeue: async ({ sessionID, inboxID }) => {
+          const api = (ctx.session as any)?.inbox;
+          if (typeof api?.cancel === "function") {
+            await api.cancel({ sessionID, inboxID });
+            return;
+          }
+          throw new Error("inbox cancel is not exposed on this surface");
+        },
+        interruptSession: async ({ sessionID }) => {
+          await ctx.session.interrupt({ sessionID });
         },
       });
       driver = new GoalDriver(controller.store, transport);
@@ -1071,7 +1086,13 @@ export default {
       "session.execution.failed",
       "session.inbox.delivered",
     ]);
-    let lastDrive = 0;
+    // Per-session drive coalescence (audit-4 #13): a burst of signals for one
+    // session produces one drive for THAT session. A global timestamp coupled
+    // unrelated sessions — session B's continuation decision could be
+    // suppressed because session A generated an event within the preceding
+    // 500 ms. The map grows with the number of concurrent sessions and is
+    // bounded in practice; entries for dead sessions hold one number each.
+    const lastDriveBySession = new Map<string, number>();
     void (async () => {
       try {
         for await (const event of ctx.event.subscribe({ signal: abort.signal })) {
@@ -1139,13 +1160,16 @@ export default {
           }
 
           if (!driver || !IDLE_SIGNALS.has(type)) continue;
-          // Debounce: a burst of signals should produce one drive, not several.
-          const now = Date.now();
-          if (now - lastDrive < 500) continue;
-          lastDrive = now;
           // The session id lives at data.sessionID on these events.
           const sessionID = sessionIDOf(event);
           if (!sessionID) continue;
+          // Debounce per session: a burst of signals for THIS session should
+          // produce one drive, not several — and must never delay another
+          // session's continuation decision (audit-4 #13).
+          const now = Date.now();
+          const last = lastDriveBySession.get(sessionID) ?? 0;
+          if (now - last < 500) continue;
+          lastDriveBySession.set(sessionID, now);
           try {
             const outcome = await driver.drive(sessionID);
             record({ event: "driver.drive", sessionID, outcome: outcome.action });

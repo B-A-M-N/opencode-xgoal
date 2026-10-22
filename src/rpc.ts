@@ -144,7 +144,15 @@ export const goalRpcDefinition = {
     "goal.accept": {
       input: {
         type: "object",
-        properties: { sessionID: str, note: str },
+        properties: {
+          sessionID: str,
+          note: str,
+          // Generation fencing (audit-4 #12): the goal the user confirmed.
+          // A stale pair is rejected instead of silently accepting whatever
+          // replacement is current by arrival time.
+          goalID: str,
+          expectedGeneration: num,
+        },
         required: ["sessionID"],
       },
       output: { type: "object", properties: { goal: goalOrNull, error: str } },
@@ -289,14 +297,23 @@ export function goalRpcHandlers(
       }
     },
 
-    "goal.accept": async (input: { sessionID?: string; note?: string }) => {
+    "goal.accept": async (input: {
+      sessionID?: string;
+      note?: string;
+      goalID?: string;
+      expectedGeneration?: number;
+    }) => {
       if (!input?.sessionID) return { goal: null, error: "sessionID is required" };
       try {
         // A USER action only: it records explicit acceptance of the
         // objective-level remainder that cannot be machine-proven. If
         // completion was waiting on exactly this, finish it now rather than
         // leaving the user to re-trigger the model.
-        const accepted = controller.acceptObjective(input.sessionID, input.note);
+        const expected =
+          input.goalID && typeof input.expectedGeneration === "number"
+            ? { goalID: input.goalID, generation: input.expectedGeneration }
+            : undefined;
+        const accepted = controller.acceptObjective(input.sessionID, input.note, expected);
         if (accepted.status === "verifying" && verifier) {
           const result = await verifier.verify(accepted.id);
           if (result.verdict === "complete") {

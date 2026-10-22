@@ -273,7 +273,7 @@ inspection. It never touches the user's database or sessions.
 ## Verification
 
 ```bash
-bun test          # 269 unit/integration tests, 836 assertions
+bun test          # 272 unit/integration tests, 859 assertions
 bun run typecheck # clean
 bash scripts/parity.sh  # 17/17 live acceptance checks
 ```
@@ -561,3 +561,25 @@ honest-progress gaps:
     cannot overwrite that run's results (its dead attempt is closed as
     abandoned), and any goal transition or replacement retires open attempts
     and discards their in-flight results.
+26. **Stale-admission reconciliation (P1)** — a continuation submission is
+    async, so a pause or replacement can land while it is in flight. When an
+    admitted message turns out to belong to a superseded generation, the
+    driver reconciles it: the round is failed, the message is dequeued via
+    the host inbox API, and the running execution is interrupted ONLY when
+    the observer can attribute it to that continuation's inbox id (never a
+    run the controller cannot tie to its own message). Where cancellation is
+    impossible, the round detail and the superseded goal's event trail name
+    the RESIDUAL RISK explicitly instead of pretending exactly-once
+    semantics. The admitted message stays attributed to its own generation,
+    so even an uncancelled late execution cannot contaminate the
+    replacement's records.
+27. **Acceptance is fenced to the reviewed generation (P2)** — `goal.accept`
+    carries the goal ID and generation the user was shown. A confirmation
+    that arrives after a replacement is rejected with the current objective
+    surfaced for fresh review, rather than silently accepting the
+    replacement's objective in the user's name. The TUI captures the pair
+    when the user acts and refreshes on rejection.
+28. **Per-session drive coalescence (P2)** — the event pump debounces per
+    session instead of with one global timestamp: a burst of signals for
+    session A can no longer suppress session B's continuation decision. The
+    durable outstanding-round invariant remains the correctness backstop.

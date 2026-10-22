@@ -172,7 +172,12 @@ var goalRpcDefinition = {
     "goal.accept": {
       input: {
         type: "object",
-        properties: { sessionID: str, note: str },
+        properties: {
+          sessionID: str,
+          note: str,
+          goalID: str,
+          expectedGeneration: num
+        },
         required: ["sessionID"]
       },
       output: { type: "object", properties: { goal: goalOrNull, error: str } }
@@ -215,6 +220,8 @@ function describeDrive(outcome) {
       return `dispatch failed: ${outcome.detail}`;
     case "abandoned":
       return `dispatch abandoned: ${outcome.detail}`;
+    case "stale":
+      return `stale admission cancelled: ${outcome.detail}`;
     case "limited":
       return `not dispatched: goal is ${outcome.status}`;
     case "waiting":
@@ -339,7 +346,18 @@ var tui_default = exports_plugin.define({
         return;
       }
       if (verb === "accept") {
-        const res = await rpc["goal.accept"]({ sessionID, note: arg || undefined });
+        const seen = (await rpc["goal.status"]({ sessionID })).current;
+        const res = await rpc["goal.accept"]({
+          sessionID,
+          note: arg || undefined,
+          goalID: seen?.id,
+          expectedGeneration: seen?.generation
+        });
+        if (res.error && /stale confirmation/i.test(res.error)) {
+          const now = (await rpc["goal.status"]({ sessionID })).current;
+          notify(`Acceptance rejected: the goal changed while confirming. ` + `The current objective (generation ${now?.generation ?? "?"}) needs fresh review: ${now?.objective ?? "none"}.`, "warning", sessionID);
+          return;
+        }
         notify(res.error ? `Could not record acceptance: ${res.error}` : "Acceptance recorded for the current generation.", res.error ? "error" : "success", sessionID);
         return;
       }

@@ -866,6 +866,12 @@ class GoalStore {
       this.depth -= 1;
     }
   }
+  recordAdmissionStale(goalID, generation, detail) {
+    this.appendEvent(goalID, generation, "admission.stale", {
+      actor: "controller",
+      detail
+    });
+  }
   appendEvent(goalID, generation, kind, extra = {}) {
     this.db.query(`INSERT INTO goal_events (goal_id, generation, kind, from_status, to_status, actor, detail, at_ms)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(goalID, generation, kind, extra.fromStatus ?? null, extra.toStatus ?? null, extra.actor ?? null, extra.detail ?? null, Date.now());
@@ -2222,8 +2228,11 @@ class GoalController {
       this.store.clearDeliveryFailure(resumed.id);
     return this.store.byID(resumed.id) ?? resumed;
   }
-  acceptObjective(sessionID, note) {
+  acceptObjective(sessionID, note, expected) {
     const goal = this.requireCurrent(sessionID);
+    if (expected && (goal.id !== expected.goalID || goal.generation !== expected.generation)) {
+      throw new GoalConflictError(`stale confirmation: acceptance was initiated for generation ${expected.generation}, ` + `but the current goal is ${goal.id} (generation ${goal.generation}); ` + `review the current objective before accepting`);
+    }
     this.store.recordUserAcceptance(goal.id, goal.generation, note);
     return this.store.byID(goal.id) ?? goal;
   }
@@ -2810,6 +2819,20 @@ class GoalDriver {
         }
       });
       if (result.ok) {
+        const current = this.store.byID(round.goalID);
+        if (!current || current.generation !== round.generation || current.status !== "active") {
+          let cancelled = { dequeued: false, interrupted: false };
+          try {
+            cancelled = await this.transport.interrupt?.({ sessionID, inboxID: round.inboxID }) ?? cancelled;
+          } catch {}
+          const detail = `stale admission: the goal moved to generation ${current?.generation ?? "?"} / ` + `status ${current?.status ?? "gone"} while the submission was in flight` + (cancelled.dequeued || cancelled.interrupted ? `; cancelled (dequeued=${cancelled.dequeued}, interrupted=${cancelled.interrupted})` : `; cancellation unavailable — RESIDUAL RISK: the admitted message may still execute and must not be trusted by the replacement`);
+          this.store.markRoundFailed(round.id, detail, { parkGoal: false });
+          if (current) {
+            this.store.recordAdmissionStale(current.id, round.generation, detail);
+          }
+          this.store.rememberMessageGeneration(sessionID, round.inboxID, round.generation, Date.now());
+          return { action: "stale", roundID: round.id, inboxID: round.inboxID, detail, cancelled: cancelled.dequeued || cancelled.interrupted };
+        }
         this.store.markRoundAdmitted(round.id);
         this.store.rememberMessageGeneration(sessionID, round.inboxID, round.generation, Date.now());
         return { action: "admitted", roundID: round.id, inboxID: round.inboxID };
@@ -3131,6 +3154,17 @@ class RoundObserver {
     }
     return false;
   }
+  isBusySlot(sessionID, inboxID) {
+    const refs = this.runningBySession.get(sessionID);
+    if (!refs)
+      return false;
+    const now = Date.now();
+    for (const ref of refs.values()) {
+      if (ref.slot === inboxID && now - ref.startedMs < LIVE_WAIT_TTL_MS)
+        return true;
+    }
+    return false;
+  }
   forget(inboxID) {
     const slot = this.seen.get(inboxID);
     if (slot?.counted !== undefined && slot.sessionID) {
@@ -3156,10 +3190,14 @@ class SessionTransport {
   observer;
   send;
   fetchState;
+  dequeue;
+  interruptSession;
   constructor(options) {
     this.observer = options.observer;
     this.send = options.send;
     this.fetchState = options.fetchState;
+    this.dequeue = options.dequeue;
+    this.interruptSession = options.interruptSession;
   }
   async submit(input) {
     try {
@@ -3168,6 +3206,23 @@ class SessionTransport {
     } catch (error) {
       return classify(error);
     }
+  }
+  async interrupt(input) {
+    let dequeued = false;
+    if (this.dequeue) {
+      try {
+        await this.dequeue(input);
+        dequeued = true;
+      } catch {}
+    }
+    let interrupted = false;
+    if (this.interruptSession && this.observer.isBusySlot(input.sessionID, input.inboxID)) {
+      try {
+        await this.interruptSession({ sessionID: input.sessionID });
+        interrupted = true;
+      } catch {}
+    }
+    return { dequeued, interrupted };
   }
   liveWait(input) {
     return this.observer.isBusy(input.sessionID);
@@ -3294,7 +3349,12 @@ var goalRpcDefinition = {
     "goal.accept": {
       input: {
         type: "object",
-        properties: { sessionID: str, note: str },
+        properties: {
+          sessionID: str,
+          note: str,
+          goalID: str,
+          expectedGeneration: num
+        },
         required: ["sessionID"]
       },
       output: { type: "object", properties: { goal: goalOrNull, error: str } }
@@ -3402,7 +3462,8 @@ function goalRpcHandlers(controller, coordinator, verifier) {
       if (!input?.sessionID)
         return { goal: null, error: "sessionID is required" };
       try {
-        const accepted = controller.acceptObjective(input.sessionID, input.note);
+        const expected = input.goalID && typeof input.expectedGeneration === "number" ? { goalID: input.goalID, generation: input.expectedGeneration } : undefined;
+        const accepted = controller.acceptObjective(input.sessionID, input.note, expected);
         if (accepted.status === "verifying" && verifier) {
           const result = await verifier.verify(accepted.id);
           if (result.verdict === "complete") {
@@ -3458,6 +3519,8 @@ function describeDrive(outcome) {
       return `dispatch failed: ${outcome.detail}.`;
     case "abandoned":
       return `dispatch abandoned: ${outcome.detail}.`;
+    case "stale":
+      return `stale admission cancelled: ${outcome.detail}. The replacement goal was not touched.`;
     case "limited":
       return `not dispatched: goal is ${outcome.status}.`;
     case "waiting":
@@ -3564,6 +3627,17 @@ var src_default = {
               finish: message.finish
             }))
           };
+        },
+        dequeue: async ({ sessionID, inboxID }) => {
+          const api = ctx.session?.inbox;
+          if (typeof api?.cancel === "function") {
+            await api.cancel({ sessionID, inboxID });
+            return;
+          }
+          throw new Error("inbox cancel is not exposed on this surface");
+        },
+        interruptSession: async ({ sessionID }) => {
+          await ctx.session.interrupt({ sessionID });
         }
       });
       driver = new GoalDriver(controller.store, transport);
@@ -4275,7 +4349,7 @@ ${unmet.join(`
       "session.execution.failed",
       "session.inbox.delivered"
     ]);
-    let lastDrive = 0;
+    const lastDriveBySession = new Map;
     (async () => {
       try {
         for await (const event of ctx.event.subscribe({ signal: abort.signal })) {
@@ -4321,13 +4395,14 @@ ${unmet.join(`
           }
           if (!driver || !IDLE_SIGNALS.has(type))
             continue;
-          const now = Date.now();
-          if (now - lastDrive < 500)
-            continue;
-          lastDrive = now;
           const sessionID = sessionIDOf(event);
           if (!sessionID)
             continue;
+          const now = Date.now();
+          const last = lastDriveBySession.get(sessionID) ?? 0;
+          if (now - last < 500)
+            continue;
+          lastDriveBySession.set(sessionID, now);
           try {
             const outcome = await driver.drive(sessionID);
             record({ event: "driver.drive", sessionID, outcome: outcome.action });

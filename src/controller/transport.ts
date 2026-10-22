@@ -265,6 +265,22 @@ export class RoundObserver {
   }
 
   /**
+   * Is the execution currently running in this session attributable to THIS
+   * continuation's inbox id? (audit-4 #11) Used by interrupt: the controller
+   * must never stop a run it cannot tie to its own stale continuation — that
+   * run may be the user's own work or a newer goal's.
+   */
+  isBusySlot(sessionID: string, inboxID: string): boolean {
+    const refs = this.runningBySession.get(sessionID);
+    if (!refs) return false;
+    const now = Date.now();
+    for (const ref of refs.values()) {
+      if (ref.slot === inboxID && now - ref.startedMs < LIVE_WAIT_TTL_MS) return true;
+    }
+    return false;
+  }
+
+  /**
    * Forget a round once it has settled, so the map cannot grow unbounded.
    *
    * Settlement is authoritative: the transcript showed the execution end. If
@@ -297,6 +313,13 @@ export interface SessionTransportOptions {
    * against the session's own inbox and message history.
    */
   fetchState?: (input: { sessionID: string }) => Promise<SessionState>;
+  /**
+   * Dequeue one queued inbox message by id (audit-4 #11). Wired to the host's
+   * inbox-cancel API when available; absent surfaces simply never dequeue.
+   */
+  dequeue?: (input: { sessionID: string; inboxID: string }) => Promise<void>;
+  /** Interrupt a running session execution (the host's supported cancel API). */
+  interruptSession?: (input: { sessionID: string }) => Promise<unknown>;
 }
 
 /** The minimal authoritative view a probe needs. */
@@ -336,11 +359,15 @@ export class SessionTransport implements ContinuationTransport {
   private readonly observer: RoundObserver;
   private readonly send: SessionTransportOptions["send"];
   private readonly fetchState: SessionTransportOptions["fetchState"];
+  private readonly dequeue: SessionTransportOptions["dequeue"];
+  private readonly interruptSession: SessionTransportOptions["interruptSession"];
 
   constructor(options: SessionTransportOptions) {
     this.observer = options.observer;
     this.send = options.send;
     this.fetchState = options.fetchState;
+    this.dequeue = options.dequeue;
+    this.interruptSession = options.interruptSession;
   }
 
   async submit(input: {
@@ -355,6 +382,40 @@ export class SessionTransport implements ContinuationTransport {
     } catch (error) {
       return classify(error);
     }
+  }
+
+  /**
+   * Best-effort cancellation of one admitted continuation (audit-4 #11).
+   *
+   * Two separate mechanisms, because admission and execution are separate
+   * facts: dequeue removes the message if it is still queued; interrupt stops
+   * the execution only when the observer can attribute the running execution
+   * to THIS inbox id. A run the controller cannot tie to its own continuation
+   * is never interrupted — it may be the user's own work.
+   */
+  async interrupt(input: { sessionID: string; inboxID: string }): Promise<{
+    dequeued: boolean;
+    interrupted: boolean;
+  }> {
+    let dequeued = false;
+    if (this.dequeue) {
+      try {
+        await this.dequeue(input);
+        dequeued = true;
+      } catch {
+        // Not exposed, or already delivered — the interrupt below still applies.
+      }
+    }
+    let interrupted = false;
+    if (this.interruptSession && this.observer.isBusySlot(input.sessionID, input.inboxID)) {
+      try {
+        await this.interruptSession({ sessionID: input.sessionID });
+        interrupted = true;
+      } catch {
+        // The run may have finished between the attribution check and now.
+      }
+    }
+    return { dequeued, interrupted };
   }
 
   /** Is an execution for this session observably still running? */

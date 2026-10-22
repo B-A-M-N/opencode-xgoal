@@ -44,6 +44,8 @@ interface GoalRpc {
   "goal.accept": (input: {
     sessionID: string;
     note?: string;
+    goalID?: string;
+    expectedGeneration?: number;
   }) => Promise<{ goal: GoalWire | null; error?: string }>;
   "goal.health": (input: { sessionID: string }) => Promise<{ health: Record<string, unknown> }>;
 }
@@ -62,6 +64,8 @@ function describeDrive(outcome: any): string {
       return `dispatch failed: ${outcome.detail}`;
     case "abandoned":
       return `dispatch abandoned: ${outcome.detail}`;
+    case "stale":
+      return `stale admission cancelled: ${outcome.detail}`;
     case "limited":
       return `not dispatched: goal is ${outcome.status}`;
     case "waiting":
@@ -244,7 +248,28 @@ export default Plugin.define({
       }
 
       if (verb === "accept") {
-        const res = await rpc["goal.accept"]({ sessionID, note: arg || undefined });
+        // Capture the goal the user is confirming (audit-4 #12): the fencing
+        // pair must describe what the user SAW, so a replacement between the
+        // user's decision and the RPC round-trip is rejected instead of
+        // silently accepting the replacement's objective. On rejection the
+        // current goal is fetched so the UI shows what actually needs review.
+        const seen = (await rpc["goal.status"]({ sessionID })).current;
+        const res = await rpc["goal.accept"]({
+          sessionID,
+          note: arg || undefined,
+          goalID: seen?.id,
+          expectedGeneration: seen?.generation,
+        });
+        if (res.error && /stale confirmation/i.test(res.error)) {
+          const now = (await rpc["goal.status"]({ sessionID })).current;
+          notify(
+            `Acceptance rejected: the goal changed while confirming. ` +
+              `The current objective (generation ${now?.generation ?? "?"}) needs fresh review: ${now?.objective ?? "none"}.`,
+            "warning",
+            sessionID,
+          );
+          return;
+        }
         notify(
           res.error ? `Could not record acceptance: ${res.error}` : "Acceptance recorded for the current generation.",
           res.error ? "error" : "success",

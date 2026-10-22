@@ -184,8 +184,28 @@ export class GoalController {
    * gate. Acceptance is generation-fenced, so replacing the goal requires
    * accepting the new objective afresh.
    */
-  acceptObjective(sessionID: string, note?: string): Goal {
+  /**
+   * Record explicit user acceptance of the objective-level remainder.
+   *
+   * `expected` fences the confirmation to the goal generation the user was
+   * looking at (audit-4 #12): a confirmation initiated against one objective
+   * must never land on a replacement that happened to be current by the time
+   * the RPC arrives. The TUI captures both values when presenting the action;
+   * a stale confirmation is rejected and the caller refreshes.
+   */
+  acceptObjective(
+    sessionID: string,
+    note?: string,
+    expected?: { goalID: string; generation: number },
+  ): Goal {
     const goal = this.requireCurrent(sessionID);
+    if (expected && (goal.id !== expected.goalID || goal.generation !== expected.generation)) {
+      throw new GoalConflictError(
+        `stale confirmation: acceptance was initiated for generation ${expected.generation}, ` +
+          `but the current goal is ${goal.id} (generation ${goal.generation}); ` +
+          `review the current objective before accepting`,
+      );
+    }
     this.store.recordUserAcceptance(goal.id, goal.generation, note);
     return this.store.byID(goal.id) ?? goal;
   }

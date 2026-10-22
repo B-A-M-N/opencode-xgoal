@@ -656,6 +656,20 @@ export class GoalStore {
     }
   }
 
+  /**
+   * Audit trail for a stale admission (audit-4 #11): the driver recorded that
+   * a continuation for THIS goal generation was admitted to the session after
+   * the goal left active scheduling. The event documents why a foreign
+   * continuation may appear in the session transcript and whether it was
+   * cancelled.
+   */
+  recordAdmissionStale(goalID: string, generation: number, detail: string): void {
+    this.appendEvent(goalID, generation, "admission.stale", {
+      actor: "controller",
+      detail,
+    });
+  }
+
   private appendEvent(
     goalID: string,
     generation: number,

@@ -58,6 +58,17 @@ export interface ContinuationTransport {
    * not scored as an unproductive round.
    */
   liveWait?(input: { sessionID: string }): boolean;
+  /**
+   * Best-effort cancellation of an admitted continuation (audit-4 #11).
+   * Dequeues the message if it is still queued, and interrupts the running
+   * execution ONLY when that execution is attributable to this continuation's
+   * inbox id — never an unrelated run the user may have started. Absent or
+   * failed cancellation is not fatal: the caller records the residual risk.
+   */
+  interrupt?(input: { sessionID: string; inboxID: string }): Promise<{
+    dequeued: boolean;
+    interrupted: boolean;
+  }>;
 }
 
 export interface DriverOptions {
@@ -144,6 +155,13 @@ export type DriveOutcome =
   | { action: "idle"; reason: string }
   | { action: "limited"; status: string }
   | { action: "admitted"; roundID: string; inboxID: string }
+  | {
+      action: "stale";
+      roundID: string;
+      inboxID: string;
+      detail: string;
+      cancelled: boolean;
+    }
   | { action: "unknown"; roundID: string; inboxID: string; detail: string }
   | { action: "failed"; roundID: string; inboxID: string; detail: string }
   | { action: "abandoned"; roundID: string; detail: string }
@@ -392,6 +410,41 @@ export class GoalDriver {
       });
 
       if (result.ok) {
+        // Admission reconciliation (audit-4 #11): the world was checked before
+        // the submit, but the submit itself is async — a user pause or
+        // replacement may have landed DURING the transport call. An admitted
+        // message for a superseded goal must not silently execute against the
+        // replacement.
+        const current = this.store.byID(round.goalID);
+        if (!current || current.generation !== round.generation || current.status !== "active") {
+          // Best-effort cancellation: dequeue the queued message, interrupt
+          // the execution only if it is still attributable to THIS inbox id.
+          let cancelled = { dequeued: false, interrupted: false };
+          try {
+            cancelled =
+              (await this.transport.interrupt?.({ sessionID, inboxID: round.inboxID })) ??
+              cancelled;
+          } catch {
+            // Cancellation is opportunistic; the residual risk is recorded.
+          }
+          const detail =
+            `stale admission: the goal moved to generation ${current?.generation ?? "?"} / ` +
+            `status ${current?.status ?? "gone"} while the submission was in flight` +
+            (cancelled.dequeued || cancelled.interrupted
+              ? `; cancelled (dequeued=${cancelled.dequeued}, interrupted=${cancelled.interrupted})`
+              : `; cancellation unavailable — RESIDUAL RISK: the admitted message may still execute and must not be trusted by the replacement`);
+          this.store.markRoundFailed(round.id, detail, { parkGoal: false });
+          // The superseded goal's own trail records the stale admission, so an
+          // auditor sees why a foreign continuation may appear in the session.
+          if (current) {
+            this.store.recordAdmissionStale(current.id, round.generation, detail);
+          }
+          // Bind the admitted message to ITS generation regardless: if it does
+          // execute, the attribution fence keeps it from contaminating the
+          // replacement's records.
+          this.store.rememberMessageGeneration(sessionID, round.inboxID, round.generation, Date.now());
+          return { action: "stale", roundID: round.id, inboxID: round.inboxID, detail, cancelled: cancelled.dequeued || cancelled.interrupted };
+        }
         // Admission only. Execution is observed separately.
         this.store.markRoundAdmitted(round.id);
         // Bind the continuation message to its generation the moment it is
