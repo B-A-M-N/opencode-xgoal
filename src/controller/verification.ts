@@ -255,8 +255,15 @@ export class GoalVerifier {
     // goal as it existed at this version. If the goal is replaced, paused, or
     // otherwise transitioned while asynchronous validation is running, the
     // store discards the result instead of letting a stale verifier overwrite
-    // the superseded goal's records (finding 10).
+    // the superseded goal's records (finding 10). The attempt is also
+    // persisted as a durable record, and the proof commit requires this exact
+    // attempt to still be open — a verifier delayed past a newer verification
+    // run cannot overwrite that run's results either.
     const attempt = { generation: goal.generation, version: goal.version };
+    const attemptID = this.store.beginVerificationAttempt(goalID, {
+      generation: goal.generation,
+      version: goal.version,
+    });
 
     const criteria = this.store.listCriteria(goalID);
     const evidence = this.store.listEvidence(goalID);
@@ -652,7 +659,13 @@ export class GoalVerifier {
     // does not accept this run's proofs; its criterion readouts stay
     // untouched.
     const snapshot = snapshotHash(criteria, evidence);
-    const recorded = this.store.recordProofs(goalID, proofs, snapshot, attempt, assessment);
+    const recorded = this.store.recordProofs(
+      goalID,
+      proofs,
+      snapshot,
+      { ...attempt, attemptID },
+      assessment,
+    );
     if (!recorded) {
       return {
         verdict: "incomplete",

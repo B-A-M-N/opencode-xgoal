@@ -273,7 +273,7 @@ inspection. It never touches the user's database or sessions.
 ## Verification
 
 ```bash
-bun test          # 255 unit/integration tests, 783 assertions
+bun test          # 266 unit/integration tests, 827 assertions
 bun run typecheck # clean
 bash scripts/parity.sh  # 17/17 live acceptance checks
 ```
@@ -543,3 +543,21 @@ honest-progress gaps:
     investigation command is genuinely new information. Blocker reports are
     also excluded from the verifiable-evidence count, closing a route by
     which reporting a blocker could register as progress.
+24. **Execution-scoped usage ledger (P1)** — session usage is billed from a
+    monotonic high-water mark (`MAX(previous, observed)`), so the delayed
+    sequence 1,000 → 1,200 → 900 → 1,200 accounts exactly 1,200 and a
+    replayed event never double-bills. Each observation carries an identity
+    (the event envelope id, or the execution+totals+second tuple) that makes
+    a duplicate delivery a no-op, and is attributed through the durable
+    message-generation map to the goal generation that actually produced it:
+    a late event from generation 1 records as *unassigned* instead of
+    charging the generation-2 replacement. Token fields are treated per
+    opencode 2 semantics (disjoint components; output is visible output with
+    reasoning excluded).
+25. **Durable verification attempt records (P1)** — every verification run
+    opens an attempt row bound to the goal generation + version it
+    describes. Committing proofs requires that exact attempt to still be the
+    goal's open one, so a verifier delayed past a newer verification run
+    cannot overwrite that run's results (its dead attempt is closed as
+    abandoned), and any goal transition or replacement retires open attempts
+    and discards their in-flight results.

@@ -583,6 +583,63 @@ CREATE TABLE IF NOT EXISTS session_usage (
   updated_at_ms INTEGER NOT NULL
 );
 
+-- Execution-scoped usage ledger (audit-4 #3).
+--
+-- One row per (execution, event) observation. The observation identity is the
+-- event envelope's id (opencode 2 events carry a unique EventID); when the
+-- envelope has no id, the (executionID, token totals, at-second) tuple is the
+-- fallback identity. The unique index makes a replayed or delayed delivery a
+-- no-op instead of a second charge.
+--
+-- attribution: 'execution' — a message/execution id resolved the observation
+-- to a (goal, generation) pair through the durable message-generation map, so
+-- a late event from generation 1 charges generation 1 (or nothing, if that
+-- goal is terminal) and never the replacement. 'current' — no execution
+-- identity was available, so the observation was charged to the goal that was
+-- current when the event ARRIVED. 'unassigned' — the execution's goal could
+-- not be established; usage is recorded but charged to no goal rather than
+-- silently accruing to whatever happens to be current (audit-4 #3).
+CREATE TABLE IF NOT EXISTS goal_usage_observations (
+  id            TEXT PRIMARY KEY,
+  session_id    TEXT NOT NULL,
+  execution_id  TEXT,
+  goal_id       TEXT,
+  generation    INTEGER,
+  attribution   TEXT NOT NULL,
+  input_tokens  INTEGER NOT NULL,
+  output_tokens INTEGER NOT NULL,
+  reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+  cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+  cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+  total_tokens  INTEGER NOT NULL,
+  at_ms         INTEGER NOT NULL,
+  -- Deduplication identity: the event envelope's id when present, else the
+  -- execution+totals+second tuple. Unique per session, so a replayed or
+  -- delayed delivery inserts nothing instead of charging twice.
+  observation_key TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS goal_usage_observation_identity
+  ON goal_usage_observations (session_id, observation_key);
+CREATE INDEX IF NOT EXISTS goal_usage_session ON goal_usage_observations (session_id);
+
+-- Verification attempt records (audit-4 #10).
+--
+-- One row per verification run, with the goal generation + version it claims
+-- to describe. recordProofs rejects a proof batch whose attempt id is not the
+-- current open attempt for the goal, so a verifier delayed past a replacement
+-- can neither overwrite newer proof results nor resurrect its own stale ones.
+CREATE TABLE IF NOT EXISTS goal_verification_attempts (
+  id          TEXT PRIMARY KEY,
+  goal_id     TEXT NOT NULL,
+  generation  INTEGER NOT NULL,
+  version     INTEGER NOT NULL,
+  status      TEXT NOT NULL,
+  started_at_ms INTEGER NOT NULL,
+  finished_at_ms INTEGER
+);
+CREATE INDEX IF NOT EXISTS goal_verification_attempts_goal
+  ON goal_verification_attempts (goal_id, started_at_ms);
+
 -- Explicit user acceptance of an objective-level criterion.
 --
 -- A broad objective ("fix the flaky tests", "clean up the config handling")
@@ -905,6 +962,8 @@ class GoalStore {
       if (stale) {
         this.markRoundFailed(stale.id, `superseded by ${newIDValue}`, { parkGoal: false });
       }
+      this.db.query(`UPDATE goal_verification_attempts SET status = 'abandoned', finished_at_ms = ?
+            WHERE goal_id = ? AND status = 'open'`).run(now, existing.id);
       this.db.query(`INSERT INTO goals (id, session_id, generation, objective, status, rounds,
              no_progress_rounds, repeated_blocker_rounds, token_budget, version,
              completion_policy, created_at_ms, updated_at_ms)
@@ -960,6 +1019,8 @@ class GoalStore {
       if (updated.changes !== 1) {
         throw new GoalConflictError(`compare-and-swap failed for ${goal.id}`);
       }
+      this.db.query(`UPDATE goal_verification_attempts SET status = 'abandoned', finished_at_ms = ?
+            WHERE goal_id = ? AND status = 'open'`).run(now, goal.id);
       this.appendEvent(goal.id, goal.generation, "status", {
         fromStatus: goal.status,
         toStatus: input.to,
@@ -1220,13 +1281,43 @@ class GoalStore {
       return bound;
     });
   }
+  abandonAttempt(attemptID) {
+    if (!attemptID)
+      return;
+    this.db.query(`UPDATE goal_verification_attempts SET status = 'abandoned', finished_at_ms = ?
+          WHERE id = ? AND status = 'open'`).run(Date.now(), attemptID);
+  }
+  beginVerificationAttempt(goalID, expected) {
+    return this.tx(() => {
+      const goal = this.byID(goalID);
+      if (!goal)
+        throw new GoalConflictError(`unknown goal ${goalID}`);
+      if (goal.generation !== expected.generation || goal.version !== expected.version) {
+        throw new GoalConflictError(`goal ${goalID} changed before the verification attempt was opened (generation ${goal.generation}, version ${goal.version})`);
+      }
+      const id = newID("vatt");
+      this.db.query(`INSERT INTO goal_verification_attempts (id, goal_id, generation, version, status, started_at_ms)
+           VALUES (?, ?, ?, ?, 'open', ?)`).run(id, goalID, expected.generation, expected.version, Date.now());
+      return id;
+    });
+  }
   recordProofs(goalID, proofs, snapshot, attempt, assessment) {
     return this.tx(() => {
       const goal = this.byID(goalID);
       if (!goal)
         throw new GoalConflictError(`unknown goal ${goalID}`);
       if (attempt && (goal.generation !== attempt.generation || goal.version !== attempt.version)) {
+        this.abandonAttempt(attempt.attemptID);
         return false;
+      }
+      if (attempt) {
+        const open = this.db.query(`SELECT id FROM goal_verification_attempts
+              WHERE goal_id = ? AND status = 'open'
+              ORDER BY started_at_ms DESC, id DESC LIMIT 1`).get(goalID);
+        if (!open || open.id !== attempt.attemptID) {
+          this.abandonAttempt(attempt.attemptID);
+          return false;
+        }
       }
       const now = Date.now();
       for (const proof of proofs) {
@@ -1256,6 +1347,10 @@ class GoalStore {
                   updated_at_ms = ?,
                   version = version + 1
             WHERE id = ? AND version = ?`).run(snapshot, now, goalID, goal.version);
+      if (attempt) {
+        this.db.query(`UPDATE goal_verification_attempts SET status = 'recorded', finished_at_ms = ?
+              WHERE id = ? AND status = 'open'`).run(now, attempt.attemptID);
+      }
       return true;
     });
   }
@@ -1327,22 +1422,75 @@ class GoalStore {
     }
     return countedRounds.size;
   }
-  recordSessionUsage(sessionID, totalTokens) {
+  recordUsageObservation(input) {
+    const atMs = input.atMs ?? Date.now();
+    const components = {
+      input: Math.max(0, Math.floor(input.inputTokens ?? 0)),
+      output: Math.max(0, Math.floor(input.outputTokens ?? 0)),
+      reasoning: Math.max(0, Math.floor(input.reasoningTokens ?? 0)),
+      cacheRead: Math.max(0, Math.floor(input.cacheReadTokens ?? 0)),
+      cacheWrite: Math.max(0, Math.floor(input.cacheWriteTokens ?? 0))
+    };
+    const observedTotal = input.total !== undefined ? Math.max(0, Math.floor(input.total)) : components.input + components.output + components.reasoning + components.cacheRead + components.cacheWrite;
+    const observationKey = input.eventID && input.eventID.trim() ? `evt:${input.eventID.trim()}` : `exe:${input.messageID ?? ""}:${observedTotal}:${Math.floor(atMs / 1000)}`;
     return this.tx(() => {
-      const previous = this.db.query(`SELECT total_tokens FROM session_usage WHERE session_id = ?`).get(sessionID)?.total_tokens ?? 0;
-      const delta = Math.max(0, Math.floor(totalTokens) - previous);
+      const existing = this.db.query(`SELECT attribution FROM goal_usage_observations WHERE session_id = ? AND observation_key = ?`).get(input.sessionID, observationKey);
+      if (existing) {
+        const goal = this.current(input.sessionID) ?? undefined;
+        return {
+          goal,
+          delta: 0,
+          duplicate: true,
+          attribution: existing.attribution
+        };
+      }
+      let attributedGoal;
+      let attribution = "unassigned";
+      let goalID = null;
+      let generation = null;
+      if (input.messageID) {
+        const g = this.resolveMessageGeneration(input.sessionID, input.messageID);
+        if (g !== undefined) {
+          const historical = this.byGeneration(input.sessionID, g);
+          generation = g;
+          if (historical && isNonTerminal(historical.status)) {
+            attributedGoal = historical;
+            goalID = historical.id;
+            attribution = "execution";
+          }
+        }
+      }
+      if (!attributedGoal && !input.messageID) {
+        const current = this.current(input.sessionID);
+        if (current && isNonTerminal(current.status)) {
+          attributedGoal = current;
+          goalID = current.id;
+          generation = current.generation;
+          attribution = "current";
+        }
+      }
+      this.db.query(`INSERT INTO goal_usage_observations
+             (id, session_id, execution_id, goal_id, generation, attribution,
+              input_tokens, output_tokens, reasoning_tokens, cache_read_tokens,
+              cache_write_tokens, total_tokens, at_ms, observation_key)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(newID("usage"), input.sessionID, input.messageID ?? null, goalID, generation, attribution, components.input, components.output, components.reasoning, components.cacheRead, components.cacheWrite, observedTotal, atMs, observationKey);
+      const previous = this.db.query(`SELECT total_tokens FROM session_usage WHERE session_id = ?`).get(input.sessionID)?.total_tokens ?? 0;
+      const highWater = Math.max(previous, observedTotal);
+      const delta = Math.max(0, highWater - previous);
       this.db.query(`INSERT INTO session_usage (session_id, total_tokens, updated_at_ms)
            VALUES (?, ?, ?)
            ON CONFLICT(session_id) DO UPDATE SET
-             total_tokens = excluded.total_tokens,
-             updated_at_ms = excluded.updated_at_ms`).run(sessionID, Math.floor(totalTokens), Date.now());
-      const current = this.current(sessionID);
-      if (!delta || !current || !isNonTerminal(current.status)) {
-        return { goal: current, delta };
+             total_tokens = MAX(session_usage.total_tokens, excluded.total_tokens),
+             updated_at_ms = excluded.updated_at_ms`).run(input.sessionID, highWater, Date.now());
+      if (delta > 0 && attributedGoal) {
+        this.db.query(`UPDATE goals SET tokens_used = COALESCE(tokens_used, 0) + ?, updated_at_ms = ? WHERE id = ?`).run(delta, Date.now(), attributedGoal.id);
       }
-      this.db.query(`UPDATE goals SET tokens_used = COALESCE(tokens_used, 0) + ?, updated_at_ms = ? WHERE id = ?`).run(delta, Date.now(), current.id);
-      return { goal: this.byID(current.id), delta };
+      return { goal: attributedGoal, delta, duplicate: false, attribution };
     });
+  }
+  recordSessionUsage(sessionID, totalTokens) {
+    const result = this.recordUsageObservation({ sessionID, total: totalTokens });
+    return { goal: result.goal, delta: result.delta };
   }
   setTokenBudget(goalID, budget) {
     return this.tx(() => {
@@ -1724,6 +1872,10 @@ class GoalVerifier {
     if (!goal)
       return { verdict: "incomplete", unmet: [], reason: "unknown goal" };
     const attempt = { generation: goal.generation, version: goal.version };
+    const attemptID = this.store.beginVerificationAttempt(goalID, {
+      generation: goal.generation,
+      version: goal.version
+    });
     const criteria = this.store.listCriteria(goalID);
     const evidence = this.store.listEvidence(goalID);
     const workspace = await this.validator.workspaceFor?.(goal.sessionID) ?? "";
@@ -1920,7 +2072,7 @@ class GoalVerifier {
       unmet.push(...staleEvidence);
     }
     const snapshot = snapshotHash(criteria, evidence);
-    const recorded = this.store.recordProofs(goalID, proofs, snapshot, attempt, assessment);
+    const recorded = this.store.recordProofs(goalID, proofs, snapshot, { ...attempt, attemptID }, assessment);
     if (!recorded) {
       return {
         verdict: "incomplete",
@@ -4120,14 +4272,25 @@ ${unmet.join(`
             const usageSession = data?.sessionID;
             const tokens = data?.tokens;
             if (usageSession && tokens) {
-              const total = Number(tokens.input ?? 0) + Number(tokens.output ?? 0) + Number(tokens.reasoning ?? 0) + Number(tokens.cache?.read ?? 0) + Number(tokens.cache?.write ?? 0);
               try {
-                const goal = controller.recordUsage(usageSession, total);
+                const result = controller.store.recordUsageObservation({
+                  sessionID: String(usageSession),
+                  eventID: event?.id ? String(event.id) : undefined,
+                  messageID: data.messageID ? String(data.messageID) : undefined,
+                  inputTokens: Number(tokens.input ?? 0),
+                  outputTokens: Number(tokens.output ?? 0),
+                  reasoningTokens: Number(tokens.reasoning ?? 0),
+                  cacheReadTokens: Number(tokens.cache?.read ?? 0),
+                  cacheWriteTokens: Number(tokens.cache?.write ?? 0)
+                });
                 record({
                   event: "usage.recorded",
                   sessionID: usageSession,
-                  tokensUsed: goal?.tokensUsed ?? null,
-                  tokenBudget: goal?.tokenBudget ?? null
+                  duplicate: result.duplicate,
+                  attribution: result.attribution,
+                  delta: result.delta,
+                  tokensUsed: result.goal?.tokensUsed ?? null,
+                  tokenBudget: result.goal?.tokenBudget ?? null
                 });
               } catch (error) {
                 record({ event: "usage.record.error", error: String(error) });

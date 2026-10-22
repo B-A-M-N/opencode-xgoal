@@ -1100,27 +1100,37 @@ export default {
             }
           }
 
-          // Session usage is a running total; charge the delta to the active
-          // goal so the budget ceiling is driven by real usage rather than
-          // staying at zero forever.
+          // Session usage is a running total; charge the delta to the goal
+          // that produced it (audit-4 #3). The event's token fields are
+          // disjoint per opencode 2 semantics (output is visible output,
+          // reasoning excluded), so the sum is the true consumption. The
+          // event envelope id deduplicates replayed deliveries, and the
+          // message id attributes the observation to the goal generation
+          // that actually produced it rather than whatever is current now.
           if (controller && type === "session.usage.updated") {
             const data = (event as any)?.data;
             const usageSession = data?.sessionID;
             const tokens = data?.tokens;
             if (usageSession && tokens) {
-              const total =
-                Number(tokens.input ?? 0) +
-                Number(tokens.output ?? 0) +
-                Number(tokens.reasoning ?? 0) +
-                Number(tokens.cache?.read ?? 0) +
-                Number(tokens.cache?.write ?? 0);
               try {
-                const goal = controller.recordUsage(usageSession, total);
+                const result = controller.store.recordUsageObservation({
+                  sessionID: String(usageSession),
+                  eventID: event?.id ? String(event.id) : undefined,
+                  messageID: data.messageID ? String(data.messageID) : undefined,
+                  inputTokens: Number(tokens.input ?? 0),
+                  outputTokens: Number(tokens.output ?? 0),
+                  reasoningTokens: Number(tokens.reasoning ?? 0),
+                  cacheReadTokens: Number(tokens.cache?.read ?? 0),
+                  cacheWriteTokens: Number(tokens.cache?.write ?? 0),
+                });
                 record({
                   event: "usage.recorded",
                   sessionID: usageSession,
-                  tokensUsed: goal?.tokensUsed ?? null,
-                  tokenBudget: goal?.tokenBudget ?? null,
+                  duplicate: result.duplicate,
+                  attribution: result.attribution,
+                  delta: result.delta,
+                  tokensUsed: result.goal?.tokensUsed ?? null,
+                  tokenBudget: result.goal?.tokenBudget ?? null,
                 });
               } catch (error) {
                 record({ event: "usage.record.error", error: String(error) });

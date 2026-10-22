@@ -227,6 +227,63 @@ CREATE TABLE IF NOT EXISTS session_usage (
   updated_at_ms INTEGER NOT NULL
 );
 
+-- Execution-scoped usage ledger (audit-4 #3).
+--
+-- One row per (execution, event) observation. The observation identity is the
+-- event envelope's id (opencode 2 events carry a unique EventID); when the
+-- envelope has no id, the (executionID, token totals, at-second) tuple is the
+-- fallback identity. The unique index makes a replayed or delayed delivery a
+-- no-op instead of a second charge.
+--
+-- attribution: 'execution' — a message/execution id resolved the observation
+-- to a (goal, generation) pair through the durable message-generation map, so
+-- a late event from generation 1 charges generation 1 (or nothing, if that
+-- goal is terminal) and never the replacement. 'current' — no execution
+-- identity was available, so the observation was charged to the goal that was
+-- current when the event ARRIVED. 'unassigned' — the execution's goal could
+-- not be established; usage is recorded but charged to no goal rather than
+-- silently accruing to whatever happens to be current (audit-4 #3).
+CREATE TABLE IF NOT EXISTS goal_usage_observations (
+  id            TEXT PRIMARY KEY,
+  session_id    TEXT NOT NULL,
+  execution_id  TEXT,
+  goal_id       TEXT,
+  generation    INTEGER,
+  attribution   TEXT NOT NULL,
+  input_tokens  INTEGER NOT NULL,
+  output_tokens INTEGER NOT NULL,
+  reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+  cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+  cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+  total_tokens  INTEGER NOT NULL,
+  at_ms         INTEGER NOT NULL,
+  -- Deduplication identity: the event envelope's id when present, else the
+  -- execution+totals+second tuple. Unique per session, so a replayed or
+  -- delayed delivery inserts nothing instead of charging twice.
+  observation_key TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS goal_usage_observation_identity
+  ON goal_usage_observations (session_id, observation_key);
+CREATE INDEX IF NOT EXISTS goal_usage_session ON goal_usage_observations (session_id);
+
+-- Verification attempt records (audit-4 #10).
+--
+-- One row per verification run, with the goal generation + version it claims
+-- to describe. recordProofs rejects a proof batch whose attempt id is not the
+-- current open attempt for the goal, so a verifier delayed past a replacement
+-- can neither overwrite newer proof results nor resurrect its own stale ones.
+CREATE TABLE IF NOT EXISTS goal_verification_attempts (
+  id          TEXT PRIMARY KEY,
+  goal_id     TEXT NOT NULL,
+  generation  INTEGER NOT NULL,
+  version     INTEGER NOT NULL,
+  status      TEXT NOT NULL,
+  started_at_ms INTEGER NOT NULL,
+  finished_at_ms INTEGER
+);
+CREATE INDEX IF NOT EXISTS goal_verification_attempts_goal
+  ON goal_verification_attempts (goal_id, started_at_ms);
+
 -- Explicit user acceptance of an objective-level criterion.
 --
 -- A broad objective ("fix the flaky tests", "clean up the config handling")
@@ -832,6 +889,15 @@ export class GoalStore {
         this.markRoundFailed(stale.id, `superseded by ${newIDValue}`, { parkGoal: false });
       }
 
+      // Retire the superseded goal's open verification attempts (audit-4 #10):
+      // their verifier describes a goal that no longer exists.
+      this.db
+        .query(
+          `UPDATE goal_verification_attempts SET status = 'abandoned', finished_at_ms = ?
+            WHERE goal_id = ? AND status = 'open'`,
+        )
+        .run(now, existing.id);
+
       this.db
         .query(
           `INSERT INTO goals (id, session_id, generation, objective, status, rounds,
@@ -934,6 +1000,17 @@ export class GoalStore {
       if (updated.changes !== 1) {
         throw new GoalConflictError(`compare-and-swap failed for ${goal.id}`);
       }
+
+      // A status change retires any open verification attempt (audit-4 #10):
+      // a verifier that opened its attempt before a pause/active flip must
+      // find its attempt closed and discard its results, exactly as it would
+      // across a replacement.
+      this.db
+        .query(
+          `UPDATE goal_verification_attempts SET status = 'abandoned', finished_at_ms = ?
+            WHERE goal_id = ? AND status = 'open'`,
+        )
+        .run(now, goal.id);
 
       this.appendEvent(goal.id, goal.generation, "status", {
         fromStatus: goal.status,
@@ -1503,13 +1580,59 @@ export class GoalStore {
   }
 
   /**
+   * Close a verification attempt as abandoned (idempotent). Used when a proof
+   * batch is discarded so the attempt ledger never shows a lingering open run
+   * that will never record anything.
+   */
+  private abandonAttempt(attemptID: string): void {
+    if (!attemptID) return;
+    this.db
+      .query(
+        `UPDATE goal_verification_attempts SET status = 'abandoned', finished_at_ms = ?
+          WHERE id = ? AND status = 'open'`,
+      )
+      .run(Date.now(), attemptID);
+  }
+
+  /**
+   * Open a verification attempt record (audit-4 #10).
+   *
+   * The attempt captures the goal generation + version the verifier is about
+   * to describe. `recordProofs` refuses any proof batch whose attempt is not
+   * still the goal's open attempt, so a verifier delayed past another
+   * verification run (or past any goal transition) can neither overwrite
+   * newer proof results nor resurrect its own.
+   */
+  beginVerificationAttempt(goalID: string, expected: { generation: number; version: number }): string {
+    return this.tx(() => {
+      const goal = this.byID(goalID);
+      if (!goal) throw new GoalConflictError(`unknown goal ${goalID}`);
+      if (goal.generation !== expected.generation || goal.version !== expected.version) {
+        throw new GoalConflictError(
+          `goal ${goalID} changed before the verification attempt was opened (generation ${goal.generation}, version ${goal.version})`,
+        );
+      }
+      const id = newID("vatt");
+      this.db
+        .query(
+          `INSERT INTO goal_verification_attempts (id, goal_id, generation, version, status, started_at_ms)
+           VALUES (?, ?, ?, ?, 'open', ?)`,
+        )
+        .run(id, goalID, expected.generation, expected.version, Date.now());
+      return id;
+    });
+  }
+
+  /**
    * Persist the proofs a verification attempt produced, atomically.
    *
-   * The write is fenced by the verification attempt (generation + version):
-   * if the goal changed state while validation was running, the proofs are
-   * discarded and the caller learns its decision described a world that no
-   * longer exists. Criterion readouts are only ever updated by a verifier
-   * that observed the current goal.
+   * The write is fenced TWICE: by the verification attempt id — the attempt
+   * must still be the goal's open attempt, so a delayed verifier that raced a
+   * newer run is discarded — and by generation + version: if the goal changed
+   * state while validation was running, the proofs are discarded and the
+   * caller learns its decision described a world that no longer exists.
+   * Criterion readouts are only ever updated by a verifier that observed the
+   * current goal through the attempt it opened.
    *
    * Returns true when the proofs were recorded; false when discarded.
    */
@@ -1523,7 +1646,7 @@ export class GoalStore {
       detail: string;
     }[],
     snapshot: string,
-    attempt?: { generation: number; version: number },
+    attempt?: { generation: number; version: number; attemptID: string },
     assessment?: {
       objectiveRevision: number;
       verdict: "satisfied" | "incomplete" | "indeterminate";
@@ -1539,8 +1662,26 @@ export class GoalStore {
       if (!goal) throw new GoalConflictError(`unknown goal ${goalID}`);
       if (attempt && (goal.generation !== attempt.generation || goal.version !== attempt.version)) {
         // Stale verification: the goal was replaced or transitioned mid-run.
-        // No proof rows, no criterion readout changes, no revision bump.
+        // No proof rows, no criterion readout changes, no revision bump. The
+        // dead attempt is closed so the record reflects reality.
+        this.abandonAttempt(attempt.attemptID);
         return false;
+      }
+      if (attempt) {
+        // Attempt fence: the caller's attempt must still be the goal's open
+        // attempt. A newer run (or a transition away from `verifying`) has
+        // already superseded it — its results must not overwrite newer ones.
+        const open = this.db
+          .query<{ id: string }, [string]>(
+            `SELECT id FROM goal_verification_attempts
+              WHERE goal_id = ? AND status = 'open'
+              ORDER BY started_at_ms DESC, id DESC LIMIT 1`,
+          )
+          .get(goalID);
+        if (!open || open.id !== attempt.attemptID) {
+          this.abandonAttempt(attempt.attemptID);
+          return false;
+        }
       }
       const now = Date.now();
       for (const proof of proofs) {
@@ -1610,6 +1751,16 @@ export class GoalStore {
             WHERE id = ? AND version = ?`,
         )
         .run(snapshot, now, goalID, goal.version);
+      // The attempt has produced its durable result: close it so it can never
+      // fence in a second, later proof batch (audit-4 #10).
+      if (attempt) {
+        this.db
+          .query(
+            `UPDATE goal_verification_attempts SET status = 'recorded', finished_at_ms = ?
+              WHERE id = ? AND status = 'open'`,
+          )
+          .run(now, attempt.attemptID);
+      }
       return true;
     });
   }
@@ -1782,42 +1933,181 @@ export class GoalStore {
   }
 
   /**
-   * Charge session usage to the current goal.
+   * Charge session-level usage to goals (audit-4 #3).
    *
-   * `totalTokens` is the session's running total from `session.usage.updated`.
-   * The delta against the previously observed total is added to the active
-   * goal. Replaying the same event is therefore a no-op, not double billing.
+   * One durable observation per (execution, event) identity. Cumulative
+   * billing uses the session high-water mark, persisted as
+   * MAX(previous, observed): a delayed event carrying a LOWER total never
+   * lowers the baseline, so replaying the later event afterwards cannot
+   * charge the same tokens again. Only the positive increment over the
+   * high-water mark is ever charged.
+   *
+   * Attribution is execution-scoped: when the caller supplies a message or
+   * execution id, the observation is resolved through the durable
+   * message-generation map and charged to THAT goal generation (or left
+   * unassigned when the execution predates every current goal or its goal is
+   * terminal). Without an execution identity, the observation charges the
+   * goal that was current when the event arrived. Unknown attribution stays
+   * unassigned — it never silently accrues to the current goal.
+   *
+   * Token fields are disjoint per opencode 2 semantics (tokens.output is
+   * visible output with reasoning excluded), so the total is their sum.
+   * The caller may instead pass `total` directly (an explicit
+   * tokens.total from the payload), which is honored verbatim.
    */
-  recordSessionUsage(sessionID: string, totalTokens: number): {
+  recordUsageObservation(input: {
+    sessionID: string;
+    /** Event envelope id — the primary dedup identity when present. */
+    eventID?: string;
+    /** The execution/message that produced the usage, for generation-scoped attribution. */
+    messageID?: string;
+    inputTokens?: number;
+    outputTokens?: number;
+    reasoningTokens?: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+    total?: number;
+    atMs?: number;
+  }): {
     goal?: Goal;
     delta: number;
+    duplicate: boolean;
+    attribution: "execution" | "current" | "unassigned";
   } {
+    const atMs = input.atMs ?? Date.now();
+    const components = {
+      input: Math.max(0, Math.floor(input.inputTokens ?? 0)),
+      output: Math.max(0, Math.floor(input.outputTokens ?? 0)),
+      reasoning: Math.max(0, Math.floor(input.reasoningTokens ?? 0)),
+      cacheRead: Math.max(0, Math.floor(input.cacheReadTokens ?? 0)),
+      cacheWrite: Math.max(0, Math.floor(input.cacheWriteTokens ?? 0)),
+    };
+    const observedTotal =
+      input.total !== undefined
+        ? Math.max(0, Math.floor(input.total))
+        : components.input + components.output + components.reasoning + components.cacheRead + components.cacheWrite;
+    const observationKey =
+      input.eventID && input.eventID.trim()
+        ? `evt:${input.eventID.trim()}`
+        : `exe:${input.messageID ?? ""}:${observedTotal}:${Math.floor(atMs / 1000)}`;
+
     return this.tx(() => {
+      // Dedup first: a replayed event is a no-op, never a second charge.
+      const existing = this.db
+        .query<{ attribution: string }, [string, string]>(
+          `SELECT attribution FROM goal_usage_observations WHERE session_id = ? AND observation_key = ?`,
+        )
+        .get(input.sessionID, observationKey);
+      if (existing) {
+        const goal = this.current(input.sessionID) ?? undefined;
+        return {
+          goal,
+          delta: 0,
+          duplicate: true,
+          attribution: existing.attribution as "execution" | "current" | "unassigned",
+        };
+      }
+
+      // Execution-scoped attribution: resolve the producing message to the
+      // (goal, generation) it actually belonged to.
+      let attributedGoal: Goal | undefined;
+      let attribution: "execution" | "current" | "unassigned" = "unassigned";
+      let goalID: string | null = null;
+      let generation: number | null = null;
+      if (input.messageID) {
+        const g = this.resolveMessageGeneration(input.sessionID, input.messageID);
+        if (g !== undefined) {
+          // The execution identity resolved: the usage belongs to generation
+          // g, full stop. If that goal is terminal (superseded/completed), the
+          // usage is recorded UNASSIGNED — falling back to the current goal
+          // here is precisely the misattribution audit-4 #3 forbids.
+          const historical = this.byGeneration(input.sessionID, g);
+          generation = g;
+          if (historical && isNonTerminal(historical.status)) {
+            attributedGoal = historical;
+            goalID = historical.id;
+            attribution = "execution";
+          }
+        }
+      }
+      if (!attributedGoal && !input.messageID) {
+        // No execution identity at all: the observation charges the goal that
+        // was current when the event arrived.
+        const current = this.current(input.sessionID);
+        if (current && isNonTerminal(current.status)) {
+          attributedGoal = current;
+          goalID = current.id;
+          generation = current.generation;
+          attribution = "current";
+        }
+      }
+
+      this.db
+        .query(
+          `INSERT INTO goal_usage_observations
+             (id, session_id, execution_id, goal_id, generation, attribution,
+              input_tokens, output_tokens, reasoning_tokens, cache_read_tokens,
+              cache_write_tokens, total_tokens, at_ms, observation_key)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          newID("usage"),
+          input.sessionID,
+          input.messageID ?? null,
+          goalID,
+          generation,
+          attribution,
+          components.input,
+          components.output,
+          components.reasoning,
+          components.cacheRead,
+          components.cacheWrite,
+          observedTotal,
+          atMs,
+          observationKey,
+        );
+
+      // Monotonic session high-water mark: MAX(previous, observed). A delayed
+      // lower total must not lower the baseline, or replaying the later,
+      // higher event would double-bill the difference.
       const previous = this.db
         .query<{ total_tokens: number }, [string]>(
           `SELECT total_tokens FROM session_usage WHERE session_id = ?`,
         )
-        .get(sessionID)?.total_tokens ?? 0;
-      const delta = Math.max(0, Math.floor(totalTokens) - previous);
+        .get(input.sessionID)?.total_tokens ?? 0;
+      const highWater = Math.max(previous, observedTotal);
+      const delta = Math.max(0, highWater - previous);
       this.db
         .query(
           `INSERT INTO session_usage (session_id, total_tokens, updated_at_ms)
            VALUES (?, ?, ?)
            ON CONFLICT(session_id) DO UPDATE SET
-             total_tokens = excluded.total_tokens,
+             total_tokens = MAX(session_usage.total_tokens, excluded.total_tokens),
              updated_at_ms = excluded.updated_at_ms`,
         )
-        .run(sessionID, Math.floor(totalTokens), Date.now());
+        .run(input.sessionID, highWater, Date.now());
 
-      const current = this.current(sessionID);
-      if (!delta || !current || !isNonTerminal(current.status)) {
-        return { goal: current, delta };
+      if (delta > 0 && attributedGoal) {
+        this.db
+          .query(`UPDATE goals SET tokens_used = COALESCE(tokens_used, 0) + ?, updated_at_ms = ? WHERE id = ?`)
+          .run(delta, Date.now(), attributedGoal.id);
       }
-      this.db
-        .query(`UPDATE goals SET tokens_used = COALESCE(tokens_used, 0) + ?, updated_at_ms = ? WHERE id = ?`)
-        .run(delta, Date.now(), current.id);
-      return { goal: this.byID(current.id), delta };
+      return { goal: attributedGoal, delta, duplicate: false, attribution };
     });
+  }
+
+  /**
+   * Legacy cumulative entry point: charge the running session total to the
+   * current goal. Kept for callers that have no event identity. New callers
+   * should use recordUsageObservation, which adds observation dedup and
+   * execution-scoped attribution.
+   */
+  recordSessionUsage(sessionID: string, totalTokens: number): {
+    goal?: Goal;
+    delta: number;
+  } {
+    const result = this.recordUsageObservation({ sessionID, total: totalTokens });
+    return { goal: result.goal, delta: result.delta };
   }
 
   /** Set or clear a goal's token ceiling. */
