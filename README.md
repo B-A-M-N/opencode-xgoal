@@ -635,13 +635,16 @@ named in the audit.
 
 ## Acknowledgments
 
-The live development and testing of this plugin ran on models served by
+This project's development and testing ran on models served by
 **[FreeInference.org](https://freeinference.org)** — a free, OpenAI-compatible
 inference service for open-source, research, and education, built at Harvard
 SEAS's MadSys Lab. Every agent turn across the audit remediation, the
-regression suites, and the independent reviewer sessions was powered by their
-endpoint, at no cost.
+regression suites, and the independent reviewer sessions ran on their
+endpoint.
 
-If you find this project useful and want to support the infrastructure that
-made it possible, consider supporting FreeInference.org — free research
-quotas stay alive because people fund them.
+**Disclosure:** this acknowledgment was not requested, directed, or approved
+by FreeInference.org, and they have not reviewed this project. The credit is
+given for one reason: they provide a vital service for people who may not
+otherwise have access to frontier-model inference — researchers, students,
+and builders without funding or institutional backing. If you find this
+project useful, that is a good reason to support them.
