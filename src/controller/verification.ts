@@ -264,7 +264,27 @@ export class GoalVerifier {
       generation: goal.generation,
       version: goal.version,
     });
+    // Every exit after this point must close the attempt: the proof commit
+    // closes it itself (recorded or abandoned), and this finally covers the
+    // early returns and validation throws so no run lingers open forever.
+    let settled = false;
+    try {
+      return await this.verifyAttempted(goalID, attempt, attemptID, () => {
+        settled = true;
+      });
+    } finally {
+      if (!settled) this.store.abandonVerificationAttempt(attemptID);
+    }
+  }
 
+  private async verifyAttempted(
+    goalID: string,
+    attempt: { generation: number; version: number },
+    attemptID: string,
+    markSettled: () => void,
+  ): Promise<VerificationResult> {
+    const goal = this.store.byID(goalID);
+    if (!goal) return { verdict: "incomplete", unmet: [], reason: "unknown goal" };
     const criteria = this.store.listCriteria(goalID);
     const evidence = this.store.listEvidence(goalID);
     const workspace = (await this.validator.workspaceFor?.(goal.sessionID)) ?? "";
@@ -666,6 +686,9 @@ export class GoalVerifier {
       { ...attempt, attemptID },
       assessment,
     );
+    // The store closed the attempt one way or the other (recorded or
+    // abandoned); the finally in verify() no longer needs to clean up.
+    markSettled();
     if (!recorded) {
       return {
         verdict: "incomplete",

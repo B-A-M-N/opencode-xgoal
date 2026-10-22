@@ -118,6 +118,19 @@ describe("audit-4 #3: observation identity dedup", () => {
     expect(next.delta).toBe(30);
     expect(store.current("ses_a")!.tokensUsed).toBe(180);
   });
+  test("garbage token fields sanitize to zero instead of dropping the observation", () => {
+    const goal = store.create({ sessionID: "ses_a", objective: "work" });
+    const result = store.recordUsageObservation({
+      sessionID: "ses_a",
+      inputTokens: Number.NaN,
+      outputTokens: 80,
+      cacheReadTokens: Number.POSITIVE_INFINITY,
+    });
+    expect(result.duplicate).toBe(false);
+    expect(result.delta).toBe(80);
+    expect(store.byID(goal.id)!.tokensUsed).toBe(80);
+    expect(store.current("ses_a")!.tokensUsed).toBe(80);
+  });
 });
 
 describe("audit-4 #3: execution-scoped attribution", () => {
@@ -185,6 +198,41 @@ describe("audit-4 #10: durable verification attempt records", () => {
   const passiveValidator: EvidenceValidator = {
     validate: async () => ({ valid: true, reason: "ok" }),
   };
+
+  test("an early-exit verification run still closes its attempt record", async () => {
+    const goal = store.create({ sessionID: "ses_a", objective: "work" });
+    store.transition({ goalID: goal.id, generation: goal.generation, to: "verifying", actor: "model" });
+
+    // No criteria recorded: verify() returns early, before any proof commit.
+    const verifier = new GoalVerifier(store, passiveValidator);
+    const result = await verifier.verify(goal.id);
+    expect(result.verdict).toBe("incomplete");
+
+    const attempts = store.db
+      .query(`SELECT status FROM goal_verification_attempts WHERE goal_id = ?`)
+      .all(goal.id) as Array<{ status: string }>;
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0]!.status).toBe("abandoned");
+  });
+
+  test("a validator that throws mid-verification still closes its attempt record", async () => {
+    const goal = store.create({ sessionID: "ses_a", objective: "work" });
+    const criterionID = store.addCriterion(goal.id, "tests pass", undefined, "user");
+    store.addEvidence({ goalID: goal.id, criterionID, kind: "test", ref: "bun test", exitCode: 0 });
+    store.transition({ goalID: goal.id, generation: goal.generation, to: "verifying", actor: "model" });
+
+    const verifier = new GoalVerifier(store, {
+      validate: async () => {
+        throw new Error("validator exploded");
+      },
+    });
+    await expect(verifier.verify(goal.id)).rejects.toThrow("validator exploded");
+
+    const attempts = store.db
+      .query(`SELECT status FROM goal_verification_attempts WHERE goal_id = ?`)
+      .all(goal.id) as Array<{ status: string }>;
+    expect(attempts[0]!.status).toBe("abandoned");
+  });
 
   test("a verification run opens and closes a durable attempt record", async () => {
     const goal = store.create({ sessionID: "ses_a", objective: "work" });

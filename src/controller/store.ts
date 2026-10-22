@@ -1581,6 +1581,16 @@ export class GoalStore {
 
   /**
    * Close a verification attempt as abandoned (idempotent). Used when a proof
+   * batch is discarded — or when a verifier exits early, before producing a
+   * batch — so the attempt ledger never shows an open run that will never
+   * record anything.
+   */
+  abandonVerificationAttempt(attemptID: string): void {
+    this.abandonAttempt(attemptID);
+  }
+
+  /**
+   * Close a verification attempt as abandoned (idempotent). Used when a proof
    * batch is discarded so the attempt ledger never shows a lingering open run
    * that will never record anything.
    */
@@ -1975,16 +1985,22 @@ export class GoalStore {
     attribution: "execution" | "current" | "unassigned";
   } {
     const atMs = input.atMs ?? Date.now();
+    // Per-field sanitation: a garbage value (NaN, Infinity) becomes 0 instead
+    // of poisoning the whole observation — the valid components still bill.
+    const safeTokens = (value: number | undefined): number => {
+      const n = Number(value ?? 0);
+      return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+    };
     const components = {
-      input: Math.max(0, Math.floor(input.inputTokens ?? 0)),
-      output: Math.max(0, Math.floor(input.outputTokens ?? 0)),
-      reasoning: Math.max(0, Math.floor(input.reasoningTokens ?? 0)),
-      cacheRead: Math.max(0, Math.floor(input.cacheReadTokens ?? 0)),
-      cacheWrite: Math.max(0, Math.floor(input.cacheWriteTokens ?? 0)),
+      input: safeTokens(input.inputTokens),
+      output: safeTokens(input.outputTokens),
+      reasoning: safeTokens(input.reasoningTokens),
+      cacheRead: safeTokens(input.cacheReadTokens),
+      cacheWrite: safeTokens(input.cacheWriteTokens),
     };
     const observedTotal =
       input.total !== undefined
-        ? Math.max(0, Math.floor(input.total))
+        ? safeTokens(input.total)
         : components.input + components.output + components.reasoning + components.cacheRead + components.cacheWrite;
     const observationKey =
       input.eventID && input.eventID.trim()

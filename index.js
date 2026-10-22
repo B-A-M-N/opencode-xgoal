@@ -1281,6 +1281,9 @@ class GoalStore {
       return bound;
     });
   }
+  abandonVerificationAttempt(attemptID) {
+    this.abandonAttempt(attemptID);
+  }
   abandonAttempt(attemptID) {
     if (!attemptID)
       return;
@@ -1424,14 +1427,18 @@ class GoalStore {
   }
   recordUsageObservation(input) {
     const atMs = input.atMs ?? Date.now();
-    const components = {
-      input: Math.max(0, Math.floor(input.inputTokens ?? 0)),
-      output: Math.max(0, Math.floor(input.outputTokens ?? 0)),
-      reasoning: Math.max(0, Math.floor(input.reasoningTokens ?? 0)),
-      cacheRead: Math.max(0, Math.floor(input.cacheReadTokens ?? 0)),
-      cacheWrite: Math.max(0, Math.floor(input.cacheWriteTokens ?? 0))
+    const safeTokens = (value) => {
+      const n = Number(value ?? 0);
+      return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
     };
-    const observedTotal = input.total !== undefined ? Math.max(0, Math.floor(input.total)) : components.input + components.output + components.reasoning + components.cacheRead + components.cacheWrite;
+    const components = {
+      input: safeTokens(input.inputTokens),
+      output: safeTokens(input.outputTokens),
+      reasoning: safeTokens(input.reasoningTokens),
+      cacheRead: safeTokens(input.cacheReadTokens),
+      cacheWrite: safeTokens(input.cacheWriteTokens)
+    };
+    const observedTotal = input.total !== undefined ? safeTokens(input.total) : components.input + components.output + components.reasoning + components.cacheRead + components.cacheWrite;
     const observationKey = input.eventID && input.eventID.trim() ? `evt:${input.eventID.trim()}` : `exe:${input.messageID ?? ""}:${observedTotal}:${Math.floor(atMs / 1000)}`;
     return this.tx(() => {
       const existing = this.db.query(`SELECT attribution FROM goal_usage_observations WHERE session_id = ? AND observation_key = ?`).get(input.sessionID, observationKey);
@@ -1876,6 +1883,20 @@ class GoalVerifier {
       generation: goal.generation,
       version: goal.version
     });
+    let settled = false;
+    try {
+      return await this.verifyAttempted(goalID, attempt, attemptID, () => {
+        settled = true;
+      });
+    } finally {
+      if (!settled)
+        this.store.abandonVerificationAttempt(attemptID);
+    }
+  }
+  async verifyAttempted(goalID, attempt, attemptID, markSettled) {
+    const goal = this.store.byID(goalID);
+    if (!goal)
+      return { verdict: "incomplete", unmet: [], reason: "unknown goal" };
     const criteria = this.store.listCriteria(goalID);
     const evidence = this.store.listEvidence(goalID);
     const workspace = await this.validator.workspaceFor?.(goal.sessionID) ?? "";
@@ -2073,6 +2094,7 @@ class GoalVerifier {
     }
     const snapshot = snapshotHash(criteria, evidence);
     const recorded = this.store.recordProofs(goalID, proofs, snapshot, { ...attempt, attemptID }, assessment);
+    markSettled();
     if (!recorded) {
       return {
         verdict: "incomplete",
