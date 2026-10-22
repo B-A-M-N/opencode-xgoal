@@ -8,12 +8,16 @@ Status: **working controller.** A user sets a goal once; the plugin drives the
 session through as many native turns as the objective needs and completes only
 after the controller verifies the result against evidence it observed. The live
 acceptance harness passes 17/17 checks, including a second goal immediately
-after a completed one and a generation-checked replacement.
+after a completed one and a generation-checked replacement. Four independent
+audits (34 findings) have been remediated with regression tests and recorded
+reviewer verdicts; the remaining live qualification runs are one command once
+a test config exists (see the acceptance harness section).
 
 ```bash
 bun run build     # required: the package entry is ./index.js
-bun test          # 228 unit/integration tests
-bash scripts/parity.sh   # live activation acceptance (real server + model)
+bun test          # 282 unit/integration tests, 884 assertions
+bash scripts/parity.sh          # live activation acceptance (real server + model)
+bash scripts/parity.sh --qualify  # adds the #14 promotion-gate scenarios
 ```
 
 ---
@@ -263,6 +267,10 @@ kept as a thin entry point to the same harness.
 ```bash
 bash scripts/parity.sh
 # Results: 17 passed, 0 failed
+
+bash scripts/parity.sh --qualify
+# adds: acceptance fencing (foreign goalID, partial fence pair),
+# replacement mid-execution, and the XGOAL_DISABLE=1 inactive control
 ```
 
 The harness uses `XGOAL_ACCEPT_KEEP=1` to keep its workspace and logs for
@@ -275,7 +283,8 @@ inspection. It never touches the user's database or sessions.
 ```bash
 bun test          # 282 unit/integration tests, 884 assertions
 bun run typecheck # clean
-bash scripts/parity.sh  # 17/17 live acceptance checks
+bash scripts/parity.sh          # 17/17 live acceptance checks
+bash scripts/parity.sh --qualify  # + the #14 promotion-gate scenarios
 ```
 
 The live acceptance run on the tested environment:
@@ -314,15 +323,15 @@ Harness notes, learned the hard way:
 ```
 src/
   index.ts                  server plugin: command, tools, hooks, RPC, driver
-  tui.tsx                   TUI companion: /goal, dialog, RPC
+  tui.tsx                   TUI companion: /goal (createGoalCommand factory), RPC
   rpc.ts                    shared RPC definition + handlers
   controller/
     state.ts                Goal, statuses, transition table
     store.ts                SQLite: goals, rounds, evidence, criteria, proofs
     controller.ts           authority split, generation fencing, verification
     criteria.ts             CriterionSpec + objective → criteria derivation
-    driver.ts               reserve → submit → settle → classify → continue
-    transport.ts            native inbox transport + authoritative probe
+    driver.ts               reserve → submit → reconcile admission → settle
+    transport.ts            native inbox transport, probe, interrupt
     verification.ts         evidence capture, per-criterion proofs, snapshot
     coordinator.ts          one mutation path: create/replace/resume → drive
 ```
@@ -352,6 +361,17 @@ Rules that are deliberate, not accidental:
   message, and a foreign human prompt stops the walk. Timestamp attribution
   survives only for sessions with exactly one generation, where it cannot
   misattribute.
+- **Every admission is reconciled after the async submit returns.** A message
+  admitted for a superseded generation is failed, dequeued, and interrupted
+  only when the observer can attribute the running execution to that inbox
+  id; where cancellation is impossible the residual risk is named, never
+  papered over.
+- **User confirmations are fenced to what the user saw.** Acceptance carries
+  the goal id + generation the dialog rendered; a stale pair is rejected and
+  the current objective is surfaced for fresh review. A partial fence pair is
+  a hard error, never silent unfenced acceptance.
+- **Scheduling coalescence is per session.** One session's event burst never
+  suppresses another session's continuation decision.
 - Completion freshness is **recomputed**, not trusted: `completeGoal` re-hashes
   the current criteria+evidence and refuses a commit whose verified snapshot no
   longer matches the world.
@@ -604,3 +624,24 @@ honest-progress gaps:
     disable the legacy `@prevalentware/opencode-goal-plugin` in their
     OpenCode config — deliberately a human action, not something this
     plugin does silently.
+
+The fourth audit's 14 findings are all remediated at the code level as of
+items 18–30. What remains open is operational, not code: the live parity +
+qualification run (one command, needs the user-created test config), disabling
+the legacy plugin in the user config, and the Codex behavioural comparison
+named in the audit.
+
+---
+
+## Acknowledgments
+
+The live development and testing of this plugin ran on models served by
+**[FreeInference.org](https://freeinference.org)** — a free, OpenAI-compatible
+inference service for open-source, research, and education, built at Harvard
+SEAS's MadSys Lab. Every agent turn across the audit remediation, the
+regression suites, and the independent reviewer sessions was powered by their
+endpoint, at no cost.
+
+If you find this project useful and want to support the infrastructure that
+made it possible, consider supporting FreeInference.org — free research
+quotas stay alive because people fund them.
