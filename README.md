@@ -71,8 +71,9 @@ sending the default completion popup:
 Save this in `~/.config/opencode/opencode-notifier.json`. The script reads the
 latest goal for that session from the XGoal database. It suppresses completion
 alerts while a goal is active, paused, stalled, or superseded; it sends one
-when the goal status is `complete`. Sessions with no XGoal record retain the
-ordinary “session finished” alert. Permission and error alerts remain governed
+alert per goal after the status becomes `complete`, even if later turns in the
+same session become idle. Sessions with no XGoal record retain the ordinary
+“session finished” alert. Permission and error alerts remain governed
 by the notifier's existing settings. The generic completion sound is disabled
 for all sessions because the notifier cannot conditionally gate that channel.
 
