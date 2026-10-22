@@ -22,29 +22,31 @@ bash scripts/parity.sh --qualify  # adds the #14 promotion-gate scenarios
 
 ---
 
-## Why I made this
+## Motivation
 
-Two reasons, both from lived experience building on OpenCode 2.
+Two problems motivated this project, both encountered building on OpenCode 2.
 
-**The plugin API keeps breaking, and getting things to work that once did is a
-pain.** V1 plugins (`@opencode-ai/plugin`) simply do not load on V2. Bare
-specifiers in a plugin entry fail silently — no error, no warning, the plugin
-is just absent. `main` pointing at a subdirectory fails silently too. Hooks
-disappear between releases with no V2 equivalent. Every one of these cost real
-time to discover, and none of them announces itself: the failure mode is
-always "your code never runs" (see the Phase 01 findings below). This project
-is partly a record of that archaeology — what actually works on this API,
-verified live, so the next person does not have to rediscover it.
+**The plugin API has changed substantially, and its failure modes are
+silent.** V1 plugins (`@opencode-ai/plugin`) do not load on V2. Bare
+specifiers in a plugin entry fail without an error, warning, or log line —
+the plugin is simply absent. `main` pointing at a subdirectory fails the same
+way, and hooks have been removed between releases with no V2 equivalent. Each
+of these cost real time to discover because none of them announces itself:
+the failure mode is always "your code never runs" (see the Phase 01 findings
+below). Part of this project's purpose is to document that archaeology — what
+actually works on this API, verified live — so it does not need to be
+rediscovered.
 
-**Models sometimes just... half-complete things.** Ask for two files and you
-get one, or you get a confident "done!" and the second file does not exist. A
-chat model optimizes for a satisfying reply, not for a verified outcome, and
-nothing in a normal session holds it to the objective once the conversation
-moves on. Codex solved this with its Goal contract — a persistent objective
-the host enforces across turns. OpenCode had nothing equivalent, so I built
-one: the goal survives turn after turn, the controller drives the loop
-instead of hoping, and completion requires evidence the controller observed —
-not the model's word for it.
+**Language models frequently complete multi-part work only partially.** Asked
+for two files, a model will produce one, or report success while the second
+file does not exist. A chat model optimizes for a satisfying reply, not a
+verified outcome, and nothing in a normal session holds it to the objective
+once the conversation moves on. Codex addresses this with its Goal contract —
+a persistent objective the host enforces across turns. OpenCode had no
+equivalent, so this project implements one: the goal survives turn after
+turn, the controller drives the loop rather than relying on the model's
+initiative, and completion requires evidence the controller observed — not
+the model's assertion.
 
 ---
 
@@ -330,7 +332,7 @@ The live acceptance run on the tested environment:
 The harness sends no prompt after `goal.create`; the only prior message is a
 one-line warm-up that makes the plugin load for the session.
 
-Harness notes, learned the hard way:
+Harness implementation notes:
 
 - Use an isolated `XDG_CONFIG_HOME` and a fixed port. The standalone server
   prints a generated password; the harness parses it from the server output.
