@@ -309,10 +309,23 @@ export function goalRpcHandlers(
         // objective-level remainder that cannot be machine-proven. If
         // completion was waiting on exactly this, finish it now rather than
         // leaving the user to re-trigger the model.
+        //
+        // The fence pair is all-or-nothing (audit-4 #12): a client that
+        // sends only one half must not get unfenced acceptance that looks
+        // fenced. Callers that send neither half get legacy (unfenced)
+        // behavior — a deliberate compatibility trade-off for headless
+        // callers; the TUI always sends both.
+        const hasID = typeof input.goalID === "string" && input.goalID.length > 0;
+        const hasGen = typeof input.expectedGeneration === "number";
+        if (hasID !== hasGen) {
+          return {
+            goal: null,
+            error:
+              "acceptance fencing requires BOTH goalID and expectedGeneration; send both (from goal.status) or neither",
+          };
+        }
         const expected =
-          input.goalID && typeof input.expectedGeneration === "number"
-            ? { goalID: input.goalID, generation: input.expectedGeneration }
-            : undefined;
+          hasID && hasGen ? { goalID: input.goalID!, generation: input.expectedGeneration! } : undefined;
         const accepted = controller.acceptObjective(input.sessionID, input.note, expected);
         if (accepted.status === "verifying" && verifier) {
           const result = await verifier.verify(accepted.id);

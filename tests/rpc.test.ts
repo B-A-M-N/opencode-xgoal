@@ -462,6 +462,27 @@ describe("goal.accept", () => {
     expect(controller.store.userAcceptance(current.id)?.note).toBeUndefined();
   });
 
+  test("REGRESSION: a partial fence pair is rejected, never silently unfenced", async () => {
+    controller.startOrDescribe("ses_a", "the objective");
+    // goalID without the generation (or vice versa) must not fall through to
+    // unfenced acceptance — a half-migrated client gets a hard error instead.
+    const partialID = await handlers["goal.accept"]({
+      sessionID: "ses_a",
+      goalID: "goal_someid",
+    });
+    expect(partialID.goal).toBeNull();
+    expect(partialID.error).toContain("BOTH");
+    const partialGen = await handlers["goal.accept"]({
+      sessionID: "ses_a",
+      expectedGeneration: 1,
+    });
+    expect(partialGen.goal).toBeNull();
+    expect(partialGen.error).toContain("BOTH");
+    // Nothing was accepted by either partial call.
+    const goal = controller.status("ses_a")!;
+    expect(controller.store.userAcceptance(goal.id)).toBeUndefined();
+  });
+
   test("a missing sessionID is rejected", async () => {
     const res = await handlers["goal.accept"]({} as never);
     expect(res.error).toContain("sessionID");

@@ -2366,9 +2366,18 @@ export class GoalStore {
     return this.tx(() => {
       const round = this.roundByID(roundID);
       if (!round) throw new GoalConflictError(`unknown round ${roundID}`);
-      this.db
-        .query(`UPDATE goal_rounds SET status='failed', detail=?, settled_at_ms=? WHERE id=?`)
+      // Idempotent: a round that is already failed (e.g. by a concurrent
+      // replace()) keeps its FIRST failure record. Re-failing would overwrite
+      // the original detail and double the round-failed trail events.
+      const updated = this.db
+        .query(
+          `UPDATE goal_rounds SET status='failed', detail=?, settled_at_ms=?
+            WHERE id=? AND status != 'failed'`,
+        )
         .run(detail, Date.now(), roundID);
+      if (updated.changes === 0) {
+        return this.roundByID(roundID)!;
+      }
       const goal = this.byID(round.goalID);
       if (goal && parkGoal) {
         this.db

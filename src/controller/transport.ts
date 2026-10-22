@@ -407,6 +407,12 @@ export class SessionTransport implements ContinuationTransport {
       }
     }
     let interrupted = false;
+    // Attribution-then-interrupt has an inherent TOCTOU: the stale run could
+    // finish between isBusySlot and interruptSession, and a run started in
+    // that gap could belong to the user. The host only offers a SESSION-level
+    // cancel, so the attribution gate is the strongest available mitigation —
+    // the window is milliseconds wide and the alternative (never interrupt)
+    // leaves a superseded execution running against a dead objective.
     if (this.interruptSession && this.observer.isBusySlot(input.sessionID, input.inboxID)) {
       try {
         await this.interruptSession({ sessionID: input.sessionID });

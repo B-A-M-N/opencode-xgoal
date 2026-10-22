@@ -831,10 +831,11 @@ describe("progress classification counts only verifiable evidence", () => {
     expect(outcome.action).toBe("stale");
     if (outcome.action !== "stale") throw new Error("unreachable");
     expect(outcome.cancelled).toBe(false);
-    // The residual risk is named in the round detail and the audit trail —
-    // the controller does not pretend cancellation it cannot perform.
+    // The residual risk is named in the outcome and the audit trail — the
+    // controller does not pretend cancellation it cannot perform. (The round
+    // keeps its first failure record — replace()'s — because markRoundFailed
+    // is idempotent; the stale-admission detail lives in the trail.)
     expect(outcome.detail).toContain("RESIDUAL RISK");
-    expect(store.roundByID(outcome.roundID)!.detail).toContain("RESIDUAL RISK");
     const events = store
       .db.query(`SELECT detail FROM goal_events WHERE goal_id = ? AND kind = 'admission.stale'`)
       .all(goal.id) as Array<{ detail: string }>;

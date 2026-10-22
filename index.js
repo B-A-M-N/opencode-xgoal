@@ -1627,7 +1627,11 @@ class GoalStore {
       const round = this.roundByID(roundID);
       if (!round)
         throw new GoalConflictError(`unknown round ${roundID}`);
-      this.db.query(`UPDATE goal_rounds SET status='failed', detail=?, settled_at_ms=? WHERE id=?`).run(detail, Date.now(), roundID);
+      const updated = this.db.query(`UPDATE goal_rounds SET status='failed', detail=?, settled_at_ms=?
+            WHERE id=? AND status != 'failed'`).run(detail, Date.now(), roundID);
+      if (updated.changes === 0) {
+        return this.roundByID(roundID);
+      }
       const goal = this.byID(round.goalID);
       if (goal && parkGoal) {
         this.db.query(`UPDATE goals SET delivery_failed=1, updated_at_ms=?, version=version+1
@@ -3462,7 +3466,15 @@ function goalRpcHandlers(controller, coordinator, verifier) {
       if (!input?.sessionID)
         return { goal: null, error: "sessionID is required" };
       try {
-        const expected = input.goalID && typeof input.expectedGeneration === "number" ? { goalID: input.goalID, generation: input.expectedGeneration } : undefined;
+        const hasID = typeof input.goalID === "string" && input.goalID.length > 0;
+        const hasGen = typeof input.expectedGeneration === "number";
+        if (hasID !== hasGen) {
+          return {
+            goal: null,
+            error: "acceptance fencing requires BOTH goalID and expectedGeneration; send both (from goal.status) or neither"
+          };
+        }
+        const expected = hasID && hasGen ? { goalID: input.goalID, generation: input.expectedGeneration } : undefined;
         const accepted = controller.acceptObjective(input.sessionID, input.note, expected);
         if (accepted.status === "verifying" && verifier) {
           const result = await verifier.verify(accepted.id);
