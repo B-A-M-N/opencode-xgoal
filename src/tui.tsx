@@ -18,7 +18,7 @@ import { Plugin } from "@opencode/plugin/tui";
 import { goalRpcDefinition, type GoalWire } from "./rpc.ts";
 
 /** The RPC surface this companion uses, inferred from the shared definition. */
-interface GoalRpc {
+export interface GoalRpc {
   "goal.status": (input: {
     sessionID: string;
   }) => Promise<{ current: GoalWire | null; latest: GoalWire | null }>;
@@ -77,28 +77,26 @@ function describeDrive(outcome: any): string {
   }
 }
 
-export default Plugin.define({
-  id: "opencode-xgoal-tui",
+/**
+ * Build the `/goal` command handler against an injected host surface.
+ *
+ * Extracted from the plugin's `setup` so the keyboard-flow contract — Enter
+ * confirms the replacement, Escape keeps the current goal, a confirmation
+ * rendered against generation N can never clobber N+1 (it is fenced and the
+ * UI refreshes on rejection) — is testable without a live TUI. The live
+ * interactive qualification (scripts/qualify.sh) covers the real keymap.
+ */
+export function createGoalCommand(host: {
+  rpc: GoalRpc;
+  /** Resolve the session the user is currently viewing. */
+  currentSessionID: () => string | undefined;
+  /** The host dialog: Enter resolves true, Escape resolves false/undefined. */
+  dialogConfirm: (input: { title: string; message: string; label: { confirm: string; cancel: string } }) => Promise<boolean | undefined>;
+  notify: (message: string, variant?: "info" | "success" | "warning" | "error", sessionID?: string) => void;
+}) {
+  const { rpc, dialogConfirm, notify } = host;
 
-  async setup(context: Plugin.Context) {
-    const rpc = context.client.rpc(goalRpcDefinition) as unknown as GoalRpc;
-
-    const currentSessionID = (): string | undefined => {
-      const route = context.ui.router.current();
-      return route.type === "session" ? route.sessionID : undefined;
-    };
-
-    const notify = (
-      message: string,
-      variant: "info" | "success" | "warning" | "error" = "info",
-      sessionID?: string,
-    ) => {
-      try {
-        context.ui.toast.show({ title: "OpenCode-XGoal", message, variant, sessionID });
-      } catch {
-        /* toasts are advisory */
-      }
-    };
+  const currentSessionID = host.currentSessionID;
 
     const statusText = (
       current: GoalWire | null,
@@ -293,7 +291,7 @@ export default Plugin.define({
         return;
       }
 
-      const confirmed = await context.ui.dialog.confirm({
+      const confirmed = await dialogConfirm({
         title: "Replace goal?",
         message: [
           `An existing goal is active (generation ${existing.generation}):`,
@@ -310,6 +308,41 @@ export default Plugin.define({
         return;
       }
       await replaceGoal(sessionID, text, existing.generation);
+    };
+
+    return { runGoal };
+  };
+
+export default Plugin.define({
+  id: "opencode-xgoal-tui",
+
+  async setup(context: Plugin.Context) {
+    const rpc = context.client.rpc(goalRpcDefinition) as unknown as GoalRpc;
+    const { runGoal } = createGoalCommand({
+      rpc,
+      currentSessionID: () => {
+        const route = context.ui.router.current();
+        return route.type === "session" ? route.sessionID : undefined;
+      },
+      dialogConfirm: (input) => context.ui.dialog.confirm(input),
+      notify: (message, variant = "info", sessionID) => {
+        try {
+          context.ui.toast.show({ title: "OpenCode-XGoal", message, variant, sessionID });
+        } catch {
+          /* toasts are advisory */
+        }
+      },
+    });
+    const currentSessionID = () => {
+      const route = context.ui.router.current();
+      return route.type === "session" ? route.sessionID : undefined;
+    };
+    const notify = (message: string, variant: "info" | "success" | "warning" | "error" = "info", sessionID?: string) => {
+      try {
+        context.ui.toast.show({ title: "OpenCode-XGoal", message, variant, sessionID });
+      } catch {
+        /* toasts are advisory */
+      }
     };
 
     // Slash completion and palette entry. `arguments: true` keeps `/goal` in

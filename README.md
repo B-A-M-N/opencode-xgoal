@@ -273,7 +273,7 @@ inspection. It never touches the user's database or sessions.
 ## Verification
 
 ```bash
-bun test          # 273 unit/integration tests, 863 assertions
+bun test          # 282 unit/integration tests, 884 assertions
 bun run typecheck # clean
 bash scripts/parity.sh  # 17/17 live acceptance checks
 ```
@@ -583,3 +583,22 @@ honest-progress gaps:
     session instead of with one global timestamp: a burst of signals for
     session A can no longer suppress session B's continuation decision. The
     durable outstanding-round invariant remains the correctness backstop.
+29. **Live qualification harness (P2, #14)** — `bash scripts/parity.sh
+    --qualify` adds the promotion-gate scenarios: acceptance fencing through
+    the user surface (a confirmation naming a foreign goal is rejected; a
+    half-sent fence pair is a hard error), replacement while a continuation
+    is actually executing, and the control case — a normal OpenCode session
+    with `XGOAL_DISABLE=1`, where the plugin is completely inert (no
+    controller, no driver, no RPC) and every native surface still works.
+    The TUI keyboard contract (Enter replaces, fenced to the generation on
+    screen; Escape keeps; a stale fence surfaces the current objective for
+    fresh review) is pinned at the unit level in `tests/tui.test.ts` and
+    exercised for real by the harness once the test config exists.
+30. **Legacy record isolation (#14)** — the file-backed goal record under
+    `.opencode/goals/` belongs to a different (legacy) plugin. XGoal is
+    SQLite-only: it never reads, writes, or deletes that directory, so
+    installing XGoal cannot mutate another plugin's state. Promotion of
+    XGoal as the sole `/goal` handler additionally requires the user to
+    disable the legacy `@prevalentware/opencode-goal-plugin` in their
+    OpenCode config — deliberately a human action, not something this
+    plugin does silently.

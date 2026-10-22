@@ -232,10 +232,171 @@ function describeDrive(outcome) {
       return `dispatch: ${String(outcome.action)}`;
   }
 }
+function createGoalCommand(host) {
+  const { rpc, dialogConfirm, notify } = host;
+  const currentSessionID = host.currentSessionID;
+  const statusText = (current, latest) => {
+    const budget = (goal) => goal.tokenBudget === null ? `${goal.tokensUsed ?? 0} tokens` : `${goal.tokensUsed ?? 0}/${goal.tokenBudget} tokens`;
+    if (!current && latest) {
+      return [
+        `[${latest.status}] generation ${latest.generation}: ${latest.objective}`,
+        `rounds ${latest.rounds}, ${budget(latest)}`,
+        `No goal in progress. Use /goal <objective> to start the next one.`
+      ].join(`
+`);
+    }
+    if (!current)
+      return "No active goal. Use /goal <objective>.";
+    return [
+      `[${current.status}] generation ${current.generation}: ${current.objective}`,
+      `rounds ${current.rounds}, no-progress ${current.noProgressRounds}, ${budget(current)}`,
+      ...current.status === "verifying" ? [`Machine verification is blocked; run /goal accept to record acceptance.`] : []
+    ].join(`
+`);
+  };
+  const replaceGoal = async (sessionID, objective, expectedGeneration) => {
+    let expected = expectedGeneration;
+    if (expected === undefined) {
+      const current = (await rpc["goal.status"]({ sessionID })).current;
+      if (!current) {
+        await createGoal(sessionID, objective);
+        return;
+      }
+      expected = current.generation;
+    }
+    const res = await rpc["goal.replace"]({ sessionID, objective, expectedGeneration: expected });
+    if (res.error) {
+      notify(`Could not set the goal: ${res.error}`, "error", sessionID);
+      return;
+    }
+    notify(`Goal set (generation ${res.goal?.generation ?? "?"}). ${describeDrive(res.drive)}.`, "success", sessionID);
+  };
+  const createGoal = async (sessionID, objective) => {
+    const res = await rpc["goal.create"]({ sessionID, objective });
+    if (res.error) {
+      notify(`Could not create the goal: ${res.error}`, "error", sessionID);
+      return;
+    }
+    notify(`Goal created (generation ${res.goal?.generation ?? "?"}). ${describeDrive(res.drive)}.`, "success", sessionID);
+  };
+  const runGoal = async (raw) => {
+    const sessionID = currentSessionID();
+    if (!sessionID) {
+      notify("Open a session before using /goal.", "warning");
+      return;
+    }
+    const text = String(raw ?? "").trim();
+    const [verb, ...rest] = text.split(/\s+/);
+    const arg = rest.join(" ").trim();
+    if (!text || verb === "status") {
+      const res = await rpc["goal.status"]({ sessionID });
+      notify(statusText(res.current, res.latest), "info", sessionID);
+      return;
+    }
+    if (verb === "pause" || verb === "resume") {
+      const res = verb === "pause" ? await rpc["goal.pause"]({ sessionID }) : await rpc["goal.resume"]({ sessionID });
+      if (res.error) {
+        notify(`Could not ${verb} the goal: ${res.error}`, "error", sessionID);
+        return;
+      }
+      const suffix = verb === "resume" ? ` ${describeDrive(res.drive)}.` : "";
+      notify(verb === "pause" ? "Goal paused." : `Goal resumed: ${res.goal?.status ?? "active"}.${suffix}`, "success", sessionID);
+      return;
+    }
+    if (verb === "replace") {
+      if (!arg) {
+        notify("Usage: /goal replace <objective>", "error", sessionID);
+        return;
+      }
+      await replaceGoal(sessionID, arg);
+      return;
+    }
+    if (verb === "budget") {
+      const current = (await rpc["goal.status"]({ sessionID })).current;
+      if (!current) {
+        notify("No active goal.", "warning", sessionID);
+        return;
+      }
+      if (!arg) {
+        notify(current.tokenBudget === null ? `Tokens: ${current.tokensUsed ?? 0} (no budget set)` : `Tokens: ${current.tokensUsed ?? 0} / ${current.tokenBudget}`, "info", sessionID);
+        return;
+      }
+      if (/^(off|none|clear)$/i.test(arg)) {
+        const res2 = await rpc["goal.budget"]({ sessionID });
+        notify(res2.error ? `Could not clear the budget: ${res2.error}` : "Token budget cleared.", res2.error ? "error" : "success", sessionID);
+        return;
+      }
+      const n = Number(arg);
+      if (!Number.isFinite(n) || n <= 0) {
+        notify("Usage: /goal budget <positive number> | off", "error", sessionID);
+        return;
+      }
+      const res = await rpc["goal.budget"]({ sessionID, budget: Math.floor(n) });
+      notify(res.error ? `Could not set the budget: ${res.error}` : `Token budget set to ${Math.floor(n)}.`, res.error ? "error" : "success", sessionID);
+      return;
+    }
+    if (verb === "accept") {
+      const seen = (await rpc["goal.status"]({ sessionID })).current;
+      const res = await rpc["goal.accept"]({
+        sessionID,
+        note: arg || undefined,
+        goalID: seen?.id,
+        expectedGeneration: seen?.generation
+      });
+      if (res.error && /stale confirmation/i.test(res.error)) {
+        const now = (await rpc["goal.status"]({ sessionID })).current;
+        notify(`Acceptance rejected: the goal changed while confirming. ` + `The current objective (generation ${now?.generation ?? "?"}) needs fresh review: ${now?.objective ?? "none"}.`, "warning", sessionID);
+        return;
+      }
+      notify(res.error ? `Could not record acceptance: ${res.error}` : "Acceptance recorded for the current generation.", res.error ? "error" : "success", sessionID);
+      return;
+    }
+    if (verb === "health") {
+      const res = await rpc["goal.health"]({ sessionID });
+      notify(JSON.stringify(res.health, null, 2), res.health?.ok === false ? "warning" : "info", sessionID);
+      return;
+    }
+    const existing = (await rpc["goal.status"]({ sessionID })).current;
+    if (!existing) {
+      await createGoal(sessionID, text);
+      return;
+    }
+    const confirmed = await dialogConfirm({
+      title: "Replace goal?",
+      message: [
+        `An existing goal is active (generation ${existing.generation}):`,
+        existing.objective,
+        "",
+        "Set a new goal?"
+      ].join(`
+`),
+      label: { confirm: "Replace", cancel: "Keep" }
+    });
+    if (confirmed !== true) {
+      notify("Kept the current goal.", "info", sessionID);
+      return;
+    }
+    await replaceGoal(sessionID, text, existing.generation);
+  };
+  return { runGoal };
+}
 var tui_default = exports_plugin.define({
   id: "opencode-xgoal-tui",
   async setup(context) {
     const rpc = context.client.rpc(goalRpcDefinition);
+    const { runGoal } = createGoalCommand({
+      rpc,
+      currentSessionID: () => {
+        const route = context.ui.router.current();
+        return route.type === "session" ? route.sessionID : undefined;
+      },
+      dialogConfirm: (input) => context.ui.dialog.confirm(input),
+      notify: (message, variant = "info", sessionID) => {
+        try {
+          context.ui.toast.show({ title: "OpenCode-XGoal", message, variant, sessionID });
+        } catch {}
+      }
+    });
     const currentSessionID = () => {
       const route = context.ui.router.current();
       return route.type === "session" ? route.sessionID : undefined;
@@ -244,149 +405,6 @@ var tui_default = exports_plugin.define({
       try {
         context.ui.toast.show({ title: "OpenCode-XGoal", message, variant, sessionID });
       } catch {}
-    };
-    const statusText = (current, latest) => {
-      const budget = (goal) => goal.tokenBudget === null ? `${goal.tokensUsed ?? 0} tokens` : `${goal.tokensUsed ?? 0}/${goal.tokenBudget} tokens`;
-      if (!current && latest) {
-        return [
-          `[${latest.status}] generation ${latest.generation}: ${latest.objective}`,
-          `rounds ${latest.rounds}, ${budget(latest)}`,
-          `No goal in progress. Use /goal <objective> to start the next one.`
-        ].join(`
-`);
-      }
-      if (!current)
-        return "No active goal. Use /goal <objective>.";
-      return [
-        `[${current.status}] generation ${current.generation}: ${current.objective}`,
-        `rounds ${current.rounds}, no-progress ${current.noProgressRounds}, ${budget(current)}`,
-        ...current.status === "verifying" ? [`Machine verification is blocked; run /goal accept to record acceptance.`] : []
-      ].join(`
-`);
-    };
-    const replaceGoal = async (sessionID, objective, expectedGeneration) => {
-      let expected = expectedGeneration;
-      if (expected === undefined) {
-        const current = (await rpc["goal.status"]({ sessionID })).current;
-        if (!current) {
-          await createGoal(sessionID, objective);
-          return;
-        }
-        expected = current.generation;
-      }
-      const res = await rpc["goal.replace"]({ sessionID, objective, expectedGeneration: expected });
-      if (res.error) {
-        notify(`Could not set the goal: ${res.error}`, "error", sessionID);
-        return;
-      }
-      notify(`Goal set (generation ${res.goal?.generation ?? "?"}). ${describeDrive(res.drive)}.`, "success", sessionID);
-    };
-    const createGoal = async (sessionID, objective) => {
-      const res = await rpc["goal.create"]({ sessionID, objective });
-      if (res.error) {
-        notify(`Could not create the goal: ${res.error}`, "error", sessionID);
-        return;
-      }
-      notify(`Goal created (generation ${res.goal?.generation ?? "?"}). ${describeDrive(res.drive)}.`, "success", sessionID);
-    };
-    const runGoal = async (raw) => {
-      const sessionID = currentSessionID();
-      if (!sessionID) {
-        notify("Open a session before using /goal.", "warning");
-        return;
-      }
-      const text = String(raw ?? "").trim();
-      const [verb, ...rest] = text.split(/\s+/);
-      const arg = rest.join(" ").trim();
-      if (!text || verb === "status") {
-        const res = await rpc["goal.status"]({ sessionID });
-        notify(statusText(res.current, res.latest), "info", sessionID);
-        return;
-      }
-      if (verb === "pause" || verb === "resume") {
-        const res = verb === "pause" ? await rpc["goal.pause"]({ sessionID }) : await rpc["goal.resume"]({ sessionID });
-        if (res.error) {
-          notify(`Could not ${verb} the goal: ${res.error}`, "error", sessionID);
-          return;
-        }
-        const suffix = verb === "resume" ? ` ${describeDrive(res.drive)}.` : "";
-        notify(verb === "pause" ? "Goal paused." : `Goal resumed: ${res.goal?.status ?? "active"}.${suffix}`, "success", sessionID);
-        return;
-      }
-      if (verb === "replace") {
-        if (!arg) {
-          notify("Usage: /goal replace <objective>", "error", sessionID);
-          return;
-        }
-        await replaceGoal(sessionID, arg);
-        return;
-      }
-      if (verb === "budget") {
-        const current = (await rpc["goal.status"]({ sessionID })).current;
-        if (!current) {
-          notify("No active goal.", "warning", sessionID);
-          return;
-        }
-        if (!arg) {
-          notify(current.tokenBudget === null ? `Tokens: ${current.tokensUsed ?? 0} (no budget set)` : `Tokens: ${current.tokensUsed ?? 0} / ${current.tokenBudget}`, "info", sessionID);
-          return;
-        }
-        if (/^(off|none|clear)$/i.test(arg)) {
-          const res2 = await rpc["goal.budget"]({ sessionID });
-          notify(res2.error ? `Could not clear the budget: ${res2.error}` : "Token budget cleared.", res2.error ? "error" : "success", sessionID);
-          return;
-        }
-        const n = Number(arg);
-        if (!Number.isFinite(n) || n <= 0) {
-          notify("Usage: /goal budget <positive number> | off", "error", sessionID);
-          return;
-        }
-        const res = await rpc["goal.budget"]({ sessionID, budget: Math.floor(n) });
-        notify(res.error ? `Could not set the budget: ${res.error}` : `Token budget set to ${Math.floor(n)}.`, res.error ? "error" : "success", sessionID);
-        return;
-      }
-      if (verb === "accept") {
-        const seen = (await rpc["goal.status"]({ sessionID })).current;
-        const res = await rpc["goal.accept"]({
-          sessionID,
-          note: arg || undefined,
-          goalID: seen?.id,
-          expectedGeneration: seen?.generation
-        });
-        if (res.error && /stale confirmation/i.test(res.error)) {
-          const now = (await rpc["goal.status"]({ sessionID })).current;
-          notify(`Acceptance rejected: the goal changed while confirming. ` + `The current objective (generation ${now?.generation ?? "?"}) needs fresh review: ${now?.objective ?? "none"}.`, "warning", sessionID);
-          return;
-        }
-        notify(res.error ? `Could not record acceptance: ${res.error}` : "Acceptance recorded for the current generation.", res.error ? "error" : "success", sessionID);
-        return;
-      }
-      if (verb === "health") {
-        const res = await rpc["goal.health"]({ sessionID });
-        notify(JSON.stringify(res.health, null, 2), res.health?.ok === false ? "warning" : "info", sessionID);
-        return;
-      }
-      const existing = (await rpc["goal.status"]({ sessionID })).current;
-      if (!existing) {
-        await createGoal(sessionID, text);
-        return;
-      }
-      const confirmed = await context.ui.dialog.confirm({
-        title: "Replace goal?",
-        message: [
-          `An existing goal is active (generation ${existing.generation}):`,
-          existing.objective,
-          "",
-          "Set a new goal?"
-        ].join(`
-`),
-        label: { confirm: "Replace", cancel: "Keep" }
-      });
-      if (confirmed !== true) {
-        notify("Kept the current goal.", "info", sessionID);
-        return;
-      }
-      await replaceGoal(sessionID, text, existing.generation);
     };
     context.keymap.layer(() => ({
       priority: 100,
@@ -412,5 +430,6 @@ var tui_default = exports_plugin.define({
   }
 });
 export {
-  tui_default as default
+  tui_default as default,
+  createGoalCommand
 };

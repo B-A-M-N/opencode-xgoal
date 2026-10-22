@@ -16,6 +16,7 @@
 #
 # Usage:
 #   bash scripts/parity.sh
+#   bash scripts/parity.sh --qualify     # add the #14 live-qualification scenarios
 #
 # Env:
 #   OPENCODE_BIN          opencode 2 executable (default: /home/bamn/.opencode/bin/opencode2)
@@ -24,6 +25,9 @@
 #   XGOAL_ACCEPT_TIMEOUT  seconds per goal (default: 420)
 #   XGOAL_ACCEPT_KEEP=1   keep the workspace and logs after the run
 set -uo pipefail
+
+QUALIFY=0
+[ "${1:-}" = "--qualify" ] && QUALIFY=1
 
 export PATH="/home/bamn/.bun/bin:$PATH"
 
@@ -350,6 +354,138 @@ else
     report "replacement goal's artifact is correct" FAIL "new.txt='$(cat "$WS/new.txt" 2>/dev/null)'"
   fi
 fi
+
+# ---------------------------------------------------------------------------
+# Audit-4 #14 live qualification (opt-in: --qualify). These scenarios drive the
+# same public surfaces a user's keyboard drives, plus the control case the
+# audit requires: a normal OpenCode session with XGoal inactive.
+# ---------------------------------------------------------------------------
+if [ "$QUALIFY" = "1" ]; then
+
+echo ""
+echo "Qualification A: acceptance fencing through the user surface"
+SIDQ=$(open_session "qualify-accept")
+if [ -z "$SIDQ" ]; then
+  report "fencing session established" FAIL "could not create a session or load the plugin"
+else
+  report "fencing session established" PASS
+  rpc goal.create "{\"sessionID\":\"$SIDQ\",\"objective\":\"Create a file called fence.txt containing exactly: fenced. When it exists, propose completion.\"}" >/dev/null
+  CUR=$(rpc goal.status "{\"sessionID\":\"$SIDQ\"}")
+  GID=$(echo "$CUR" | json output.current.id)
+  GEN=$(echo "$CUR" | json output.current.generation)
+
+  # A confirmation naming the generation the user saw is accepted.
+  OKRES=$(rpc goal.accept "{\"sessionID\":\"$SIDQ\",\"goalID\":\"$GID\",\"expectedGeneration\":$GEN}")
+  OKERR=$(echo "$OKRES" | json output.error)
+  if [ -z "$OKERR" ]; then
+    report "acceptance with a current fence pair is recorded" PASS
+  else
+    report "acceptance with a current fence pair is recorded" FAIL "error=$OKERR"
+  fi
+
+  # A confirmation naming a DIFFERENT goal id is rejected — the fence is on
+  # identity, not just recency.
+  BADRES=$(rpc goal.accept "{\"sessionID\":\"$SIDQ\",\"goalID\":\"goal_not_this_one\",\"expectedGeneration\":$GEN}")
+  BADERR=$(echo "$BADRES" | json output.error)
+  if [ -n "$BADERR" ]; then
+    report "acceptance naming a foreign goal is rejected" PASS
+  else
+    report "acceptance naming a foreign goal is rejected" FAIL "accepted a foreign goalID"
+  fi
+
+  # A half-sent fence pair is a hard error, never silent unfenced acceptance.
+  PARTRES=$(rpc goal.accept "{\"sessionID\":\"$SIDQ\",\"goalID\":\"$GID\"}")
+  PARTERR=$(echo "$PARTRES" | json output.error)
+  if echo "$PARTERR" | grep -q "BOTH"; then
+    report "a partial fence pair is rejected" PASS
+  else
+    report "a partial fence pair is rejected" FAIL "error=$PARTERR"
+  fi
+fi
+
+echo ""
+echo "Qualification B: replacement while a continuation is executing"
+SIDR=$(open_session "qualify-race")
+if [ -z "$SIDR" ]; then
+  report "race session established" FAIL "could not create a session or load the plugin"
+else
+  report "race session established" PASS
+  # A goal with real work in flight; the replacement lands while the model is
+  # mid-execution. The stale-admission reconciliation (audit-4 #11) must keep
+  # the replacement clean.
+  rpc goal.create "{\"sessionID\":\"$SIDR\",\"objective\":\"Create a file called slow1.txt containing exactly: one, then a file called slow2.txt containing exactly: two. When both exist, propose completion.\"}" >/dev/null
+  sleep 2
+  RRESP=$(rpc goal.replace "{\"sessionID\":\"$SIDR\",\"objective\":\"Create a file called quick.txt containing exactly: quick. When it exists, propose completion.\",\"expectedGeneration\":1}")
+  RGEN=$(echo "$RRESP" | json output.goal.generation)
+  if [ "$RGEN" = "2" ]; then
+    report "mid-execution replacement accepted with the right fence" PASS
+  else
+    report "mid-execution replacement accepted with the right fence" FAIL "generation=$RGEN resp=$RRESP"
+  fi
+  if wait_complete "$SIDR" "race goal"; then
+    report "replacement goal completed despite the race" PASS
+  else
+    report "replacement goal completed despite the race" FAIL "status=$(goal_field "$SIDR" status)"
+  fi
+  # The superseded goal's artifacts must not exist in the replacement's world.
+  if [ "$(cat "$WS/quick.txt" 2>/dev/null)" = "quick" ]; then
+    report "replacement goal's artifact is correct" PASS
+  else
+    report "replacement goal's artifact is correct" FAIL "quick.txt='$(cat "$WS/quick.txt" 2>/dev/null)'"
+  fi
+fi
+
+echo ""
+echo "Qualification C: control — a normal OpenCode session with XGoal inactive"
+INACT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/xgoal-inactive.XXXXXX")"
+(
+  cd "$INACT_DIR" || exit 1
+  exec env XDG_CONFIG_HOME="$TC" \
+    XGOAL_DB="$INACT_DIR/unused.db" \
+    XGOAL_DISABLE=1 \
+    "$OC" serve --hostname "$HOST" --port "$((PORT + 1))" --log-level warn
+) >"$INACT_DIR/server.out" 2>&1 &
+INACT_PID=$!
+INACT_PW=""
+for _ in $(seq 1 60); do
+  INACT_PW=$(grep -m1 '^server password ' "$INACT_DIR/server.out" 2>/dev/null | awk '{print $3}')
+  [ -n "$INACT_PW" ] && break
+  sleep 0.5
+done
+if [ -z "$INACT_PW" ]; then
+  report "inactive control server starts" FAIL "server did not start; see $INACT_DIR/server.out"
+else
+  report "inactive control server starts" PASS
+  ISID=$(curl -s -m 30 -u "opencode:$INACT_PW" -X POST "http://$HOST:$((PORT + 1))/api/session" \
+    -H 'content-type: application/json' -d '{"title":"inactive-control"}' | json data.id)
+  if [ -n "$ISID" ]; then
+    report "session creation works without XGoal" PASS
+    IMSG=$(curl -s -m 60 -u "opencode:$INACT_PW" -X POST \
+      "http://$HOST:$((PORT + 1))/api/session/$ISID/synthetic" \
+      -H 'content-type: application/json' \
+      -d "{\"id\":\"msg_ctl_$ISID\",\"text\":\"Reply with exactly: alive. Do not use any tools.\",\"delivery\":\"queue\"}" | json id)
+    if [ -n "$IMSG" ]; then
+      report "a normal turn works without XGoal" PASS
+    else
+      report "a normal turn works without XGoal" FAIL "synthetic message rejected"
+    fi
+    # The XGoal RPC must NOT be registered on this server.
+    IRPC=$(curl -s -m 15 -u "opencode:$INACT_PW" -X POST \
+      "http://$HOST:$((PORT + 1))/api/rpc/local.opencode-xgoal/goal.status" \
+      -H 'content-type: application/json' -d "{\"input\":{\"sessionID\":\"$ISID\"}}")
+    if echo "$IRPC" | grep -q "output"; then
+      report "XGoal RPC is absent when inactive" FAIL "goal.status responded"
+    else
+      report "XGoal RPC is absent when inactive" PASS
+    fi
+  else
+    report "session creation works without XGoal" FAIL "no session id"
+  fi
+fi
+kill_tree TERM "$INACT_PID" 2>/dev/null || true
+rm -rf "$INACT_DIR"
+
+fi # QUALIFY
 
 # ---------------------------------------------------------------------------
 echo ""

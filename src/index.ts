@@ -103,6 +103,13 @@ export default {
   id: "opencode-xgoal",
 
   async setup(ctx: any) {
+    // Qualification control (audit-4 #14): XGOAL_DISABLE=1 must produce a
+    // completely inert plugin — no controller, no driver, no RPC — so the
+    // harness can prove a normal OpenCode session works with XGoal inactive.
+    if (process.env.XGOAL_DISABLE === "1") {
+      record({ event: "disabled", reason: "XGOAL_DISABLE=1" });
+      return {};
+    }
     const abort = new AbortController();
     let controller: GoalController | undefined;
     let startupError: string | undefined;

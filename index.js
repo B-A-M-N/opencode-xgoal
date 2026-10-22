@@ -3571,6 +3571,10 @@ var num2 = { type: "number" };
 var src_default = {
   id: "opencode-xgoal",
   async setup(ctx) {
+    if (process.env.XGOAL_DISABLE === "1") {
+      record({ event: "disabled", reason: "XGOAL_DISABLE=1" });
+      return {};
+    }
     const abort = new AbortController;
     let controller;
     let startupError;
